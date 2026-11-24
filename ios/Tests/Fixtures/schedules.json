@@ -1,0 +1,1 @@
+[{"id": "5ced0000a11e", "name": "\u6bcf\u65e5\u6668\u62a5", "device": "", "origin": "", "time": "06:30", "days": [], "keepRuns": 7, "enabled": true, "createdAt": 1785542400, "lastFired": "2026-08-01", "lastFiredAt": 1785565800, "lastWfId": "wf0000000001", "lastError": "", "attempts": 0, "lastAttemptPeriod": "", "nextDue": 1785652200, "lastStatus": "done", "tz": "+0000"}]

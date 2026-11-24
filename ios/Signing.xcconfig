@@ -1,0 +1,11 @@
+// Pervio signing — fill in YOUR two values to run on a real device.
+//
+//   DEVELOPMENT_TEAM        your Apple Developer Team ID (Xcode → Settings → Accounts)
+//   PRODUCT_BUNDLE_ID_BASE  any bundle id you own, e.g. com.yourname.pervio
+//
+// Keep your personal values in Signing.local.xcconfig (git-ignored) so they
+// survive template updates; that file overrides everything below.
+DEVELOPMENT_TEAM =
+PRODUCT_BUNDLE_ID_BASE = app.pervio
+
+#include? "Signing.local.xcconfig"

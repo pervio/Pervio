@@ -1,0 +1,48 @@
+{
+  "scenario": "claude-error",
+  "backend": "claude",
+  "model": "claude-nope-9",
+  "capturedUTC": "2026-08-07T08:57:31Z",
+  "cliVersion": "2.1.181 (Claude Code)",
+  "command": "server/bin/pervio-chat --text --backend claude --dir /home/pervio/work --prompt-b64 aGk= --perm default --model claude-nope-9",
+  "prompt": "hi",
+  "exitCode": 1,
+  "events": 4,
+  "seconds": 3.1,
+  "usage": {
+    "inputTokens": 0,
+    "cachedInputTokens": 0,
+    "outputTokens": 0,
+    "reasoningOutputTokens": null,
+    "costUSD": 0
+  },
+  "sessionIdRedactedTo": "00000000-0000-4000-8000-000000000001",
+  "covers": [
+    "assistant with error/request_id",
+    "result is_error + api_error_status"
+  ],
+  "twin": "codex-error",
+  "noTwinBecause": null,
+  "free": true,
+  "redactions": [
+    "workdir (plain, realpath, and '-'-encoded) -> /home/pervio/work",
+    "$HOME -> /home/pervio, username -> pervio",
+    "hostname -> pervio-host",
+    "IANA timezone -> Etc/UTC",
+    "UUIDs -> 00000000-0000-4000-8000-0000000000NN (consistent within a file)",
+    "req_… -> req_000…NN",
+    "bulk vendor/environment values -> '<redacted: …>' markers (keys and types preserved; see 'scrubbedPaths')"
+  ],
+  "scrubbedPaths": [
+    "agents",
+    "attachment.addedLines",
+    "attachment.addedNames",
+    "attachment.addedTypes",
+    "attachment.content",
+    "attachment.names",
+    "skills",
+    "slash_commands"
+  ],
+  "regenerate": "python3 server/tests/capture_corpus.py --only claude-error",
+  "note": "REAL agent output. Everything except the values listed under 'redactions' is byte-for-byte what the CLI emitted."
+}

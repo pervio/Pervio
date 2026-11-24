@@ -1,0 +1,8 @@
+push.pervio.dev {
+	# A push is a few kilobytes; nothing larger has any business here.
+	request_body {
+		max_size 16KB
+	}
+	reverse_proxy 127.0.0.1:8787
+	encode gzip
+}

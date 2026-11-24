@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""pervio-codex-index — make Pervio's headless `codex exec` conversations show up
+in Codex's interactive `codex resume` picker.
+
+ROOT CAUSE (verified)
+---------------------
+`codex resume` scans rollout files and shows ONLY sessions whose first-line
+session_meta has `source == "cli"` (created by the interactive TUI). Pervio drives
+`codex exec`, which stamps `source: "exec"` / `originator: "codex_exec"`, so those
+conversations never appear in the picker (not even with `--all`). The picker does
+NOT read ~/.codex/session_index.jsonl — only the rollout metadata matters.
+
+WHAT THIS DOES
+--------------
+Scans rollout files and, for any with `source == "exec"`, rewrites just the
+first-line session_meta to `source: "cli"` / `originator: "codex-tui"` so the
+picker lists them like any interactive session. The conversation content (every
+line after the first) is left byte-for-byte unchanged, and the change is fully
+reversible (cli -> exec).
+
+SAFETY
+------
+- Only the first line (session_meta) is changed; conversation turns are untouched.
+- Atomic write (temp file + os.replace): a reader always sees a complete file.
+- Idempotent: a rollout already at source=="cli" is skipped (so a resumed thread
+  is patched once, on its first turn, and left alone after).
+- Best-effort: never raises; a failure here must never break a chat turn.
+"""
+import glob
+import json
+import os
+import sys
+import tempfile
+
+HOME = os.path.expanduser("~")
+SESS = os.path.join(HOME, ".codex", "sessions")
+
+
+def _patch(fp):
+    """If this rollout was made by `codex exec`, flip its source to interactive so
+    `codex resume` lists it. Returns True if it changed the file."""
+    # BINARY, never text: a rollout carries whatever bytes a tool printed, and
+    # text mode with errors="replace" would silently rewrite every invalid byte
+    # as U+FFFD (and universal-newlines would eat the \r of CRLF payloads). The
+    # conversation is the only copy, so it is copied through untouched.
+    try:
+        mode = os.stat(fp).st_mode & 0o7777
+        with open(fp, "rb") as f:
+            first = f.readline()
+            rest = f.read()
+    except OSError:
+        return False
+    try:
+        o = json.loads(first)          # ValueError also covers UnicodeDecodeError
+    except ValueError:
+        return False
+    # A rollout whose first line is valid JSON but not an object (null, [], 123,
+    # "x") is not ours to touch — and .get() on it would raise, which used to
+    # abort the whole sweep and leave every later rollout invisible.
+    if not isinstance(o, dict) or o.get("type") != "session_meta":
+        return False
+    p = o.get("payload")
+    if not isinstance(p, dict) or p.get("source") != "exec":
+        return False
+    p["source"] = "cli"
+    p["originator"] = "codex-tui"
+    o["payload"] = p
+    head = json.dumps(o, ensure_ascii=False).encode("utf-8") + b"\n"
+    d = os.path.dirname(fp)
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(dir=d, prefix=".rollout.", suffix=".tmp")
+        with os.fdopen(fd, "wb") as g:
+            g.write(head)
+            g.write(rest)
+            g.flush()
+            os.fsync(g.fileno())       # the rename must not commit ahead of the data
+        os.chmod(tmp, mode)            # mkstemp is 0600; keep the rollout's own bits
+        os.replace(tmp, fp)
+        return True
+    except Exception:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        return False
+
+
+def cmd_sync():
+    changed = 0
+    # sorted(): glob returns raw directory order, so which rollout is visited
+    # first varied by filesystem — a reproducible sweep (and a reproducible test)
+    # needs a stable order.
+    for fp in sorted(glob.glob(os.path.join(SESS, "*", "*", "*", "rollout-*.jsonl"))):
+        if _patch(fp):
+            changed += 1
+    sys.stdout.write(json.dumps({"madeVisible": changed}) + "\n")
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "sync"
+    if cmd != "sync":
+        sys.stderr.write("usage: pervio-codex-index sync\n")
+        sys.exit(2)
+    try:
+        cmd_sync()
+    except Exception as e:        # best-effort: must never break a chat turn
+        sys.stderr.write("pervio-codex-index: %s\n" % e)
+        sys.stdout.write(json.dumps({"madeVisible": 0}) + "\n")
+
+
+if __name__ == "__main__":
+    main()

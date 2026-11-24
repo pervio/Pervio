@@ -1,0 +1,2428 @@
+#!/usr/bin/env python3
+"""pervio-sessions — read-only introspection of Claude Code's on-disk sessions.
+
+The iOS app runs this over SSH to power: the project picker, the "past
+conversations" list (resume), and loading a transcript when resuming.
+
+Because Claude Code stores conversations under
+    ~/.claude/projects/<cwd with '/' replaced by '-'>/<sessionId>.jsonl
+a phone session created with `--dir <path>` lands in the SAME folder a desktop
+Claude Code uses for that path — so history is shared across both.
+
+Usage:
+    pervio-sessions projects
+    pervio-sessions list      --dir <path>
+    pervio-sessions home      --dir <default> [--top N] [--per M] [--limit K]   the phone's home page: recent folders + the default folder's own chats
+    pervio-sessions transcript --dir <path> --session <id> [--limit N]
+    pervio-sessions turns     --dir <path> --session <id> [--backend codex|cursor] [--from N] [--limit M] [--text]   a window + bearings
+    pervio-sessions project-docs --dir <path>      CLAUDE.md / AGENTS.md / rules / memory files a folder's agents read
+    pervio-sessions meta      --session <id> [--title-b64 <b64> | --clear-title] [--dirs-b64 <b64 JSON list>]   name + folders
+    pervio-sessions fork      --dir <path> --session <id> --before <uuid> | --after <uuid> [--backend codex]
+    pervio-sessions user-turns --session <id> --backend codex      the typed user messages' ids + text (fork anchors)
+    pervio-sessions search    --query <text> [--limit N]
+All commands print a single JSON value to stdout.
+"""
+import os, sys, json, glob, re, signal, time, subprocess
+
+HOME = os.path.expanduser("~")
+PROJ = os.path.join(HOME, ".claude", "projects")
+CODEX_SESS = os.path.join(HOME, ".codex", "sessions")   # Codex's separate session store
+# Cursor's store (agent 2026.10.14, probed 2026-10-14): one chat =
+#   ~/.cursor/chats/<md5 of the cwd>/<chat id>/{meta.json, store.db}   (meta: cwd, times)
+#   ~/.cursor/projects/<slug>/agent-transcripts/<chat id>/<chat id>.jsonl (the readable transcript:
+#   {"role":"user"|"assistant","message":{"content":[…]}} lines, Claude-like blocks, Shell/Write/Read tools)
+CURSOR_CHATS = os.path.join(HOME, ".cursor", "chats")
+CURSOR_PROJECTS = os.path.join(HOME, ".cursor", "projects")
+
+# ---------- pins ledger (2026-09-08) ----------
+# The phone's "pin this conversation" used to live only in the phone's own
+# UserDefaults — a decoration no deleter on this Mac could see, so a pinned
+# conversation vanished as silently as any other, and a reinstall wiped the
+# pins themselves. The ledger moves the FACT to the Mac: keyed by session id
+# (Claude UUID or Codex thread id — globally unique across dirs and stores),
+# value {dir, at}. `list` stamps every row with it (one round trip, no extra
+# fetch), `delete` REFUSES a pinned id unless --force, and the phone keeps its
+# copy only as a cache + an outbox of taps to replay on the next list.
+PINS_PATH = os.path.join(HOME, ".pervio", "chat", "pins.json")
+
+
+META_PATH = os.path.join(HOME, ".pervio", "chat", "meta.json")
+
+
+def _meta_load():
+    """{session_id: {"title": str, "dirs": [str]}} — the person's own name for
+    a conversation and the folders it was handed (writable extra dirs) — {}
+    on a missing or corrupt file, like the pins."""
+    try:
+        with open(META_PATH, encoding="utf-8") as f:
+            d = json.load(f)
+        m = d.get("meta") if isinstance(d, dict) else None
+        return {k: v for k, v in m.items()
+                if isinstance(k, str) and isinstance(v, dict)} if isinstance(m, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _meta_save(meta):
+    os.makedirs(os.path.dirname(META_PATH), mode=0o700, exist_ok=True)
+    tmp = META_PATH + ".tmp.%d" % os.getpid()
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump({"meta": meta}, f, ensure_ascii=False)
+    os.replace(tmp, META_PATH)
+
+
+def cmd_meta(session, title_b64=None, clear_title=False, dirs_b64=None):
+    """Set / read a conversation's name and folders (2026-10-17): --title-b64
+    names it, --clear-title drops the name, --dirs-b64 (a JSON list) records
+    the folders handed over so the list can show them. Prints the entry."""
+    if not session or "/" in session or ".." in session:
+        print("meta: bad session id", file=sys.stderr)
+        sys.exit(1)
+    import base64
+    meta = _meta_load()
+    e = dict(meta.get(session) or {})
+    if clear_title:
+        e.pop("title", None)
+    elif title_b64 is not None:
+        try:
+            t = base64.b64decode(title_b64).decode("utf-8").strip()
+        except Exception:
+            print("meta: bad --title-b64", file=sys.stderr)
+            sys.exit(1)
+        if t:
+            e["title"] = t[:120]
+        else:
+            e.pop("title", None)
+    if dirs_b64 is not None:
+        try:
+            dirs = json.loads(base64.b64decode(dirs_b64).decode("utf-8"))
+        except Exception:
+            dirs = None
+        if not isinstance(dirs, list) or not all(isinstance(x, str) for x in dirs):
+            print("meta: bad --dirs-b64 (a JSON list of paths)", file=sys.stderr)
+            sys.exit(1)
+        e["dirs"] = [d for d in dirs if d][:20]
+    if e:
+        meta[session] = e
+    else:
+        meta.pop(session, None)
+    _meta_save(meta)
+    print(json.dumps({"id": session, "title": e.get("title", ""), "dirs": e.get("dirs", [])}, ensure_ascii=False))
+
+
+def _pins_load():
+    """{session_id: {"dir": str, "at": int}} — {} on a missing or corrupt file
+    (a corrupt ledger must never take the session list down with it)."""
+    try:
+        with open(PINS_PATH, encoding="utf-8") as f:
+            d = json.load(f)
+        pins = d.get("pins") if isinstance(d, dict) else None
+        return {k: v for k, v in pins.items()
+                if isinstance(k, str) and isinstance(v, dict)} if isinstance(pins, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _pins_save(pins):
+    """Atomic (tmp + rename), 0600: a half-written ledger would read as corrupt
+    and drop every pin at once."""
+    os.makedirs(os.path.dirname(PINS_PATH), mode=0o700, exist_ok=True)
+    tmp = PINS_PATH + ".tmp.%d" % os.getpid()
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"v": 1, "pins": pins}, f, ensure_ascii=False, indent=1)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, PINS_PATH)
+
+
+def _safe_id(session):
+    return bool(session) and "/" not in session and ".." not in session and "\x00" not in session
+
+
+def _pins_out(pins):
+    print(json.dumps({"pins": {k: int((v or {}).get("at") or 0) for k, v in pins.items()}}))
+
+
+def cmd_pin(directory, session, at):
+    """Pin (idempotent: an existing pin keeps its original instant, so the
+    phone's 'most recently pinned first' order survives a replay)."""
+    if not _safe_id(session):
+        print(json.dumps({"pinned": False, "reason": "rejected"}))
+        sys.exit(1)
+    pins = _pins_load()
+    if session not in pins:
+        import time
+        pins[session] = {"dir": directory, "at": int(at or time.time())}
+        _pins_save(pins)
+    print(json.dumps({"pinned": True, "at": int(pins[session].get("at") or 0)}))
+
+
+def cmd_unpin(session):
+    pins = _pins_load()
+    if session in pins:
+        del pins[session]
+        _pins_save(pins)
+    print(json.dumps({"pinned": False}))
+
+
+def cmd_pins_merge(directory, b64):
+    """Union the phone's outbox/migration set {id: at} into the ledger. NEVER
+    removes — an unpin is its own verb — so two phones (or one phone replaying
+    an old outbox) can only ever add. Prints the whole ledger back."""
+    import base64
+    try:
+        incoming = json.loads(base64.b64decode(b64 or "").decode("utf-8")) if b64 else {}
+    except (ValueError, TypeError):
+        print(json.dumps({"pins": {}, "error": "bad merge payload"}))
+        sys.exit(1)
+    pins = _pins_load()
+    changed = False
+    for sid, at in (incoming.items() if isinstance(incoming, dict) else []):
+        if not _safe_id(str(sid)) or sid in pins:
+            continue
+        try:
+            pins[sid] = {"dir": directory, "at": int(float(at))}
+        except (TypeError, ValueError):
+            import time
+            pins[sid] = {"dir": directory, "at": int(time.time())}
+        changed = True
+    if changed:
+        _pins_save(pins)
+    _pins_out(pins)
+
+
+def encode(path):
+    # Claude Code's project-folder encoding: EVERY character that isn't a letter or
+    # digit becomes '-'. That means '/', '.', '-', spaces and non-ASCII (e.g. CJK)
+    # all map to '-'. The old code replaced only '/', so any path with a CJK/space/
+    # dotted segment mismatched the real folder (e.g. 'OneDrive-个人' -> folder
+    # 'OneDrive----'), making `list`/`transcript` come up empty even though
+    # `projects` had counted the folder.
+    return re.sub(r"[^a-zA-Z0-9]", "-", path)
+
+
+def _proj_dir(directory):
+    """Resolve ~/.claude/projects/<folder> for a cwd, robustly. Tries Claude's
+    encoding, then the legacy '/'->'-', and—if neither folder exists—scans for the
+    folder whose sessions actually record this cwd (bulletproof against any encoding
+    edge case). Returns an absolute path (the best candidate even if absent yet)."""
+    cand = os.path.join(PROJ, encode(directory))
+    if os.path.isdir(cand):
+        return cand
+    legacy = os.path.join(PROJ, directory.replace("/", "-"))
+    if os.path.isdir(legacy):
+        return legacy
+    if os.path.isdir(PROJ):
+        for d in os.listdir(PROJ):
+            full = os.path.join(PROJ, d)
+            if not os.path.isdir(full):
+                continue
+            js = glob.glob(os.path.join(full, "*.jsonl"))
+            # The folder's ROOT as project_root reads it (migration-aware), not
+            # the newest session's first cwd: a session migrated from another
+            # Mac opens with the old machine's path, and matching on that hung
+            # a whole folder's conversations under a path that no longer
+            # exists (two "Pervio" folders on the home page, 2026-11-11).
+            if js and project_root(d, max(js, key=os.path.getmtime)) == directory:
+                return full
+    return cand
+
+
+def _session_path(directory, session):
+    """Resolve a session JSONL path, rejecting path tricks. `session` must be a
+    bare filename — no '/', no '..', no NUL — so a crafted id can't escape the
+    project dir to read other files (e.g. ../../somewhere/secret.jsonl). Returns
+    the absolute path, or None when the id is unsafe/empty."""
+    if not session or "/" in session or ".." in session or "\x00" in session:
+        return None
+    return os.path.join(_proj_dir(directory), session + ".jsonl")
+
+
+def _iter_json(fp):
+    with open(fp, "r", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except Exception:
+                continue
+
+
+def _short_path(p):
+    parts = [x for x in p.split("/") if x]
+    return p if len(parts) <= 2 else ".../" + "/".join(parts[-2:])
+
+
+def _tool_label(b):
+    """A human-readable label for a tool_use block, e.g. 'Edit  .../app/Foo.swift'.
+    Mirrors the iOS side's toolSummary so loaded history matches live turns."""
+    name = b.get("name", "")
+    inp = b.get("input") if isinstance(b.get("input"), dict) else {}
+    if name == "ExitPlanMode":
+        # Must match the iOS toolSummary byte-for-byte so live and reloaded
+        # turns render identically (tapping the chip reopens the plan sheet).
+        return "Plan ready · tap to review"
+    detail = None
+    if name in ("Read", "Write", "Edit", "NotebookEdit"):
+        fp = inp.get("file_path")
+        detail = _short_path(fp) if fp else None
+    elif name == "Bash":
+        cmd = inp.get("command")
+        detail = cmd[:80] if cmd else None
+    elif name in ("Grep", "Glob"):
+        detail = inp.get("pattern")
+    elif name in ("WebFetch", "WebSearch"):
+        detail = inp.get("url") or inp.get("query")
+    elif name == "Task":
+        detail = inp.get("description")
+    return "{}  {}".format(name, detail) if detail else name
+
+
+def _text_of(content):
+    """Flatten a message 'content' into (text, tool_labels, thinking)."""
+    text, tools, thinking = "", [], ""
+    if isinstance(content, str):
+        return content, tools, thinking
+    if isinstance(content, list):
+        for b in content:
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") == "text":
+                text += b.get("text", "")
+            elif b.get("type") == "thinking":
+                thinking += b.get("thinking", "")
+            elif b.get("type") == "tool_use":
+                tools.append(_tool_label(b))
+    return text, tools, thinking
+
+
+TOOL_FIELD_CAP = 20000   # truncate huge tool fields so transcript JSON stays sane
+
+
+def _trunc(s):
+    if not isinstance(s, str):
+        return None
+    return s if len(s) <= TOOL_FIELD_CAP else s[:TOOL_FIELD_CAP] + "\n… (truncated)"
+
+
+def _tool_block(b):
+    """A LIGHTWEIGHT tool block: label + tool_use id + file path. The heavy detail
+    (Edit old/new, Write content, Bash command) is fetched lazily via `tool-detail`
+    only when the user taps the chip, so the transcript payload stays small."""
+    name = b.get("name", "")
+    inp = b.get("input") if isinstance(b.get("input"), dict) else {}
+    blk = {"t": "tool", "v": _tool_label(b), "name": name}
+    if b.get("id"):
+        blk["id"] = b["id"]
+    if inp.get("file_path"):
+        blk["filePath"] = inp["file_path"]
+    return blk
+
+
+# The two workflow-launch MCP tools answer with a tiny {"wfId": …} JSON. That
+# result is attached to the launch tool's own block so a transcript reload can
+# rebuild the phone's tap-to-monitor chip (the live stream sees the tool_result
+# event directly). Launch tools ONLY — any other tool's result (a Read/Bash dump
+# can be huge) stays off the transcript payload, as before.
+WF_LAUNCH_TOOLS = ("mcp__perviotools__pervio_start", "mcp__perviotools__pervio_rerun")
+
+
+def _attach_wf_results(blocks, content):
+    """Copy each tool_result's text onto the matching launch-tool block (by
+    tool_use id) in `blocks`. Mutates the block dicts in place; a non-launch or
+    unmatched result is ignored."""
+    launch = {b.get("id"): b for b in blocks
+              if isinstance(b, dict) and b.get("t") == "tool"
+              and b.get("name") in WF_LAUNCH_TOOLS and b.get("id")}
+    if not launch:
+        return
+    for r in content:
+        if not isinstance(r, dict):
+            continue
+        blk = launch.get(r.get("tool_use_id"))
+        if blk is None or "result" in blk:
+            continue
+        rc = r.get("content")
+        if isinstance(rc, list):
+            rc = "\n".join(c.get("text") or "" for c in rc
+                           if isinstance(c, dict) and c.get("type") == "text")
+        if isinstance(rc, str) and rc.strip():
+            blk["result"] = rc[:500]        # {"wfId":…} is tiny; errors get clipped
+
+
+def cmd_tool_detail(directory, session, tool_id):
+    """Return the heavy detail for ONE tool call (by its tool_use id), fetched on
+    demand when the user taps its chip: Edit -> old/new, Write -> content,
+    Bash -> command, ExitPlanMode -> plan text as content (truncated)."""
+    fp = _session_path(directory, session)
+    out = {}
+    if tool_id and fp and os.path.isfile(fp):
+        for o in _iter_json(fp):
+            content = o.get("message", {}).get("content")
+            if not isinstance(content, list):
+                continue
+            for b in content:
+                if not (isinstance(b, dict) and b.get("type") == "tool_use" and b.get("id") == tool_id):
+                    continue
+                inp = b.get("input") if isinstance(b.get("input"), dict) else {}
+                name = b.get("name", "")
+                if name in ("Edit", "NotebookEdit"):
+                    if inp.get("old_string") is not None:
+                        out["oldString"] = _trunc(inp.get("old_string"))
+                    if inp.get("new_string") is not None:
+                        out["newString"] = _trunc(inp.get("new_string"))
+                elif name == "Write" and inp.get("content") is not None:
+                    out["content"] = _trunc(inp.get("content"))
+                elif name == "Bash" and inp.get("command") is not None:
+                    out["command"] = _trunc(inp.get("command"))
+                elif name == "ExitPlanMode" and inp.get("plan") is not None:
+                    # The plan text, so a history chip can reopen the approval sheet.
+                    out["content"] = _trunc(inp.get("plan"))
+                print(json.dumps(out))
+                return
+    print(json.dumps(out))
+
+
+def _blocks_of(content):
+    """Ordered content blocks preserving execution order, so the phone renders a
+    turn as it happened (thinking → text → tool → text …) instead of clumping all
+    tools then all text. Returns [{"t": "text"|"thinking"|"tool", "v": str, …}]."""
+    blocks = []
+    if isinstance(content, str):
+        if content.strip():
+            blocks.append({"t": "text", "v": content})
+        return blocks
+    if isinstance(content, list):
+        for b in content:
+            if not isinstance(b, dict):
+                continue
+            bt = b.get("type")
+            if bt == "text" and b.get("text"):
+                blocks.append({"t": "text", "v": b["text"]})
+            elif bt == "thinking" and b.get("thinking"):
+                blocks.append({"t": "thinking", "v": b["thinking"]})
+            elif bt == "tool_use":
+                blocks.append(_tool_block(b))
+    return blocks
+
+
+ATTACHED_HEADER = "The user attached the following file(s) on this machine"
+
+
+def _fold_app_injections(text):
+    """The phone's own injections, folded for a title: the attached-files list
+    → the ask (or the first file's name when there was none), a handed-over
+    directory → its name. The person never typed these lines."""
+    if text.startswith(ATTACHED_HEADER):
+        lines = text.split("\n")
+        paths = [l[2:] for l in lines[1:] if l.startswith("- ")]
+        rest = "\n".join(l for l in lines[1:] if not l.startswith("- ")).strip()
+        if rest and rest != "Please look at the attached file(s).":
+            return rest
+        return ("📎 " + os.path.basename(paths[0])) if paths else ""
+    for prefix in ("背景项目:", "Background project: "):
+        if text.startswith(prefix):
+            path = text[len(prefix):].split("\n", 1)[0].strip()
+            return "📁 " + (os.path.basename(path.rstrip("/")) or path)
+    return text
+
+
+def first_user_text(fp):
+    """Best-effort preview: the first *substantial* user message (so a chat that
+    opens with a trivial 'd'/'hi'/'继续' gets titled by the next real message),
+    ignoring IDE/system wrappers and tool-result turns. Falls back to the first
+    non-empty message if every message is short."""
+    first = ""
+    for o in _iter_json(fp):
+        if o.get("type") != "user":
+            continue
+        content = o.get("message", {}).get("content")
+        # skip tool-result-only turns
+        if isinstance(content, list) and content and all(
+            isinstance(b, dict) and b.get("type") == "tool_result" for b in content
+        ):
+            continue
+        text, _, _ = _text_of(content)
+        text = _fold_app_injections(text.strip()).strip()
+        # Skip IDE/harness-injected noise that isn't real user intent.
+        if (not text or text.startswith("<")
+                or text.startswith("[Request interrupted")
+                or text.startswith("Caveat: The messages below")):
+            continue
+        if not first:
+            first = text
+        if len(text) > 3:           # substantial enough to title the chat
+            return text[:140]
+    return first[:140]
+
+
+def cwd_of(fp):
+    for o in _iter_json(fp):
+        if o.get("cwd"):
+            return o["cwd"]
+    return ""
+
+
+def project_root(folder, fp):
+    """The cwd a ~/.claude/projects/<folder> stands for, read from its newest
+    session `fp`. Claude Code names the folder by encoding the cwd the session
+    was LAUNCHED in, and stamps every line with the cwd at that moment — which
+    drifts into subdirectories as the shell cds, and on a machine the sessions
+    were MIGRATED to, the early lines still carry the OLD machine's path
+    (2026-10-08: three projects listed under paths that no longer existed, so
+    every tap in the app dead-ended). So: of all cwds the session records, the
+    LATEST one whose encoding IS this folder wins — that excludes both the
+    subdirectories and the old root; when none matches (the session never ran
+    on this machine) decode the folder name against the real filesystem; only
+    then fall back to the first cwd, as before."""
+    match = first = ""
+    for o in _iter_json(fp):
+        c = o.get("cwd")
+        if not c:
+            continue
+        if not first:
+            first = c
+        if encode(c) == folder:
+            match = c
+    return match or _decode_folder(folder) or first
+
+
+def _decode_folder(folder):
+    """Recover a real directory from Claude Code's folder name by walking the
+    filesystem. The encoding is lossy ('-' may stand for '/', '.', ' ', '_' or
+    any non-ASCII char), so rather than guess, match real directory entries
+    whose own encoding equals a run of the name's dash-separated segments.
+    "" when nothing on this machine fits."""
+    segs = folder.split("-")
+    if len(segs) < 2 or segs[0] != "":        # absolute paths encode with a leading '-'
+        return ""
+
+    def walk(path, i):
+        if i == len(segs):
+            return path
+        try:
+            entries = sorted(os.listdir(path))
+        except OSError:
+            return ""
+        for e in entries:
+            full = os.path.join(path, e)
+            if not os.path.isdir(full):
+                continue
+            enc = encode(e)
+            run = ""
+            for j in range(i, len(segs)):          # an entry may span several segments
+                run = segs[j] if j == i else run + "-" + segs[j]
+                if run == enc:
+                    r = walk(full, j + 1)
+                    if r:
+                        return r
+                    break
+                if len(run) > len(enc):
+                    break
+        return ""
+
+    return walk("/", 1)
+
+
+def ai_title(fp):
+    """Claude Code's generated conversation title — the last 'ai-title' entry.
+    This is what desktop CC shows in its list; far better than the raw first
+    message (which can be just 'd' or 'hi')."""
+    title = ""
+    for o in _iter_json(fp):
+        if o.get("type") == "ai-title":
+            t = (o.get("aiTitle") or "").strip()
+            if t:
+                title = t
+    return title
+
+
+# ---------- Codex sessions (~/.codex/sessions/<Y>/<M>/<D>/rollout-*-<id>.jsonl) ----------
+# Codex stores conversations separately from Claude with a different shape: a
+# first-line `session_meta` (payload.id = thread_id, payload.cwd), then
+# `response_item` messages (user input_text / assistant output_text). We surface
+# them in the SAME list/transcript JSON shape so the phone treats both backends
+# uniformly. NOTE: listing scans every rollout's first line (filtered by cwd);
+# fine for a personal store, revisit if it ever grows huge.
+#
+# codex ≥0.153 broke "one file = one conversation" two ways (2026-09-12, both
+# observed live):
+#   * pagination — a long thread overflows into continuation files named
+#     rollout-<ts>-<threadId>_<segmentId>.jsonl whose head keeps the SAME
+#     payload.id and records where it resumes (history_base.end_*). One
+#     conversation, several files: list them as ONE row, read them in order.
+#   * multi-agent v2 — helper sub-threads get their own rollout files
+#     (thread_source == "subagent", parent_thread_id set). They are NOT openable
+#     conversations: codex refuses `thread/resume` on one ("resume the parent
+#     first"), and their results are reported back into the parent thread. Hide
+#     them everywhere (list, search) or the picker fills with dead rows.
+
+def _codex_rollouts():
+    return glob.glob(os.path.join(CODEX_SESS, "*", "*", "*", "rollout-*.jsonl"))
+
+
+def _codex_meta(fp):
+    """First-line session_meta payload (id, cwd, …), or {}."""
+    try:
+        with open(fp, "r", errors="replace") as f:
+            o = json.loads(f.readline())
+        if o.get("type") == "session_meta":
+            return o.get("payload") or {}
+    except Exception:
+        pass
+    return {}
+
+
+def _codex_subthread(meta):
+    """True for a multi-agent helper thread — hidden, never resumable on its
+    own. A pagination segment is NOT one (same thread, thread_source "user");
+    a manual fork is NOT one either (own id, forked_from_id, no parent)."""
+    return meta.get("thread_source") == "subagent" or bool(meta.get("parent_thread_id"))
+
+
+def _codex_files(session):
+    """ALL rollout files of one codex thread, oldest → newest: the original
+    rollout-<ts>-<id>.jsonl plus any pagination segments
+    rollout-<ts>-<id>_<seg>.jsonl. The filename's timestamp prefix makes a
+    basename sort chronological. [] for an unsafe or unknown id."""
+    if not session or "/" in session or ".." in session or "\x00" in session:
+        return []
+    day = os.path.join(CODEX_SESS, "*", "*", "*")
+    hits = (glob.glob(os.path.join(day, "rollout-*-%s.jsonl" % session))
+            + glob.glob(os.path.join(day, "rollout-*-%s_*.jsonl" % session)))
+    return sorted(hits, key=os.path.basename)
+
+
+def _codex_token_count(fp):
+    """The LAST `token_count` payload in a rollout — codex's own record of how much
+    of the window this conversation is using and where its plan's quota stands.
+
+    Shape (verified against every rollout on this machine, codex-cli 0.146.1):
+        {"type":"event_msg","payload":{"type":"token_count",
+          "info":{"total_token_usage":{…},"last_token_usage":{…},
+                  "model_context_window":258400},
+          "rate_limits":{"primary":{"used_percent","window_minutes","resets_at"},
+                         "secondary":…,"plan_type":…}}}
+    One line is appended per model request, so the last one describes NOW.
+    Returns {} when the rollout has none (old codex, or a turn that never billed)."""
+    last = {}
+    try:
+        for o in _iter_json(fp):
+            if o.get("type") != "event_msg":
+                continue
+            p = o.get("payload")
+            if isinstance(p, dict) and p.get("type") == "token_count":
+                last = p
+    except OSError:
+        return {}
+    return last
+
+
+def _codex_model(fp):
+    """The model this thread last ran on, from the `turn_context` line codex writes
+    at the start of each turn (the rollout has no model field in session_meta)."""
+    model = ""
+    try:
+        for o in _iter_json(fp):
+            if o.get("type") != "turn_context":
+                continue
+            p = o.get("payload")
+            if isinstance(p, dict) and p.get("model"):
+                model = p["model"]
+    except OSError:
+        pass
+    return model
+
+
+# Inside the IDE preamble, the words the person actually typed sit under this
+# marker ("# Context from my IDE setup: … ## My request:\n<question>") — ONE
+# user message, boilerplate first. codex_vscode 0.153.4, verified live.
+_CODEX_REQUEST_MARK = "## My request"
+
+# A message delivered by pervio-group opens with a hidden header telling the
+# model who is talking and how to read the others; the phone shows only the
+# words after it, with a small "via" label from the header's `from`.
+_GROUP_OPEN = "<pervio-group"
+_GROUP_CLOSE = "</pervio-group>"
+
+
+def _strip_group(text):
+    """(display text, via) — `via` is the header's from= value ("human",
+    "synth", "relay") or None when the text carries no group header."""
+    if not text.startswith(_GROUP_OPEN):
+        return text, None
+    end = text.find(_GROUP_CLOSE)
+    if end < 0:
+        return text, None
+    head = text[:end]
+    m = re.search(r'from="([^"]*)"', head)
+    return text[end + len(_GROUP_CLOSE):].lstrip("\n"), (m.group(1) if m else "group")
+
+
+def _codex_user_text(text):
+    """What a codex user message should DISPLAY, or None to hide it.
+
+    Plain typed text passes through. An IDE-preamble message yields just the
+    request part after _CODEX_REQUEST_MARK (first occurrence — the marker is
+    the wrapper's, anything later belongs to the person's own words); with no
+    marker it is context-only noise and hides. 2026-09-15: the previous
+    wholesale prefix drop was eating the QUESTION along with the boilerplate —
+    six of the user's own turns vanished from one thread's transcript."""
+    text, _via = _strip_group(text)
+    if text.startswith("<"):
+        return None
+    if text.startswith("# Context from my IDE"):
+        i = text.find(_CODEX_REQUEST_MARK)
+        if i < 0:
+            return None
+        req = text[i + len(_CODEX_REQUEST_MARK):].lstrip(":").strip()
+        return req or None
+    return text
+
+
+def _codex_first_user_text(fp):
+    """First substantial user prompt — the person's words, unwrapped from
+    codex's injected noise."""
+    first = ""
+    for o in _iter_json(fp):
+        if o.get("type") != "response_item":
+            continue
+        p = o.get("payload") or {}
+        if p.get("type") != "message" or p.get("role") != "user":
+            continue
+        text = "".join(c.get("text") or "" for c in (p.get("content") or [])
+                       if isinstance(c, dict) and c.get("type") in ("input_text", "text")).strip()
+        text = _codex_user_text(text)
+        if not text:
+            continue
+        if not first:
+            first = text
+        if len(text) > 3:
+            return text[:140]
+    return first[:140]
+
+
+def _same_dir(a, b):
+    """The same folder in either spelling: as typed, or resolved through the
+    symlinks on the way (OneDrive's Known Folder Move makes ~/Documents a link
+    into ~/Library/CloudStorage; pervio-chat launches codex on the RESOLVED path
+    because its sandbox refuses symlinked writable roots, so a codex thread
+    records the real path while the person's entry says ~/Documents/…)."""
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    try:
+        return os.path.realpath(a) == os.path.realpath(b)
+    except OSError:
+        return False
+
+
+def _user_spelling(path):
+    """A real path under a cloud-synced folder, spelled the way the person
+    sees it: ~/Documents/x instead of ~/Library/CloudStorage/OneDrive-…/
+    Documents/x, when ~/Documents (or Desktop, Downloads) is the link that
+    leads there. Anything else comes back unchanged."""
+    for name in ("Documents", "Desktop", "Downloads"):
+        link = os.path.join(HOME, name)
+        if not os.path.islink(link):
+            continue
+        try:
+            real = os.path.realpath(link).rstrip("/")
+            rp = os.path.realpath(path)          # /tmp vs /private/tmp and the like
+        except OSError:
+            continue
+        if rp == real or rp.startswith(real + "/"):
+            return link + rp[len(real):]
+    return path
+
+
+def _codex_sessions_for(directory):
+    """One row per conversation: pagination segments fold into their thread
+    (newest mtime wins the sort, sizes add up), sub-threads don't list at all.
+    Preview comes from the earliest file that has a real user prompt — the
+    conversation's actual opener, stable across segment rollover."""
+    groups = {}   # thread id -> [files]
+    for fp in _codex_rollouts():
+        meta = _codex_meta(fp)
+        if not _same_dir(meta.get("cwd"), directory) or _codex_subthread(meta):
+            continue
+        tid = meta.get("id")
+        if not tid:
+            continue
+        groups.setdefault(tid, []).append(fp)
+    out = []
+    for tid, files in groups.items():
+        files.sort(key=os.path.basename)
+        out.append({
+            "id": tid,
+            "preview": next((t for t in (_codex_first_user_text(fp) for fp in files) if t), ""),
+            "modified": int(max(os.path.getmtime(fp) for fp in files)),
+            "bytes": sum(os.path.getsize(fp) for fp in files),
+            "backend": "codex",
+        })
+    return out
+
+
+def _codex_transcript(files, limit):
+    """Turns across a thread's files in order — a paginated conversation reads
+    as one continuous transcript (segments hold only what came after their
+    base, so plain concatenation is exact)."""
+    turns = []
+    for fp in files:
+        for o in _iter_json(fp):
+            if o.get("type") != "response_item":
+                continue
+            p = o.get("payload") or {}
+            if p.get("type") != "message":
+                continue
+            role = p.get("role")
+            if role not in ("user", "assistant"):
+                continue   # skip developer/system injected messages
+            text = "".join(c.get("text") or "" for c in (p.get("content") or [])
+                           if isinstance(c, dict) and c.get("type") in ("input_text", "output_text", "text")).strip()
+            via = None
+            if role == "user":
+                _t, via = _strip_group(text)
+                text = _codex_user_text(text) or ""   # unwrap IDE preamble, drop pure noise
+            if not text:
+                continue
+            turn = {"role": role, "text": text, "tools": [], "thinking": None, "blocks": []}
+            if via:
+                turn["via"] = via
+            turns.append(turn)
+    return turns[-limit:]
+
+
+# ---------- Cursor ----------
+_CURSOR_ID = re.compile(r"^[0-9a-fA-F-]{8,64}$")
+
+
+def _cursor_workspaces(directory):
+    """The chat folders Cursor could have used for this cwd: it hashes the
+    process cwd (a realpath — /tmp becomes /private/tmp), so try both spellings."""
+    import hashlib
+    out = []
+    for d in dict.fromkeys([directory, os.path.realpath(directory)]):
+        if d:
+            out.append(os.path.join(CURSOR_CHATS, hashlib.md5(d.encode("utf-8")).hexdigest()))
+    return out
+
+
+def _cursor_transcript_file(chat_id):
+    if not _CURSOR_ID.match(chat_id or ""):
+        return None
+    hits = glob.glob(os.path.join(CURSOR_PROJECTS, "*", "agent-transcripts", chat_id, chat_id + ".jsonl"))
+    return hits[0] if hits else None
+
+
+def _cursor_user_text(text):
+    """The person's words: Cursor wraps them in <timestamp>…</timestamp> and
+    <user_query>…</user_query>; a group header may sit inside the query."""
+    t = re.sub(r"<timestamp>.*?</timestamp>\s*", "", text or "", flags=re.S)
+    m = re.search(r"<user_query>\s*(.*?)\s*</user_query>", t, flags=re.S)
+    return (m.group(1) if m else t).strip()
+
+
+def _cursor_turns(fp):
+    """Turns in the phone's shape. Cursor writes one line per assistant block;
+    consecutive assistant lines fold into one turn, as Claude's do."""
+    turns = []
+    for o in _iter_json(fp):
+        role = o.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        content = (o.get("message") or {}).get("content") or []
+        if not isinstance(content, list):
+            continue
+        if role == "user":
+            text = "".join(b.get("text") or "" for b in content if isinstance(b, dict) and b.get("type") == "text")
+            text = _cursor_user_text(text)
+            text, via = _strip_group(text)
+            if not text:
+                continue
+            turn = {"role": "user", "text": text, "tools": [], "thinking": None, "blocks": []}
+            if via:
+                turn["via"] = via
+            turns.append(turn)
+            continue
+        norm = []
+        for b in content:
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") == "tool_use":
+                name = b.get("name") or "Tool"
+                inp = b.get("input") if isinstance(b.get("input"), dict) else {}
+                if name == "Shell":
+                    name = "Bash"
+                if "path" in inp and "file_path" not in inp:
+                    inp = dict(inp, file_path=inp["path"])
+                norm.append({"type": "tool_use", "name": name, "input": inp, "id": b.get("id")})
+            else:
+                norm.append(b)
+        text, tools, thinking = _text_of(norm)
+        blocks = _blocks_of(norm)
+        if not text and not tools:
+            continue
+        if turns and turns[-1]["role"] == "assistant":
+            cur = turns[-1]
+            cur["text"] = (cur["text"] + "\n\n" + text) if (cur["text"] and text) else (cur["text"] or text)
+            cur["tools"].extend(tools)
+            cur["blocks"].extend(blocks)
+        else:
+            turns.append({"role": "assistant", "text": text, "tools": tools,
+                          "thinking": thinking or None, "blocks": blocks})
+    return turns
+
+
+def _cursor_first_user_text(fp):
+    for o in _iter_json(fp):
+        if o.get("role") != "user":
+            continue
+        content = (o.get("message") or {}).get("content") or []
+        text = "".join(b.get("text") or "" for b in content if isinstance(b, dict) and b.get("type") == "text")
+        text, _via = _strip_group(_cursor_user_text(text))
+        if text:
+            return text[:200]
+    return ""
+
+
+def _cursor_meta(ws, cid):
+    try:
+        with open(os.path.join(ws, cid, "meta.json"), "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _cursor_sessions_for(directory):
+    out, seen = [], set()
+    for ws in _cursor_workspaces(directory):
+        if not os.path.isdir(ws):
+            continue
+        for cid in os.listdir(ws):
+            if cid in seen or not _CURSOR_ID.match(cid):
+                continue
+            meta = _cursor_meta(ws, cid)
+            if meta.get("hasConversation") is False:
+                continue
+            fp = _cursor_transcript_file(cid)
+            if not fp:
+                continue                      # an empty chat (create-chat) has nothing to show yet
+            modified = int((meta.get("updatedAtMs") or meta.get("createdAtMs") or 0) / 1000) or int(os.path.getmtime(fp))
+            seen.add(cid)
+            out.append({"id": cid, "preview": _cursor_first_user_text(fp), "modified": modified,
+                        "bytes": os.path.getsize(fp), "backend": "cursor"})
+    return out
+
+
+def _cursor_in_dir(directory, cid):
+    return any(os.path.isdir(os.path.join(ws, cid)) for ws in _cursor_workspaces(directory))
+
+
+def _cursor_dialog_text(o):
+    """Search predicate: a Cursor transcript line's real dialogue text."""
+    role = o.get("role")
+    if role not in ("user", "assistant"):
+        return None
+    content = (o.get("message") or {}).get("content") or []
+    if not isinstance(content, list):
+        return None
+    text = "".join(b.get("text") or "" for b in content if isinstance(b, dict) and b.get("type") == "text")
+    if role == "user":
+        text, _via = _strip_group(_cursor_user_text(text))
+    return text or None
+
+
+def _wf_internal(path):
+    """Cwds that are not "your projects", hidden from `projects` AND `search`:
+
+    * workflow-internal (~/.pervio/wf/<id>/… — orchestrator worktrees,
+      fanout/dispatch scratch dirs): every spawned child minted a project
+      folder, flooding the picker with rows like "wt". Their conversations
+      stay reachable from the run detail page. Other ~/.pervio subdirs
+      (e.g. papers) still list. Also match the ENCODED folder-name fallback
+      (a crashed session may record no cwd, and `path` then falls back to
+      the -Users-x--pervio-wf-… form the substring above can't see).
+    * temp-dir sessions (/tmp, /private/tmp, /var/folders): throwaway
+      experiment cwds — an agent test-driving prompts in its scratchpad
+      minted rows like「2608.04962」「wd」in the user's picker
+      (2026-08-21, observed and cleaned). Nobody keeps a real project in
+      a directory the OS may wipe at reboot; if a session lives there,
+      it was never meant to be seen."""
+    if "/.pervio/wf/" in path or "-.pervio-wf-" in path.replace("--", "-"):
+        return True
+    # …but never hide anything inside the user's own HOME: the hermetic test
+    # suites (and nothing else) run with $HOME under /tmp, and a blanket /tmp
+    # rule swallowed their legitimate fixtures whole.
+    h = os.path.expanduser("~")
+    inside_home = path == h or path.startswith(h + os.sep)
+    return (not inside_home) and path.startswith(
+        ("/tmp/", "/private/tmp/", "/private/var/folders/", "/var/folders/"))
+
+
+def _expand(p):
+    """~ and ~/x as the phone spells them → the Mac's absolute path."""
+    p = (p or "").strip()
+    if p == "~":
+        return HOME
+    if p.startswith("~/"):
+        return os.path.join(HOME, p[2:])
+    return p
+
+
+def under(path, root):
+    """Is `path` the folder `root` or inside it? The phone's working directory
+    IS a server's scope ("~" sees the whole home, "~/a" only a and below —
+    the person's rule, 2026-10-15), so every verb that enumerates ACROSS
+    folders takes --under and asks this. Both spellings of each side are
+    tried (as recorded, and resolved), so /tmp vs /private/tmp never splits
+    a project from itself."""
+    root = _expand(root).rstrip("/")
+    if not root:
+        return True
+    path = (path or "").rstrip("/")
+    roots = {root, os.path.realpath(root)}
+    paths = {path, os.path.realpath(path)}
+    return any(p == r or p.startswith(r + "/") for r in roots for p in paths)
+
+
+def cmd_projects(root=""):
+    print(json.dumps(_projects_rows(root)))
+
+
+def _projects_rows(root=""):
+    out = []
+    if os.path.isdir(PROJ):
+        for d in sorted(os.listdir(PROJ)):
+            full = os.path.join(PROJ, d)
+            if not os.path.isdir(full):
+                continue
+            jsonls = glob.glob(os.path.join(full, "*.jsonl"))
+            if not jsonls:
+                continue
+            jsonls.sort(key=os.path.getmtime, reverse=True)
+            path = project_root(d, jsonls[0]) or d
+            if _wf_internal(path) or (root and not under(path, root)):
+                continue
+            out.append({
+                "path": path,
+                "sessions": len(jsonls),
+                "modified": int(os.path.getmtime(jsonls[0])),
+            })
+    # Folders that only Codex or Cursor ever worked in: Claude Code never made a
+    # folder for them, so until now they were invisible as projects and their
+    # conversations unreachable from the phone (a Codex-only tester, 2026-10-15).
+    # A folder Claude Code has a project for is a project whatever the disk
+    # says (its root is read migration-aware above); one it has no project for
+    # must exist on this Mac, or it is a ghost — a cwd that came along from
+    # another machine in a Codex thread (two "Pervio" folders, 2026-11-11).
+    claude_paths = {row["path"] for row in out}
+    def on_this_mac(cwd):
+        return cwd in claude_paths or os.path.isdir(_expand(cwd))
+    seen_codex = {}   # cwd -> (threads, newest mtime)
+    for fp in _codex_rollouts():
+        meta = _codex_meta(fp)
+        if meta.get("cwd"):
+            meta = dict(meta, cwd=_user_spelling(meta["cwd"]))   # the person's spelling, not the sandbox's
+        cwd, tid = meta.get("cwd"), meta.get("id")
+        if not cwd or not tid or _wf_internal(cwd) or _codex_subthread(meta):
+            continue
+        if root and not under(cwd, root):
+            continue
+        if not on_this_mac(cwd):               # a ghost; its conversations stay reachable through search
+            continue
+        threads, newest = seen_codex.get(cwd, (set(), 0))
+        threads.add(tid)
+        seen_codex[cwd] = (threads, max(newest, int(os.path.getmtime(fp))))
+    for cwd, (threads, newest) in seen_codex.items():
+        out.append({"path": cwd, "sessions": len(threads), "modified": newest})
+    if os.path.isdir(CURSOR_CHATS):
+        seen_cursor = {}
+        for ws in os.listdir(CURSOR_CHATS):
+            wsd = os.path.join(CURSOR_CHATS, ws)
+            if not os.path.isdir(wsd):
+                continue
+            for cid in os.listdir(wsd):
+                mp = os.path.join(wsd, cid, "meta.json")
+                try:
+                    meta = json.load(open(mp, encoding="utf-8"))
+                except Exception:
+                    continue
+                cwd = meta.get("cwd") or meta.get("workspace") or ""
+                if not cwd or _wf_internal(cwd) or (root and not under(cwd, root)):
+                    continue
+                if not on_this_mac(cwd):                 # same rule as the codex rows above
+                    continue
+                n, newest = seen_cursor.get(cwd, (0, 0))
+                seen_cursor[cwd] = (n + 1, max(newest, int((meta.get("updatedAtMs") or 0) // 1000)))
+        for cwd, (n, newest) in seen_cursor.items():
+            out.append({"path": cwd, "sessions": n, "modified": newest})
+    # Two folders can resolve to ONE project (Claude Code's folder encoding
+    # changed once — a path with a dot got a second folder — and a sandbox's
+    # /var vs /private/var spelling does the same): one row per path, sessions
+    # summed, newest modified kept, or the phone shows the project twice.
+    merged = {}
+    for row in out:
+        m = merged.get(row["path"])
+        if m is None:
+            merged[row["path"]] = dict(row)
+        else:
+            m["sessions"] += row["sessions"]
+            m["modified"] = max(m["modified"], row["modified"])
+    out = list(merged.values())
+    out.sort(key=lambda x: x["modified"], reverse=True)
+    return out
+
+
+def cmd_home(directory, top=3, per=3, limit=10):
+    """The phone's home page in ONE round trip (2026-10-17): the folders the
+    person worked in most recently, each with its newest conversations, and
+    the conversations held directly in the default folder — the ones started
+    from the home page without a project (the casual chats). The default
+    folder is the scope as well ("~" sees everything, "~/a" only a and below)
+    and never lists itself as a project; pinned chats of the default folder
+    ride along past the limit, since the phone shows pins first."""
+    rows = [p for p in _projects_rows(directory) if not _same_dir(_expand(p["path"]), directory)]
+    rows.sort(key=lambda p: p["modified"], reverse=True)
+    projects = []
+    for p in rows[:max(0, top)]:
+        projects.append(dict(p, recent=_list_rows(p["path"])[:max(0, per)]))
+    recent = _list_rows(directory)
+    cut = recent[:max(0, limit)]
+    seen = {r["id"] for r in cut}
+    cut += [r for r in recent if r.get("pinned") and r["id"] not in seen]
+    print(json.dumps({"dir": directory, "projects": projects, "recent": cut}))
+
+
+def _group_of_sessions():
+    """{session id: group id} over ~/.pervio/groups — a member whose
+    conversation exists yet. Missing dir / bad file → nobody is grouped."""
+    out = {}
+    gdir = os.path.join(HOME, ".pervio", "groups")
+    try:
+        names = os.listdir(gdir)
+    except OSError:
+        return out
+    for fn in names:
+        if not fn.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(gdir, fn), "r", encoding="utf-8") as f:
+                g = json.load(f)
+        except (OSError, ValueError):
+            continue
+        gid = g.get("id") or fn[:-5]
+        for m in [g.get("primary") or {}] + list(g.get("members") or []):
+            sid = (m or {}).get("session")
+            if sid:
+                out[sid] = gid
+    return out
+
+
+def cmd_list(directory):
+    print(json.dumps(_list_rows(directory)))
+
+
+def _list_rows(directory):
+    full = _proj_dir(directory)
+    out = []
+    if os.path.isdir(full):
+        for fp in glob.glob(os.path.join(full, "*.jsonl")):
+            out.append({
+                # Prefer the user's own first message (in their language) over
+                # Claude Code's auto-generated ai-title, which is always English.
+                "id": os.path.basename(fp)[:-6],
+                "preview": first_user_text(fp) or ai_title(fp),
+                "modified": int(os.path.getmtime(fp)),
+                "bytes": os.path.getsize(fp),
+                "backend": "claude",
+            })
+    # Codex conversations for the same cwd, merged in so the phone shows both.
+    out += _codex_sessions_for(directory)
+    out += _cursor_sessions_for(directory)
+    # The pin ledger rides along on the SAME round trip: every row says whether
+    # it is pinned (and since when), so the phone never fetches pins separately.
+    pins = _pins_load()
+    groups = _group_of_sessions()
+    meta = _meta_load()
+    for row in out:
+        e = pins.get(row["id"])
+        row["pinned"] = bool(e)
+        if e:
+            row["pinnedAt"] = int(e.get("at") or 0)
+        # The person's own name and the folders handed over (meta.json).
+        m = meta.get(row["id"])
+        if m:
+            if m.get("title"):
+                row["title"] = m["title"]
+            if m.get("dirs"):
+                row["dirs"] = m["dirs"]
+        # A member of a group (pervio-group) says so: the phone shows the group
+        # as ONE row and reaches the member through it, instead of scattering
+        # the members as unrelated conversations (user, 2026-10-12).
+        gid = groups.get(row["id"])
+        if gid:
+            row["group"] = gid
+    out.sort(key=lambda x: x["modified"], reverse=True)
+    return out
+
+
+# ---------- search (cross-project full-text, claude + codex) ----------
+# Performance discipline (single session files reach 81MB — NEVER slurp one):
+#   1. files are visited newest-mtime first, so the scan can stop as soon as
+#      `limit` hits exist (the output is sorted by modified desc anyway);
+#   2. each file is streamed line by line; a line is json-parsed ONLY after a
+#      cheap lower() substring pre-filter on the raw line;
+#   3. a parsed line must pass the transcript's own dialogue predicates (real
+#      user/assistant body text — tool_result carriers, subagent lines and
+#      <noise> wrappers don't count) AND re-match on the extracted text;
+#   4. the FIRST true hit ends the scan of that file.
+
+
+def _probe_of(query):
+    """The longest query fragment guaranteed to appear LITERALLY in the raw JSONL
+    line whenever the parsed text contains the query. Both stores serialize with
+    ensure_ascii=False (verified on real files: CJK is raw UTF-8; the only \\uXXXX
+    sequences are literal text inside tool output), so the JSON encoder escapes
+    only '\"', '\\\\' and control chars — a fragment free of those is a pre-filter
+    with no false negatives WITHIN a single text block. Known narrow exception:
+    a query straddling the boundary of two adjacent text blocks of one line
+    (the extractors join blocks with "") has no literal run in the raw line and
+    is missed — accepted; a search phrase spanning a block seam is a rare edge.
+    An empty probe (pathological query like '\"') just disables the pre-filter;
+    the parse+match stage stays correct either way."""
+    runs, cur = [], ""
+    for ch in query:
+        if ch in '"\\' or ord(ch) < 0x20:
+            if cur:
+                runs.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    if cur:
+        runs.append(cur)
+    return max(runs, key=len).lower() if runs else ""
+
+
+def _claude_dialog_text(o):
+    """The searchable body text of one Claude JSONL line, or None when the line
+    isn't real dialogue. Reuses cmd_transcript's filters verbatim: only
+    user/assistant lines; no subagent (Task) lines; a tool_result-only user line
+    is mid-turn, not dialogue; a '<'-wrapped user line is IDE/system noise.
+    _text_of collects text blocks only, so tool_use inputs, tool_result payloads
+    and thinking never enter the haystack."""
+    t = o.get("type")
+    if t not in ("user", "assistant"):
+        return None
+    if o.get("parent_tool_use_id") or o.get("isSidechain"):
+        return None
+    content = o.get("message", {}).get("content")
+    if t == "user" and isinstance(content, list) and content and all(
+        isinstance(b, dict) and b.get("type") == "tool_result" for b in content
+    ):
+        return None
+    text, _, _ = _text_of(content)
+    text = text.strip()
+    if t == "user":
+        text, _via = _strip_group(text)
+    if t == "user" and text.startswith("<"):
+        return None
+    return text or None
+
+
+def _codex_dialog_text(o):
+    """Codex counterpart: user/assistant response_item message text, with the
+    injected <environment_context>/<permissions> user noise dropped — the same
+    predicates _codex_transcript applies."""
+    if o.get("type") != "response_item":
+        return None
+    p = o.get("payload") or {}
+    if p.get("type") != "message" or p.get("role") not in ("user", "assistant"):
+        return None
+    text = "".join(c.get("text") or "" for c in (p.get("content") or [])
+                   if isinstance(c, dict) and c.get("type") in ("input_text", "output_text", "text")).strip()
+    if p.get("role") == "user":
+        return _codex_user_text(text)
+    return text or None
+
+
+def _scan_file(fp, q_lower, probe, extract):
+    """Stream one JSONL file for the FIRST dialogue line whose body text contains
+    the query (case-insensitive). Returns that text, or None. Never loads the
+    whole file; only pre-filter hits are json-parsed."""
+    try:
+        with open(fp, "r", errors="replace") as f:
+            for line in f:
+                if probe and probe not in line.lower():
+                    continue
+                try:
+                    o = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(o, dict):
+                    continue                     # valid JSON, wrong shape — skip,
+                try:                             # and one weird line must never
+                    text = extract(o)            # kill the whole cross-project scan
+                except (AttributeError, TypeError, KeyError):
+                    continue
+                if text is not None and q_lower in text.lower():
+                    return text
+    except OSError:
+        pass
+    return None
+
+
+def _snippet(text, q_lower, total=160):
+    """≤`total` chars of context around the (case-insensitive) hit, whitespace
+    collapsed so the phone renders one clean line."""
+    idx = text.lower().find(q_lower)
+    if idx < 0:                      # unreachable (caller matched); stay safe
+        idx = 0
+    before = max((total - len(q_lower)) // 2, 0)
+    start = max(idx - before, 0)
+    end = min(len(text), start + total)
+    start = max(end - total, 0)
+    return " ".join(text[start:end].split())
+
+
+def cmd_search(query, limit, root=""):
+    """Search real conversation text across ALL projects (both session stores).
+    The query is LITERAL text — case-insensitive substring, never a regex.
+    Prints [{project, id, backend, modified, snippet, preview}] sorted by
+    modified desc, at most `limit` rows. Empty query exits non-zero."""
+    if not query.strip():
+        print("search needs a non-empty --query", file=sys.stderr)
+        sys.exit(1)
+    q_lower = query.lower()
+    probe = _probe_of(query)
+    # (mtime, fp, project-path, session-id, backend) — newest first, so the walk
+    # can stop at `limit` hits and still be exactly the global top-N by modified.
+    # --under drops candidates outside the scope BEFORE the walk, so the N are
+    # the top-N inside it, never N global hits with the outsiders blanked.
+    cand = []
+    if os.path.isdir(PROJ):
+        for d in os.listdir(PROJ):
+            full = os.path.join(PROJ, d)
+            if not os.path.isdir(full):
+                continue
+            js = glob.glob(os.path.join(full, "*.jsonl"))
+            if not js:
+                continue
+            js.sort(key=os.path.getmtime, reverse=True)
+            path = project_root(d, js[0]) or d   # same real-path resolution as `projects`
+            if _wf_internal(path):
+                continue
+            for fp in js:
+                cand.append((os.path.getmtime(fp), fp, path,
+                             os.path.basename(fp)[:-6], "claude"))
+    for fp in _codex_rollouts():
+        meta = _codex_meta(fp)
+        tid, cwd = meta.get("id"), meta.get("cwd")
+        # Sub-threads are skipped for the same reason the list hides them: a hit
+        # would open a thread codex refuses to resume. A pagination segment stays
+        # a candidate — its head id IS the thread, so the hit opens the real row.
+        if not tid or not cwd or _wf_internal(cwd) or _codex_subthread(meta):
+            continue
+        cand.append((os.path.getmtime(fp), fp, cwd, tid, "codex"))
+    # Cursor chats: the transcript file is the candidate; its cwd comes from meta.json.
+    if os.path.isdir(CURSOR_CHATS):
+        for ws in os.listdir(CURSOR_CHATS):
+            wsd = os.path.join(CURSOR_CHATS, ws)
+            if not os.path.isdir(wsd):
+                continue
+            for cid in os.listdir(wsd):
+                if not _CURSOR_ID.match(cid):
+                    continue
+                meta = _cursor_meta(wsd, cid)
+                cwd = meta.get("cwd") or ""
+                fp = _cursor_transcript_file(cid)
+                if not cwd or not fp or _wf_internal(cwd):
+                    continue
+                cand.append((os.path.getmtime(fp), fp, cwd, cid, "cursor"))
+    if root:
+        cand = [c for c in cand if under(c[2], root)]
+    cand.sort(key=lambda c: c[0], reverse=True)
+    out = []
+    for mtime, fp, path, sid, backend in cand:
+        extract = (_claude_dialog_text if backend == "claude"
+                   else _cursor_dialog_text if backend == "cursor" else _codex_dialog_text)
+        text = _scan_file(fp, q_lower, probe, extract)
+        if text is None:
+            continue
+        preview = (first_user_text(fp) if backend == "claude"
+                   else _cursor_first_user_text(fp) if backend == "cursor"
+                   else _codex_first_user_text(fp))
+        out.append({
+            "project": path,
+            "id": sid,
+            "backend": backend,
+            "modified": int(mtime),
+            "snippet": _snippet(text, q_lower),
+            "preview": preview,
+        })
+        if len(out) >= limit:
+            break
+    print(json.dumps(out))
+
+
+def _turns_of(directory, session, backend="claude"):
+    """EVERY turn of a conversation, in order, plus the files it was read from
+    — the one reader behind `transcript` (the phone's history), `turns` (the
+    context export and the model's own paging) and the exports."""
+    if backend == "cursor":
+        # Bound to --dir like the other two: the transcript is found by chat id
+        # alone, so the chat must belong to this directory's workspace.
+        fp = _cursor_transcript_file(session) if _cursor_in_dir(directory, session) else None
+        return (_cursor_turns(fp) if fp else []), ([fp] if fp else [])
+    if backend == "codex":
+        # Bind to --dir like the Claude path (_session_path) does. _codex_files
+        # locates rollouts by thread id ALONE (a global glob), so without this cwd
+        # check, knowing any project's codex thread id would read its conversation
+        # from any other --dir. Same folder match the listing uses
+        # (_codex_sessions_for), so anything the phone could have listed still opens.
+        files = [fp for fp in _codex_files(session)
+                 if _same_dir(_codex_meta(fp).get("cwd"), directory)]
+        return _codex_transcript(files, 10 ** 9), files
+    fp = _session_path(directory, session)
+    turns = []
+    # Claude Code records ONE logical assistant turn as SEVERAL JSONL lines
+    # (thinking, then text, then each tool_use; a tool_result-only user line sits
+    # between tool calls). Coalesce that run into a single turn so the phone renders
+    # ONE bubble per turn — matching the live stream and desktop Claude Code. Before
+    # this, one turn per line made a reload split (and visually duplicate) a single
+    # turn across several bubbles.
+    cur = None   # the assistant turn currently being accumulated, or None
+    if fp and os.path.isfile(fp):
+        for o in _iter_json(fp):
+            t = o.get("type")
+            if t == "attachment" and not (o.get("parent_tool_use_id") or o.get("isSidechain")):
+                # A message the person sent MID-turn (2026-10-21): Claude Code does
+                # not write it as a `user` line — it rode the running turn's next
+                # request as a queued_command attachment (the queue entry is then
+                # marked absorbed_mid_turn). A user turn of its own here, flagged
+                # `mid`, so a reload shows what the live view showed: the words,
+                # and the rest of the reply below them.
+                a = o.get("attachment") or {}
+                # `prompt` is a string, or (an image/text message) a list of
+                # content blocks — a real 2026-10 conversation had 24 of those,
+                # and a .strip() on a list took the whole transcript down.
+                prompt = a.get("prompt") if isinstance(a, dict) else ""
+                if isinstance(prompt, list):
+                    prompt = "\n".join(b.get("text") or "" for b in prompt if isinstance(b, dict) and b.get("type") == "text")
+                words = prompt.strip() if isinstance(prompt, str) else ""
+                if isinstance(a, dict) and a.get("type") == "queued_command" and words \
+                        and a.get("commandMode") in (None, "prompt"):
+                    if cur is not None:
+                        turns.append(cur)
+                        cur = None
+                    turns.append({"role": "user", "text": words, "tools": [], "thinking": "", "blocks": [], "mid": True})
+                continue
+            if t not in ("user", "assistant"):
+                continue
+            # Skip subagent (Task) activity so it doesn't flatten into the main
+            # transcript — matches the live-stream filter and desktop Claude Code.
+            if o.get("parent_tool_use_id") or o.get("isSidechain"):
+                continue
+            content = o.get("message", {}).get("content")
+            # A tool-result-only user line is the MIDDLE of an assistant turn, not a
+            # new message — skip it WITHOUT closing the turn being accumulated. But
+            # first hang a workflow-launch result (its wfId) on the tool's block so
+            # the phone can rebuild the tap-to-monitor chip on reload.
+            if t == "user" and isinstance(content, list) and content and all(
+                isinstance(b, dict) and b.get("type") == "tool_result" for b in content
+            ):
+                if cur is not None:
+                    _attach_wf_results(cur["blocks"], content)
+                continue
+            text, tools, thinking = _text_of(content)
+            text = text.strip()
+            via = None
+            if t == "user":
+                text, via = _strip_group(text)   # a group message: show the words, keep who sent it
+            if t == "user" and text.startswith("<"):
+                continue  # IDE/system wrapper noise
+            if not text and not tools and not thinking:
+                continue
+            blocks = _blocks_of(content)
+            if t == "assistant":
+                if cur is None:
+                    cur = {"role": "assistant", "text": text, "tools": list(tools),
+                           "thinking": thinking, "blocks": list(blocks)}
+                else:
+                    # fold this line's content into the in-progress turn, in order
+                    if text:
+                        cur["text"] = cur["text"] + "\n\n" + text if cur["text"] else text
+                    cur["tools"].extend(tools)
+                    cur["thinking"] += thinking
+                    cur["blocks"].extend(blocks)
+            else:
+                # a real user message closes the assistant turn that preceded it
+                if cur is not None:
+                    turns.append(cur)
+                    cur = None
+                turn = {"role": "user", "text": text, "tools": tools,
+                        "thinking": thinking, "blocks": blocks}
+                if via:
+                    turn["via"] = via
+                turns.append(turn)
+    if cur is not None:
+        turns.append(cur)
+    return turns, ([fp] if fp and os.path.isfile(fp) else [])
+
+
+def cmd_transcript(directory, session, limit, backend="claude"):
+    turns, _files = _turns_of(directory, session, backend)
+    # Keep the most recent `limit` turns. One logical turn is one row (tool calls fold
+    # into their turn), so `limit` counts real turns — far fewer rows than per-line.
+    print(json.dumps(turns[-limit:]))
+
+
+def cmd_turns(directory, session, backend="claude", frm=0, limit=200, text=False):
+    """A WINDOW of a conversation with its bearings (2026-10-17): {total, from,
+    to, files, turns} — turns numbered 1..total in order, `files` the records
+    they came from. Without --from the window is the LAST `limit` turns; with
+    it, `limit` turns from that number. --text prints the window as plain
+    lines ("#12 user: …") for a model that pages through a conversation
+    itself: the same clean dialogue the phone shows, in the same shape for
+    Claude, Codex and Cursor records."""
+    turns, files = _turns_of(directory, session, backend)
+    total = len(turns)
+    limit = max(1, limit)
+    if frm and frm > 0:
+        start = min(frm, total + 1)
+    else:
+        start = max(1, total - limit + 1)
+    end = min(total, start + limit - 1)
+    window = turns[start - 1:end] if start <= total else []
+    if text:
+        lines = ["# conversation %s · %d turns · showing %d-%d" % (session, total, start if window else 0, end if window else 0)]
+        for i, t in enumerate(window, start):
+            who = t.get("role", "")
+            body = (t.get("text") or "").strip()
+            if not body and t.get("tools"):
+                body = "(tools: %s)" % ", ".join(t.get("tools") or [])
+            lines.append("#%d %s: %s" % (i, who, body))
+        print("\n".join(lines))
+        return
+    print(json.dumps({"total": total, "from": start if window else 0, "to": end if window else 0,
+                      "files": files, "turns": window}, ensure_ascii=False))
+
+
+# ---------- the documents a folder's agents read on their own ----------
+# What the Context panel can hand over besides past conversations (2026-10-17):
+# the project notes each CLI loads from the working directory (and its parents,
+# up to the home folder, the way the CLIs themselves look), the rules folders,
+# and Claude Code's own memory for that folder. Each entry is a real file the
+# phone attaches by path.
+
+def _memory_dir_for(directory):
+    """~/.claude/projects/<encoded cwd>/memory — Claude Code's auto-memory for
+    a folder, when it has one."""
+    for folder in dict.fromkeys([encode(directory), encode(os.path.realpath(directory))]):
+        d = os.path.join(PROJ, folder, "memory")
+        if os.path.isdir(d):
+            return d
+    return ""
+
+
+def cmd_project_docs(directory):
+    out, seen = [], set()
+    def add(path, kind):
+        try:
+            st = os.stat(path)
+        except OSError:
+            return
+        if not os.path.isfile(path) or path in seen:
+            return
+        seen.add(path)
+        out.append({"path": path, "kind": kind, "name": os.path.basename(path), "bytes": st.st_size})
+    # the folder, then its parents up to (and including) the home folder
+    chain = []
+    d = os.path.abspath(directory)
+    while True:
+        chain.append(d)
+        if d == HOME or d == os.path.dirname(d):
+            break
+        d = os.path.dirname(d)
+    for i, d in enumerate(chain):
+        for name in ("CLAUDE.md", "CLAUDE.local.md"):
+            add(os.path.join(d, name), "claude-md")
+        add(os.path.join(d, "AGENTS.md"), "agents-md")
+        if i == 0:
+            for fp in sorted(glob.glob(os.path.join(d, ".claude", "rules", "*.md"))):
+                add(fp, "rules")
+            for fp in sorted(glob.glob(os.path.join(d, ".cursor", "rules", "*.mdc"))):
+                add(fp, "cursor-rules")
+            add(os.path.join(d, ".cursorrules"), "cursor-rules")
+    add(os.path.join(HOME, ".claude", "CLAUDE.md"), "claude-md")
+    add(os.path.join(HOME, ".codex", "AGENTS.md"), "agents-md")
+    # Claude Code's own memory: the INDEX only. The notes behind it are Claude's
+    # working material — bug post-mortems, the person's feedback to it — noise
+    # (and private) as context for another conversation (the person, 2026-10-18).
+    mem = _memory_dir_for(directory)
+    if mem:
+        add(os.path.join(mem, "MEMORY.md"), "memory")
+    print(json.dumps(out, ensure_ascii=False))
+
+
+def cmd_context(directory, session, backend="claude"):
+    """Latest context fill + model for a session, so the phone can show the context
+    ring on a resumed conversation (like Claude Code) without sending a turn.
+
+    claude: used = the last assistant message's input + cache_read + cache_creation
+            (claude's input_tokens EXCLUDES cache, so the three ADD up).
+    codex:  used = the last token_count's last_token_usage.input_tokens, and the
+            answer also carries the rollout's real `window`.
+
+            NOT input+cached: codex's input_tokens ALREADY INCLUDES the cached
+            prefix (cached_input_tokens is a breakdown of it, not an addition —
+            total_tokens == input + output exactly in every rollout checked).
+            Adding them double-counts the cache and pins the ring past 100%; it
+            would also disagree with the LIVE ring, which the App already feeds
+            from `turn.completed.usage.input_tokens` alone.
+
+    `window` is optional and claude never emits it, so an older App decoding
+    {used, model} is unaffected."""
+    if backend == "cursor":
+        # Cursor keeps no per-turn usage in its transcript; the ring stays empty.
+        print(json.dumps({"used": 0, "model": ""})); return
+    if backend == "codex":
+        # Same cwd binding the codex transcript path has (audit #8): a thread id
+        # alone must not read another project's numbers. The NEWEST file that has
+        # the record wins — after pagination, "now" lives in the last segment.
+        files = [f for f in _codex_files(session)
+                 if _codex_meta(f).get("cwd") == directory]
+        if not files:
+            print(json.dumps({"used": 0, "model": ""})); return
+        tc = next((t for t in (_codex_token_count(f) for f in reversed(files)) if t), {})
+        model = next((m for m in (_codex_model(f) for f in reversed(files)) if m), "")
+        info = tc.get("info") if isinstance(tc.get("info"), dict) else {}
+        last = info.get("last_token_usage") if isinstance(info.get("last_token_usage"), dict) else {}
+        out = {"used": last.get("input_tokens") or 0, "model": model}
+        if info.get("model_context_window"):
+            out["window"] = info["model_context_window"]
+        print(json.dumps(out)); return
+
+    fp = _session_path(directory, session)
+    used, model = 0, ""
+    if fp and os.path.isfile(fp):
+        for o in _iter_json(fp):
+            if o.get("type") != "assistant":
+                continue
+            msg = o.get("message") or {}
+            u = msg.get("usage")
+            if isinstance(u, dict):
+                used = ((u.get("input_tokens") or 0)
+                        + (u.get("cache_read_input_tokens") or 0)
+                        + (u.get("cache_creation_input_tokens") or 0))
+            if msg.get("model"):
+                model = msg["model"]
+    print(json.dumps({"used": used, "model": model}))
+
+
+def _cursor_delete(directory, session, force):
+    """A Cursor chat: its folder under ~/.cursor/chats and its transcript folder."""
+    import shutil
+    if not _CURSOR_ID.match(session or ""):
+        print(json.dumps({"deleted": False, "reason": "rejected"})); sys.exit(1)
+    pins = _pins_load()
+    if session in pins and not force:
+        print(json.dumps({"deleted": False, "reason": "pinned"}))
+        print("delete refused: session %s is pinned (unpin first, or --force)" % session, file=sys.stderr)
+        sys.exit(1)
+    targets = [os.path.join(ws, session) for ws in _cursor_workspaces(directory) if os.path.isdir(os.path.join(ws, session))]
+    targets += [os.path.dirname(fp) for fp in
+                glob.glob(os.path.join(CURSOR_PROJECTS, "*", "agent-transcripts", session, session + ".jsonl"))]
+    if not targets:
+        print(json.dumps({"deleted": False, "reason": "not-found"})); return
+    try:
+        for t in targets:
+            shutil.rmtree(t)
+    except OSError as e:
+        print(json.dumps({"deleted": False, "reason": "failed"}))
+        print("delete failed: %s" % e, file=sys.stderr)
+        sys.exit(1)
+    if session in pins:
+        del pins[session]
+        _pins_save(pins)
+    print(json.dumps({"deleted": True, "reason": "removed"}))
+
+
+def _codex_delete(directory, session, force):
+    """A Codex conversation (2026-10-21): every rollout file of the thread —
+    its pagination segments too — bound to --dir the way transcript is, so a
+    thread id from another folder deletes nothing here. Refused while a writer
+    holds the thread (a turn is running there), and, unforced, while pinned.
+    Before this the phone's delete of a Codex row took the Claude path, found
+    nothing and the row came back on the next load."""
+    files = [fp for fp in _codex_files(session) if _same_dir(_codex_meta(fp).get("cwd"), directory)]
+    if not files:
+        print(json.dumps({"deleted": False, "reason": "not-found"}))
+        return
+    pins = _pins_load()
+    if session in pins and not force:
+        print(json.dumps({"deleted": False, "reason": "pinned"}))
+        print("delete refused: session %s is pinned (unpin first, or --force)" % session, file=sys.stderr)
+        sys.exit(1)
+    lock = os.path.join(CODEX_LOCKS, session + ".lock")
+    if os.path.exists(lock) and _lock_holders(lock):
+        print(json.dumps({"deleted": False, "reason": "busy"}))
+        print("delete refused: a codex process is still writing thread %s" % session, file=sys.stderr)
+        sys.exit(1)
+    for fp in files:
+        try:
+            os.remove(fp)
+        except OSError as e:
+            print(json.dumps({"deleted": False, "reason": "failed"}))
+            print("delete failed, %s is still on disk: %s" % (fp, e), file=sys.stderr)
+            sys.exit(1)
+    if session in pins:
+        del pins[session]
+        _pins_save(pins)
+    print(json.dumps({"deleted": True, "reason": "removed"}))
+
+
+def cmd_delete(directory, session, force=False, backend="claude"):
+    if backend == "cursor":
+        _cursor_delete(directory, session, force)
+        return
+    if backend == "codex":
+        _codex_delete(directory, session, force)
+        return
+    """Remove one conversation file — the only copy — and say honestly what
+    happened, in BOTH channels a caller can act on:
+
+        removed   exit 0   {"deleted": true,  "reason": "removed"}
+        not-found exit 0   {"deleted": false, "reason": "not-found"}
+        rejected  exit 1   {"deleted": false, "reason": "rejected"}   unsafe id
+        pinned    exit 1   {"deleted": false, "reason": "pinned"}     guarded (2026-09-08)
+        failed    exit 1   {"deleted": false, "reason": "failed"}     STILL on disk
+
+    A PINNED session is refused — this is the one choke point every deleter on
+    the Mac goes through (the app's swipe, the workflow pruner's conversation
+    sweep), so a pin finally has teeth. --force deletes anyway and drops the
+    pin with it (the app's explicit "unpin and delete").
+
+    It used to print {"deleted": false} and exit 0 for all three failure shapes,
+    so a denied unlink was indistinguishable from a clean sweep — and that exit
+    code is exactly what pervio-orchestrate's conversation sweep gates its
+    warning on, so a conversation that survived a workflow delete was reported
+    as swept. not-found stays exit 0 on purpose: the sweep re-deletes sessions
+    that may already be gone, and delete is idempotent by design."""
+    fp = _session_path(directory, session)
+    if fp is None:
+        print(json.dumps({"deleted": False, "reason": "rejected"}))
+        print("delete: unsafe session id: %r" % (session,), file=sys.stderr)
+        sys.exit(1)
+    if not os.path.isfile(fp):
+        print(json.dumps({"deleted": False, "reason": "not-found"}))
+        return
+    pins = _pins_load()
+    if session in pins and not force:
+        print(json.dumps({"deleted": False, "reason": "pinned"}))
+        print("delete refused: session %s is pinned (unpin first, or --force)" % session,
+              file=sys.stderr)
+        sys.exit(1)
+    try:
+        os.remove(fp)
+    except OSError as e:
+        print(json.dumps({"deleted": False, "reason": "failed"}))
+        print("delete failed, %s is still on disk: %s" % (fp, e), file=sys.stderr)
+        sys.exit(1)
+    if session in pins:
+        del pins[session]
+        _pins_save(pins)
+    print(json.dumps({"deleted": True, "reason": "removed"}))
+
+
+# ---------- codex takeover (the thread writer lock) ----------
+CODEX_LOCKS = os.path.join(HOME, ".codex", "thread-writer-locks")
+RUNS_DIR = os.path.join(HOME, ".pervio", "runs")
+
+
+def _lock_holders(lock):
+    """[(pid, command)] of processes holding `lock` open, via lsof (+c 0 so the
+    command name isn't truncated to 9 chars). [] when nobody does."""
+    try:
+        out = subprocess.run(["lsof", "+c", "0", "-F", "pc", "--", lock],
+                             capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    holders, pid = [], None
+    for line in out.splitlines():
+        if line.startswith("p"):
+            pid = int(line[1:]) if line[1:].isdigit() else None
+        elif line.startswith("c") and pid is not None:
+            holders.append((pid, line[1:]))
+    return holders
+
+
+def _own_run_pgids():
+    """Process groups of the phone's OWN still-running detached runs — a takeover
+    must never kill the conversation the user is watching from the app."""
+    pg = set()
+    for d in glob.glob(os.path.join(RUNS_DIR, "*")):
+        try:
+            if open(os.path.join(d, "status")).read().startswith("exited"):
+                continue
+            pg.add(int(open(os.path.join(d, "pgid")).read().strip()))
+        except (OSError, ValueError):
+            continue
+    return pg
+
+
+def cmd_codex_takeover(session):
+    """Free a codex thread another client (VS Code's plugin, the desktop app) is
+    holding, so the phone can resume it. codex >=0.153 lets exactly one writer
+    per thread — the holder keeps ~/.codex/thread-writer-locks/<id>.lock open
+    for as long as the conversation panel is open, even idle — and refuses
+    every other `thread/resume` with "already has an active writer".
+
+    Three refusals, each a hard line: the holder must be a codex process (we
+    never kill anything else), it must not be one of the app's own running
+    detached runs (never kill the run the user is watching), and the id must be
+    a bare thread id. A lock nobody holds is a corpse codex ignores — nothing to
+    do, reported as released. Prints JSON and exits 0 when the thread is free
+    afterwards, 1 when it is not."""
+    if not session or "/" in session or ".." in session or "\x00" in session:
+        print(json.dumps({"released": False, "reason": "rejected"})); sys.exit(1)
+    lock = os.path.join(CODEX_LOCKS, session + ".lock")
+    holders = _lock_holders(lock)
+    if not holders:
+        print(json.dumps({"released": True, "reason": "unheld", "killed": []})); return
+    bad = [h for h in holders if os.path.basename(h[1]) != "codex"]
+    if bad:
+        print(json.dumps({"released": False, "reason": "not-codex",
+                          "holder": "%s (pid %d)" % (os.path.basename(bad[0][1]), bad[0][0])}))
+        sys.exit(1)
+    own = _own_run_pgids()
+    for pid, _ in holders:
+        try:
+            if os.getpgid(pid) in own:
+                print(json.dumps({"released": False, "reason": "own-run",
+                                  "holder": "codex (pid %d)" % pid}))
+                sys.exit(1)
+        except OSError:
+            pass
+    killed = []
+    for sig, wait in ((signal.SIGTERM, 5.0), (signal.SIGKILL, 2.0)):
+        for pid, _ in holders:
+            try:
+                os.kill(pid, sig); killed.append(pid)
+            except OSError:
+                pass
+        deadline = time.time() + wait
+        while time.time() < deadline:
+            if not _lock_holders(lock):
+                print(json.dumps({"released": True, "reason": "killed",
+                                  "killed": sorted(set(killed))})); return
+            time.sleep(0.25)
+        holders = _lock_holders(lock)
+        if not holders:
+            break
+    print(json.dumps({"released": not holders, "reason": "killed" if not holders else "still-held",
+                      "killed": sorted(set(killed))}))
+    sys.exit(0 if not holders else 1)
+
+
+def _typed_user_line(o):
+    """A TYPED user message — a turn boundary. The other two type=="user" shapes
+    (tool_result carrier, sidechain/subagent line) are mid-turn."""
+    if not isinstance(o, dict) or o.get("type") != "user":
+        return False
+    content = (o.get("message") or {}).get("content")
+    if o.get("parent_tool_use_id") or o.get("isSidechain"):
+        return False
+    if isinstance(content, list) and content and all(
+            isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
+        return False
+    return True
+
+
+def _name_branch(new_id, source_id, source_fp, lang, codex=False):
+    """A branch starts out named after what it came from — "fork from <name>"
+    (zh: 分支自 <name>) — <name> being the source's own name when the person
+    gave it one, else its first words (the list's default title). The person
+    can rename it like any conversation (asked 2026-10-17)."""
+    meta = _meta_load()
+    src = (meta.get(source_id) or {}).get("title") or ""
+    if not src and source_fp:
+        try:
+            src = (_codex_first_user_text(source_fp) if codex else first_user_text(source_fp)) or ""
+        except Exception:
+            src = ""
+    src = " ".join(src.split())[:40]
+    if not src:
+        return
+    title = ("分支自 " if lang == "zh" else "fork from ") + src
+    e = dict(meta.get(new_id) or {})
+    e["title"] = title[:120]
+    meta[new_id] = e
+    try:
+        _meta_save(meta)
+    except OSError:
+        pass
+
+
+def _codex_typed_user(o):
+    """(id, display text) for a TYPED codex user line — a response_item message
+    with role user whose text survives _codex_user_text (environment/context
+    injections and IDE-only preambles hide, as in the transcript) — else None."""
+    if not isinstance(o, dict) or o.get("type") != "response_item":
+        return None
+    p = o.get("payload") or {}
+    if p.get("type") != "message" or p.get("role") != "user":
+        return None
+    raw = "".join(c.get("text") or "" for c in (p.get("content") or [])
+                  if isinstance(c, dict) and c.get("type") in ("input_text", "text")).strip()
+    text = _codex_user_text(raw) or ""
+    if not text or not isinstance(p.get("id"), str) or not p.get("id"):
+        return None
+    return p["id"], text
+
+
+def cmd_user_turns(session, backend="claude"):
+    """[{uuid, text}] of the typed user messages of a codex thread, in order —
+    the anchors `fork --backend codex` takes (payload.id, "msg_…"), with the
+    text the transcript shows so the phone can match its rows. (Claude's
+    equivalent is the script the app ships inline.)"""
+    if backend != "codex":
+        print("user-turns: codex only", file=sys.stderr)
+        sys.exit(2)
+    out = []
+    for fp in _codex_files(session):
+        for o in _iter_json(fp):
+            hit = _codex_typed_user(o)
+            if hit:
+                out.append({"uuid": hit[0], "text": hit[1][:2000]})
+    print(json.dumps(out, ensure_ascii=False))
+
+
+def _codex_fork(session, before, after, lang="en"):
+    """Fork a codex thread the way the Claude one is forked: every line BEFORE
+    the cut copied into a fresh rollout-<now>-<newid>.jsonl beside the base
+    file, the session_meta's id/session_id rewritten — `codex exec resume
+    <newid>` then continues the branch and appends to that file (verified on
+    the real codex, 2026-10-16). A paginated thread's segments are stitched in
+    order first (each segment's own session_meta dropped), so the branch is one
+    file. Anchors are payload.id of TYPED user lines (see _codex_typed_user):
+    --before cuts at that line, --after cuts before the NEXT typed user line
+    (or keeps everything when that turn is the last)."""
+    import time as _time, uuid as _uuid
+    files = _codex_files(session)
+    if not files:
+        print("session not found", file=sys.stderr)
+        sys.exit(1)
+    meta = _codex_meta(files[0])
+    if _codex_subthread(meta):
+        print("a sub-agent thread cannot be branched", file=sys.stderr)
+        sys.exit(1)
+    lines = []           # (raw line, parsed or None)
+    for k, fp in enumerate(files):
+        with open(fp, "r", errors="replace") as f:
+            for j, raw in enumerate(f):
+                s = raw.strip()
+                o = None
+                if s:
+                    try:
+                        o = json.loads(s)
+                    except Exception:
+                        o = None
+                if k > 0 and isinstance(o, dict) and o.get("type") == "session_meta":
+                    continue   # a segment's head: the thread's meta is the base file's
+                lines.append((raw, o))
+    anchor = before or after
+    idx = None
+    for i, (_raw, o) in enumerate(lines):
+        if isinstance(o, dict) and ((o.get("payload") or {}).get("id") == anchor):
+            if not _codex_typed_user(o):
+                print("not a typed user message — branch from the message you typed", file=sys.stderr)
+                sys.exit(1)
+            idx = i
+            break
+    if idx is None:
+        print("message uuid not found in session", file=sys.stderr)
+        sys.exit(1)
+    if before:
+        cut = idx
+    else:
+        cut = len(lines)
+        for i in range(idx + 1, len(lines)):
+            if _codex_typed_user(lines[i][1]):
+                cut = i
+                break
+    if not any(_codex_typed_user(o) for _raw, o in lines[:cut]):
+        print("nothing before this message — start a new chat instead", file=sys.stderr)
+        sys.exit(1)
+    head = lines[0][1]
+    if not (isinstance(head, dict) and head.get("type") == "session_meta"):
+        print("rollout has no session_meta head", file=sys.stderr)
+        sys.exit(1)
+    new_id = str(_uuid.uuid4())
+    pl = dict(head.get("payload") or {})
+    pl["id"] = new_id
+    if "session_id" in pl:
+        pl["session_id"] = new_id
+    pl.pop("history_base", None)
+    head = dict(head, payload=pl)
+    out_fp = os.path.join(os.path.dirname(files[0]),
+                          "rollout-%s-%s.jsonl" % (_time.strftime("%Y-%m-%dT%H-%M-%S"), new_id))
+    tmp = out_fp + ".tmp.%d" % os.getpid()
+    try:
+        with open(tmp, "w") as f:
+            f.write(json.dumps(head, ensure_ascii=False) + "\n")
+            for raw, _o in lines[1:cut]:
+                f.write(raw if raw.endswith("\n") else raw + "\n")
+        os.replace(tmp, out_fp)
+    except OSError as e:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        print("fork write failed: %s" % e, file=sys.stderr)
+        sys.exit(1)
+    _name_branch(new_id, session, files[0], lang, codex=True)
+    print(json.dumps({"session": new_id}))
+
+
+def cmd_fork(directory, session, before, after="", backend="claude", lang="en"):
+    if backend == "codex":
+        if not before and not after:
+            print("missing --before or --after uuid", file=sys.stderr)
+            sys.exit(1)
+        return _codex_fork(session, before, after, lang)
+    """Fork ("rewind") a Claude conversation at a user message: copy every line
+    BEFORE the line whose uuid == `before` into a fresh <uuid4>.jsonl in the same
+    project folder, rewriting each JSON line's top-level sessionId to the new id —
+    that's all `claude --resume <newid>` needs to continue the branch as its own
+    conversation (verified against the real pipeline). The original file is never
+    touched, so the pre-rewind conversation survives in the list.
+
+    `before` must point at a TYPED user message ("redo from this message") — not
+    a tool_result carrier or sidechain line, which are mid-turn; the dropped span
+    is that message and everything after it. Forking before the FIRST message is
+    refused (an empty-history file is un-resumable — verified: claude answers
+    "No conversation found"; the caller starts a new chat instead). In real
+    session files sessionId is a top-level field only (never nested) and the few
+    lines without one (file-history-snapshot/delta) — plus any non-JSON line — are
+    preserved byte-for-byte. Codex sessions are NOT supported here: their rollout
+    store/format differs (session_meta + response_item), so the phone hides the
+    rewind menu item for codex.
+
+    Prints {"session": "<newid>"}; on failure exits non-zero with one stderr line."""
+    import uuid
+    fp = _session_path(directory, session)
+    if not fp or not os.path.isfile(fp):
+        print("session not found", file=sys.stderr)
+        sys.exit(1)
+    if not before and not after:
+        print("missing --before or --after uuid", file=sys.stderr)
+        sys.exit(1)
+    with open(fp, "r", errors="replace") as f:
+        lines = f.readlines()
+    cut = None
+    if after:
+        # "Branch in new chat" from a message (2026-10-16): keep history THROUGH
+        # the turn the typed user message `after` starts — its answer included —
+        # i.e. cut before the NEXT typed user message, or copy everything when
+        # that turn is the last. Same anchor rules as --before.
+        start = None
+        for i, raw in enumerate(lines):
+            s = raw.strip()
+            if not s:
+                continue
+            try:
+                o = json.loads(s)
+            except Exception:
+                continue
+            if isinstance(o, dict) and o.get("uuid") == after:
+                if not _typed_user_line(o):
+                    print("not a typed user message — branch from the message you typed", file=sys.stderr)
+                    sys.exit(1)
+                start = i
+                break
+        if start is None:
+            print("message uuid not found in session", file=sys.stderr)
+            sys.exit(1)
+        cut = len(lines)
+        for i in range(start + 1, len(lines)):
+            s = lines[i].strip()
+            if not s:
+                continue
+            try:
+                o = json.loads(s)
+            except Exception:
+                continue
+            if _typed_user_line(o):
+                cut = i
+                break
+        before = ""
+    for i, raw in enumerate(lines) if before else []:
+        s = raw.strip()
+        if not s:
+            continue
+        try:
+            o = json.loads(s)
+        except Exception:
+            continue
+        if isinstance(o, dict) and o.get("uuid") == before:
+            if o.get("type") != "user":
+                print("not a user message", file=sys.stderr)
+                sys.exit(1)
+            # Real jsonl has THREE kinds of type=="user" lines; only a typed
+            # message is a turn boundary. A tool_result carrier or a sidechain
+            # (subagent) line is MID-turn — cutting there leaves a dangling
+            # tool_use at the branch tail. Same filters the transcript uses.
+            content = (o.get("message") or {}).get("content")
+            if (o.get("parent_tool_use_id") or o.get("isSidechain")
+                    or (isinstance(content, list) and content and all(
+                        isinstance(b, dict) and b.get("type") == "tool_result"
+                        for b in content))):
+                print("mid-turn line (tool result / subagent) — not a rewind anchor",
+                      file=sys.stderr)
+                sys.exit(1)
+            cut = i
+            break
+    if cut is None:
+        print("message uuid not found in session", file=sys.stderr)
+        sys.exit(1)
+    # An empty-history fork is a DEAD END, not a fresh start: `claude --resume`
+    # refuses a file with no message lines ("No conversation found…", verified
+    # empirically on 2.1.181). Refuse to mint one — the caller should open a
+    # new chat instead of forking before the first message.
+    has_message = False
+    for raw in lines[:cut]:
+        s = raw.strip()
+        if not s:
+            continue
+        try:
+            o = json.loads(s)
+        except Exception:
+            continue
+        if isinstance(o, dict) and o.get("type") in ("user", "assistant"):
+            has_message = True
+            break
+    if not has_message:
+        print("nothing before this message — start a new chat instead",
+              file=sys.stderr)
+        sys.exit(1)
+    new_id = str(uuid.uuid4())
+    out_fp = os.path.join(os.path.dirname(fp), new_id + ".jsonl")
+    while os.path.exists(out_fp):                      # paranoia: uuid4 collision
+        new_id = str(uuid.uuid4())
+        out_fp = os.path.join(os.path.dirname(fp), new_id + ".jsonl")
+    tmp = out_fp + ".tmp.%d" % os.getpid()
+    try:
+        with open(tmp, "w") as f:
+            for raw in lines[:cut]:
+                s = raw.strip()
+                o = None
+                if s:
+                    try:
+                        o = json.loads(s)
+                    except Exception:
+                        o = None
+                if isinstance(o, dict) and "sessionId" in o:
+                    o["sessionId"] = new_id
+                    # compact + raw UTF-8, matching Claude Code's own serialization
+                    f.write(json.dumps(o, ensure_ascii=False, separators=(",", ":")) + "\n")
+                else:
+                    f.write(raw if raw.endswith("\n") else raw + "\n")
+        os.replace(tmp, out_fp)
+    except OSError as e:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        print("fork write failed: %s" % e, file=sys.stderr)
+        sys.exit(1)
+    _name_branch(new_id, session, fp, lang)
+    print(json.dumps({"session": new_id}))
+
+
+def cmd_codex_usage():
+    """Current CODEX plan usage, read out of codex's own rollouts — never the net,
+    never a claude credential.
+
+    Codex stamps `rate_limits` onto every `token_count` line: the plan's windows
+    with `used_percent` / `window_minutes` / `resets_at` (epoch seconds), plus
+    `plan_type`. Those numbers are ACCOUNT-wide, not per-conversation, so the
+    freshest one anywhere in the store is the truthful one — a conversation
+    resumed from last week would otherwise show last week's percentage. We scan
+    rollouts newest-first and stop at the first that carries rate_limits (a
+    single file read in practice).
+
+    Only the WEEKLY window is surfaced, and it's picked by window_minutes
+    (10080), not by position: older codex builds put the 5-hour window in
+    `primary` and the weekly in `secondary`, so trusting `primary` would label a
+    5h percentage "weekly". Output is a shape of its own — {weekly, plan} — with
+    none of claude's five_hour/seven_day/scoped keys, so a codex conversation
+    can never be handed claude's pools (and vice versa)."""
+    files = _codex_rollouts()
+    try:
+        files.sort(key=os.path.getmtime, reverse=True)
+    except OSError:
+        files.sort(reverse=True)
+    for fp in files[:40]:            # bounded: the answer is in the newest file
+        rl = _codex_token_count(fp).get("rate_limits")
+        if not isinstance(rl, dict):
+            continue
+        windows = [w for w in (rl.get("primary"), rl.get("secondary")) if isinstance(w, dict)]
+        if not windows:
+            continue
+        weekly = next((w for w in windows if w.get("window_minutes") == 10080), None)
+        if weekly is None:
+            # No 7-day window in this build's shape — the widest one is the closest
+            # honest analogue; mislabeling a 5h number as weekly is worse than none.
+            weekly = max(windows, key=lambda w: w.get("window_minutes") or 0)
+            if (weekly.get("window_minutes") or 0) < 10080:
+                continue
+        out = {"weekly": {"utilization": weekly.get("used_percent"),
+                          "resets_at": _epoch_iso(weekly.get("resets_at"))}}
+        if rl.get("plan_type"):
+            out["plan"] = rl["plan_type"]
+        print(json.dumps(out)); return
+    # Honest silence beats claude's numbers: no fall-through to the OAuth path.
+    print(json.dumps({"error": "no-codex-usage"}))
+
+
+def _epoch_iso(secs):
+    """Codex reports resets_at as epoch SECONDS; the App's usage line parses
+    ISO8601 (that's claude's shape). Convert so one parser serves both."""
+    import time
+    try:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(secs)))
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+
+
+def _keychain_token():
+    """The FRESH OAuth token, from the macOS Keychain — where the claude CLI
+    actually refreshes it. `~/.claude/.credentials.json` is only a COPY made by
+    install.sh, and it goes stale the moment its access token expires: that is
+    how the usage line served a week-old「Fable 80%」as current (file token
+    expired 08-17 → endpoint 401 → the stale-cache fallback replayed 08-13
+    forever, 60 seconds at a time). Keychain first, file as fallback.
+
+    NEVER touches refreshToken: refreshing is claude's job alone — a competing
+    refresh rotates the one-time token and logs every session out (2026-08-14,
+    lived it). A locked keychain / non-mac box returns None and the file path
+    stands; an expired keychain copy returns None the same way."""
+    import subprocess, time
+    try:
+        p = subprocess.run(["security", "find-generic-password",
+                            "-s", "Claude Code-credentials", "-w"],
+                           capture_output=True, text=True, timeout=5)
+        if p.returncode != 0:
+            return None
+        o = (json.loads(p.stdout).get("claudeAiOauth") or {})
+        exp = o.get("expiresAt") or 0
+        if exp and exp / 1000 < time.time():
+            return None
+        return o.get("accessToken") or None
+    except Exception:
+        return None
+
+
+def cmd_usage():
+    """Current Claude usage (5-hour rolling window + 7-day) via the OAuth endpoint.
+    The token stays on the server — the phone only ever sees the percentages.
+
+    CACHED (60s TTL) in a file: the phone calls this on every open AND after every
+    turn, which hammered the endpoint into HTTP 429 — and a 429 used to return an
+    {"error"} the phone couldn't decode, so the usage line blanked out. A fresh
+    cache is served without a live call; a failed live call falls back to the
+    cached value — but HONESTLY now: a fallback older than the TTL carries
+    "stale": true (the app dims the line), and one older than 48h is refused
+    outright ({"error"}), because a week-old percentage presented as current is
+    worse than no line at all (2026-08-20: exactly that shipped)."""
+    import urllib.request, time
+    cache = os.path.join(HOME, ".pervio", "usage-cache.json")
+    TTL = 60
+    STALE_CUTOFF = 48 * 3600
+    cached = None
+    try:
+        with open(cache) as f:
+            cached = json.load(f)
+        if isinstance(cached, dict) and "five_hour" in cached \
+                and time.time() - cached.get("_ts", 0) < TTL:
+            out = {"five_hour": cached.get("five_hour"),
+                   "seven_day": cached.get("seven_day")}
+            if cached.get("scoped"):
+                out["scoped"] = cached.get("scoped")
+            print(json.dumps(out)); return
+    except (OSError, ValueError):
+        cached = None
+
+    def serve_cached_or(err):
+        age = time.time() - cached.get("_ts", 0) if isinstance(cached, dict) else 1e18
+        if isinstance(cached, dict) and "five_hour" in cached and age < STALE_CUTOFF:
+            out = {"five_hour": cached.get("five_hour"),
+                   "seven_day": cached.get("seven_day"),
+                   "stale": True}          # real numbers, old clock — say so
+            if cached.get("scoped"):
+                out["scoped"] = cached.get("scoped")
+            print(json.dumps(out))
+        else:
+            print(json.dumps({"error": err}))
+
+    tok = _keychain_token()
+    if not tok:
+        cred = os.path.join(HOME, ".claude", ".credentials.json")
+        try:
+            with open(cred) as f:
+                tok = (json.load(f).get("claudeAiOauth") or {}).get("accessToken")
+        except Exception:
+            serve_cached_or("no-credentials"); return
+    if not tok:
+        serve_cached_or("no-token"); return
+    # The URL is injectable for the test suite ONLY (a local server that records
+    # the Authorization header); production never sets it.
+    req = urllib.request.Request(
+        os.environ.get("PERVIO_USAGE_URL",
+                       "https://api.anthropic.com/api/oauth/usage"),
+        headers={"Authorization": "Bearer " + tok,
+                 "anthropic-beta": "oauth-2025-04-20",
+                 "User-Agent": "claude-cli"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = json.load(r)
+    except Exception as e:
+        serve_cached_or(str(e)[:120]); return
+
+    def pick(d):
+        if not isinstance(d, dict):
+            return None
+        return {"utilization": d.get("utilization"), "resets_at": d.get("resets_at")}
+    out = {"five_hour": pick(data.get("five_hour")), "seven_day": pick(data.get("seven_day"))}
+    # Model-scoped pools ride the `limits` array (verified live 2026-08-06: a
+    # weekly_scoped entry with scope.model.display_name "Fable" sat at 91%
+    # critical while five_hour/seven_day looked calm) — without surfacing them
+    # the phone shows a green picture of a nearly-exhausted Fable week.
+    scoped = []
+    for l in (data.get("limits") or []):
+        if not isinstance(l, dict):
+            continue
+        model = ((l.get("scope") or {}).get("model") or {}) if isinstance(l.get("scope"), dict) else {}
+        name = model.get("display_name")
+        if name and l.get("percent") is not None:
+            scoped.append({"name": name, "percent": l.get("percent"),
+                           "resets_at": l.get("resets_at"),
+                           "severity": l.get("severity")})
+    if scoped:
+        out["scoped"] = scoped
+    try:
+        os.makedirs(os.path.dirname(cache), mode=0o700, exist_ok=True)
+        tmp = cache + ".tmp.%d" % os.getpid()
+        with open(tmp, "w") as f:
+            json.dump(dict(out, _ts=time.time()), f)
+        os.replace(tmp, cache)
+    except OSError:
+        pass
+    print(json.dumps(out))
+
+
+def main():
+    args = sys.argv[1:]
+    cmd = args[0] if args else ""
+    opts, i = {}, 1
+    while i < len(args):
+        if args[i] in ("--dir", "--session", "--limit", "--tool-id", "--backend", "--before", "--after", "--query",
+                       "--b64", "--at", "--under", "--title-b64", "--dirs-b64", "--lang", "--from",
+                       "--top", "--per") and i + 1 < len(args):
+            opts[args[i][2:]] = args[i + 1]
+            i += 2
+        elif args[i] == "--force":
+            opts["force"] = "1"
+            i += 1
+        elif args[i] == "--clear-title":
+            opts["clear-title"] = "1"
+            i += 1
+        elif args[i] == "--text":
+            opts["text"] = "1"
+            i += 1
+        else:
+            i += 1
+
+    directory = opts.get("dir", "")
+    if directory == "~":
+        directory = HOME
+    elif directory.startswith("~/"):
+        directory = os.path.join(HOME, directory[2:])
+
+    if cmd == "projects":
+        cmd_projects(opts.get("under", ""))
+    elif cmd == "list":
+        cmd_list(directory)
+    elif cmd == "home":
+        def _n(key, default):
+            try:
+                return max(0, min(int(opts.get(key, default)), 50))
+            except ValueError:
+                return default
+        cmd_home(directory, _n("top", 3), _n("per", 3), _n("limit", 10))
+    elif cmd == "transcript":
+        try:
+            limit = int(opts.get("limit", "40"))   # bounded; see note in cmd_transcript
+        except ValueError:
+            limit = 40
+        cmd_transcript(directory, opts.get("session", ""), limit, opts.get("backend", "claude"))
+    elif cmd == "tool-detail":
+        cmd_tool_detail(directory, opts.get("session", ""), opts.get("tool-id", ""))
+    elif cmd == "context":
+        cmd_context(directory, opts.get("session", ""), opts.get("backend", "claude"))
+    elif cmd == "delete":
+        cmd_delete(directory, opts.get("session", ""), force=bool(opts.get("force")),
+                   backend=opts.get("backend", "claude"))
+    elif cmd == "turns":
+        try:
+            lim = int(opts.get("limit", "200"))
+        except ValueError:
+            lim = 200
+        try:
+            frm = int(opts.get("from", "0"))
+        except ValueError:
+            frm = 0
+        cmd_turns(directory, opts.get("session", ""), opts.get("backend", "claude"), frm, lim, bool(opts.get("text")))
+    elif cmd == "project-docs":
+        cmd_project_docs(directory)
+    elif cmd == "meta":
+        cmd_meta(opts.get("session", ""), opts.get("title-b64"), bool(opts.get("clear-title")), opts.get("dirs-b64"))
+    elif cmd == "pin":
+        cmd_pin(directory, opts.get("session", ""), opts.get("at"))
+    elif cmd == "unpin":
+        cmd_unpin(opts.get("session", ""))
+    elif cmd == "pins-merge":
+        cmd_pins_merge(directory, opts.get("b64", ""))
+    elif cmd == "pins":
+        _pins_out(_pins_load())
+    elif cmd == "codex-takeover":
+        cmd_codex_takeover(opts.get("session", ""))
+    elif cmd == "fork":
+        cmd_fork(directory, opts.get("session", ""), opts.get("before", ""), opts.get("after", ""),
+                 opts.get("backend", "claude"), lang="zh" if opts.get("lang", "").startswith("zh") else "en")
+    elif cmd == "user-turns":
+        cmd_user_turns(opts.get("session", ""), opts.get("backend", "claude"))
+    elif cmd == "search":
+        try:
+            limit = int(opts.get("limit", "30"))
+        except ValueError:
+            limit = 30
+        cmd_search(opts.get("query", ""), max(1, min(limit, 100)), opts.get("under", ""))
+    elif cmd == "usage":
+        # The two backends' quotas are different pools with different sources
+        # (claude: OAuth endpoint; codex: its own rollouts). Routed by --backend so
+        # neither can ever answer for the other.
+        if opts.get("backend") == "codex":
+            cmd_codex_usage()
+        else:
+            cmd_usage()
+    else:
+        print("[]")
+
+
+if __name__ == "__main__":
+    main()

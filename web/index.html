@@ -1,0 +1,466 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Pervio</title>
+<meta name="description" content="Pervio 是一个 iPhone app，用 SSH 连上你自己的电脑，在手机上用电脑里装好的 Claude Code、Codex、Cursor。手机锁屏、断网，任务照样跑，做完了或者要你批准会发通知。开源。">
+<meta name="robots" content="noindex">
+<meta name="theme-color" content="#0E1017">
+<meta property="og:title" content="Pervio">
+<meta property="og:description" content="用手机指挥你自己电脑上的编程 agent：Claude Code、Codex、Cursor。只走 SSH，开源。">
+<link rel="icon" type="image/png" sizes="64x64" href="assets/icon-64.png">
+<link rel="apple-touch-icon" href="assets/icon-180.png">
+<link rel="preload" href="assets/fonts/WixMadeforDisplay-latin.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="assets/fonts/WixMadeforText-latin.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="assets/fonts.css">
+<link rel="stylesheet" href="assets/site.css">
+<script>document.documentElement.classList.add("js")</script>
+<style>
+/* Pervio home, v6 (2026-11-23). After Hallmark's Dusk: a photograph of the
+   turn of the light, slate below it. The five main features in real
+   captures (scripts/site-shots.sh), then what reaches you when the app is
+   closed, then the rest as a ruled list.
+   shape: narrative workflow · hero: stage, a portrait phone on five columns
+   nav: edge-aligned · footer: one row and a colophon · job: join the beta */
+
+/* ---------- hero ---------- */
+.hero{position:relative;isolation:isolate;overflow:clip;display:flex;align-items:center;
+  min-height:max(640px,100vh);min-height:max(640px,100svh);
+  padding-block:calc(var(--nav-h) + var(--space-lg)) var(--space-3xl)}
+.hero__photo{position:absolute;inset:0;z-index:-2;background:var(--color-paper-3)}
+.hero__photo img{width:100%;height:118%;object-fit:cover;object-position:44% 0;transform-origin:50% 30%;animation:settle 1.8s var(--ease-out) both}
+@keyframes settle{from{transform:scale(1.04)}to{transform:scale(1)}}
+/* the nav's own shade, and the foot going to slate */
+.hero__veil{position:absolute;inset:0;z-index:-1;background:
+  linear-gradient(to bottom,var(--paper-00) 64%,var(--color-paper) 100%),
+  linear-gradient(to bottom,var(--shade-30) 0,var(--shade-00) 24%)}
+/* the dusk deepened behind the words, and only there: the band is measured from
+   the text itself (the sentence is 31rem at its widest), so it holds at every
+   width, and the light on the horizon is left alone */
+.hero__text{position:relative;--band:48rem}
+:root:lang(en) .hero__text{--band:60rem}      /* the English headline runs wider */
+.hero__text::before{content:"";position:absolute;z-index:-1;top:-100vh;bottom:-100vh;left:-100vw;width:calc(100vw + var(--band));
+  background:linear-gradient(to left,var(--shade-00) 0,var(--shade-10) 3rem,var(--shade-22) 6rem,var(--shade-36) 9rem,var(--shade-48) 12rem,var(--shade-55) 15rem,var(--shade-62) 21rem,var(--shade-70) 100%)}
+.hero__in{display:grid;grid-template-columns:minmax(0,7fr) minmax(0,5fr);column-gap:var(--space-3xl);align-items:center}
+.hero h1{max-width:11em}
+:root:lang(en) .hero h1{max-width:none;font-size:clamp(2.375rem,1.2rem + 5vw,5.25rem)}
+@media (max-width:400px){:root:lang(en) .hero h1 br{display:none}}
+.hero .lead{max-width:31rem;margin-top:var(--space-lg);color:var(--color-ink)}
+.hero .lead,.hero__note{text-shadow:0 1px 2px var(--shade-30)}
+.hero .actions{margin-top:var(--space-xl)}
+.hero__note{margin-top:var(--space-lg);font-size:var(--text-sm);color:var(--color-ink)}
+
+/* the one device on the page: a plain ring around a real screenshot, nothing drawn on it */
+.phone{--w:min(330px,23vw,calc((100vh - 250px) * .46));--w:min(330px,23vw,calc((100svh - 250px) * .46));
+  justify-self:center;width:var(--w);padding:calc(var(--w) * .03);border-radius:calc(var(--w) * .165);
+  background:var(--color-shade);box-shadow:inset 0 0 0 1px var(--light-16),0 0 0 1px var(--shade-55),0 60px 100px -36px var(--shade-70)}
+.phone img{width:100%;border-radius:calc(var(--w) * .137);aspect-ratio:720/1564;object-fit:cover}
+
+/* ---------- the main features, one real capture each ---------- */
+.steps{counter-reset:step;border-bottom:1px solid var(--color-rule)}
+.step{counter-increment:step;display:grid;grid-template-columns:minmax(0,5fr) minmax(0,6fr);column-gap:clamp(40px,7vw,112px);
+  padding-block:var(--space-3xl) 80px;border-top:1px solid var(--color-rule)}
+.step__text{position:sticky;top:calc(var(--nav-h) + var(--space-2xl));align-self:start}
+.step__text h3{display:flex;align-items:baseline;gap:.6em;font-size:clamp(1.5rem,1.15rem + 1.3vw,2.125rem);line-height:1.2}
+.step__text h3::before{content:counter(step);min-width:1ch;font-weight:400;color:var(--color-muted);font-variant-numeric:tabular-nums}
+.step__text p{margin-top:var(--space-lg);max-width:30rem}
+.step__text p + p{margin-top:var(--space-md);color:var(--color-muted)}
+.step__fig{justify-self:end;width:100%;max-width:600px}
+.step__fig img{width:100%;border-radius:var(--radius-card);background:var(--color-paper-2);box-shadow:var(--glass-hi),var(--shadow-card)}
+figcaption{margin-top:var(--space-md);font-size:var(--text-sm);line-height:1.6;color:var(--color-muted)}
+figcaption b{display:block;font-weight:500;color:var(--color-ink)}
+
+/* ---------- when the app is closed ---------- */
+.away{display:grid;grid-template-columns:minmax(0,7fr) minmax(0,5fr);gap:var(--space-xl)}
+.away__surface{display:grid;place-items:center;min-height:clamp(280px,32vw,440px);padding:clamp(24px,5vw,64px);border-radius:var(--radius-card)}
+.well{background:linear-gradient(160deg,var(--color-well),var(--color-well-2))}
+.well__stack{display:grid;gap:18px;width:min(100%,540px)}
+.well__stack img{width:100%;border-radius:var(--radius-pill);box-shadow:0 22px 40px -22px rgba(21,24,32,.42),0 0 0 1px var(--color-well-rule)}
+.pane{background:var(--color-paper-2);box-shadow:var(--glass-hi)}
+.pane img{width:min(100%,400px);border-radius:12.2% / 38.2%;box-shadow:0 30px 60px -24px var(--shade-70)}
+
+/* ---------- the rest, as a ruled list ---------- */
+.ledger{display:grid;grid-template-columns:minmax(0,4fr) minmax(0,8fr);column-gap:var(--space-3xl)}
+.ledger .head{position:sticky;top:calc(var(--nav-h) + var(--space-2xl));align-self:start;margin-bottom:0}
+.rows > li{display:grid;grid-template-columns:minmax(0,3fr) minmax(0,5fr);gap:var(--space-xs) var(--space-xl);padding-block:28px;border-top:1px solid var(--color-rule)}
+.rows > li:last-child{border-bottom:1px solid var(--color-rule)}
+
+/* ---------- how it connects ---------- */
+.wire{display:grid;grid-template-columns:minmax(0,7fr) minmax(0,5fr);column-gap:clamp(40px,6vw,96px);align-items:start}
+.wire__text p{margin-top:var(--space-lg);max-width:33rem}
+.facts{margin-top:var(--space-2xl)}
+.facts li{padding-block:var(--space-md);border-top:1px solid var(--color-rule);color:var(--color-ink-2)}
+.facts li:last-child{border-bottom:1px solid var(--color-rule)}
+.map{display:grid;justify-items:stretch}
+.map__node{padding:var(--space-lg) var(--space-xl) var(--space-xl);border-radius:var(--radius-card);background:var(--color-paper-2);box-shadow:var(--glass-hi)}
+.map__node h3{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;gap:4px 16px}
+.map__node h3 span{font:400 var(--text-sm)/1.4 var(--font-body);letter-spacing:0;color:var(--color-muted)}
+.map__node ul{margin-top:var(--space-md)}
+.map__node li{padding-block:10px;border-top:1px solid var(--light-07);font-size:.9375rem;color:var(--color-ink-2)}
+.map__link{justify-self:center;display:grid;justify-items:center;height:76px;grid-template-rows:1fr auto 1fr}
+.map__link::before,.map__link::after{content:"";width:1px;background:var(--color-accent)}
+.map__link span{padding:5px 14px;border-radius:var(--radius-pill);font:600 var(--text-sm)/1 var(--font-body);color:var(--color-accent);box-shadow:inset 0 0 0 1px var(--color-accent)}
+.map__aside{margin-top:var(--space-lg);padding:var(--space-md) var(--space-xl);border-radius:var(--radius-card);box-shadow:inset 0 0 0 1px var(--color-rule-2);font-size:var(--text-sm);line-height:1.7;color:var(--color-muted)}
+.map__aside b{font-weight:500;color:var(--color-wait)}
+
+/* ---------- install ---------- */
+.install{counter-reset:n;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:var(--space-2xl) var(--space-xl)}
+.install li{counter-increment:n;padding-top:var(--space-lg);border-top:1px solid var(--color-rule)}
+.install li::before{content:counter(n);display:block;margin-bottom:var(--space-lg);font:400 var(--text-section)/1 var(--font-display);letter-spacing:var(--tracking-display);color:var(--color-muted);font-variant-numeric:tabular-nums}
+.install p{margin-top:var(--space-sm);max-width:26rem}
+.install__more{margin-top:var(--space-2xl);display:flex;flex-wrap:wrap;gap:var(--space-sm) var(--space-xl);align-items:baseline;justify-content:space-between;color:var(--color-muted)}
+
+/* ---------- open source ---------- */
+.open{display:grid;grid-template-columns:minmax(0,5fr) minmax(0,7fr);column-gap:clamp(40px,6vw,96px);align-items:start}
+.open__text p{margin-top:var(--space-lg);max-width:30rem}
+.open__text .actions{margin-top:var(--space-xl)}
+.tree{width:100%;border-collapse:collapse;font-size:.9375rem}
+.tree th,.tree td{padding:15px 0;border-top:1px solid var(--color-rule);text-align:left;vertical-align:baseline;font-weight:400}
+.tree tr:last-child th,.tree tr:last-child td{border-bottom:1px solid var(--color-rule)}
+.tree th{width:42%;padding-right:var(--space-lg);color:var(--color-ink)}
+.tree td{color:var(--color-ink-2)}
+
+/* ---------- the close: the same hour, further along the shore ---------- */
+.close{position:relative;isolation:isolate;overflow:clip;padding-block:clamp(88px,11vw,168px)}
+.close__photo{position:absolute;inset:0;z-index:-2;background:var(--color-paper-3)}
+.close__photo img{width:100%;height:100%;object-fit:cover;object-position:60% 40%}
+.close__veil{position:absolute;inset:0;z-index:-1;background:
+  linear-gradient(to bottom,var(--color-paper) 0,var(--paper-00) 26%,var(--paper-00) 70%,var(--color-paper) 100%),
+  linear-gradient(to right,var(--shade-30),var(--shade-00) 70%)}
+.close__panel{max-width:35rem;padding:clamp(28px,4vw,48px)}
+.close__panel p{margin-top:var(--space-md);color:var(--color-ink)}
+.close__panel .actions{margin-top:var(--space-xl)}
+
+/* ---------- narrower screens: everything stacks in reading order ---------- */
+@media (max-width:960px){
+  .hero{align-items:flex-start;min-height:0;padding-bottom:var(--space-2xl)}
+  .hero__in{grid-template-columns:minmax(0,1fr);row-gap:var(--space-2xl)}
+  .hero__photo img{height:100%;object-position:50% 100%}
+  .hero__veil{background:linear-gradient(to bottom,var(--paper-00) 78%,var(--color-paper) 100%)}
+  .hero__text::before{bottom:-7rem;right:-100vw;width:auto;
+    background:linear-gradient(to top,var(--shade-00) 0,var(--shade-10) 1.5rem,var(--shade-22) 3rem,var(--shade-36) 4.5rem,var(--shade-48) 6rem,var(--shade-55) 8rem,var(--shade-62) 100%)}
+  .phone{--w:min(300px,70vw)}
+  .step{grid-template-columns:minmax(0,1fr);row-gap:var(--space-xl);padding-block:var(--space-2xl) var(--space-3xl)}
+  .step__text,.ledger .head{position:static}
+  .step__fig{justify-self:start;max-width:520px}
+  .away,.ledger,.wire,.open{grid-template-columns:minmax(0,1fr);row-gap:var(--space-2xl)}
+  .install{grid-template-columns:minmax(0,1fr)}
+  .install li::before{margin-bottom:var(--space-md)}
+}
+@media (max-width:560px){
+  .rows > li{grid-template-columns:minmax(0,1fr);padding-block:22px}
+  .head{margin-bottom:var(--space-2xl)}
+  .tree th{width:46%}
+}
+</style>
+</head>
+<body>
+<a class="skip" href="#features">跳到正文</a>
+
+<header class="nav">
+  <div class="container nav__in">
+    <a class="brand" href="#top"><img src="assets/icon-64.png" width="28" height="28" alt="">Pervio</a>
+    <nav class="nav__links" aria-label="站内导航">
+      <a class="hide-s" href="#features">功能</a>
+      <a class="hide-s" href="#wire">怎么连</a>
+      <a href="docs.html">文档</a>
+      <a class="hide-xs" href="https://github.com/pervio/Pervio">GitHub</a>
+      <a href="en.html">EN</a>
+      <a class="btn btn--small" href="https://testflight.apple.com/join/EagwZXV1">加入公测</a>
+    </nav>
+  </div>
+</header>
+
+<main id="top">
+
+<section class="hero">
+  <picture class="hero__photo">
+    <source media="(max-width:760px)" type="image/avif" srcset="assets/photo/mattole-hero-tall.avif">
+    <source media="(max-width:760px)" srcset="assets/photo/mattole-hero-tall.jpg">
+    <source type="image/avif" srcset="assets/photo/mattole-hero.avif">
+    <img src="assets/photo/mattole-hero.jpg" width="2880" height="1620" alt="黄昏的海岸，一道雾堤从陆地涌向海面" fetchpriority="high">
+  </picture>
+  <div class="hero__veil" aria-hidden="true"></div>
+  <div class="container hero__in">
+    <div class="hero__text">
+      <h1>用手机指挥<br>你自己电脑上的<br>编程 agent</h1>
+      <p class="lead">Pervio 是一个 iPhone app。它用 SSH 连上你的电脑，直接用上面装好的 Claude Code、Codex、Cursor。手机锁屏了、没网了，任务照样在电脑上跑。</p>
+      <div class="actions">
+        <a class="btn" href="https://testflight.apple.com/join/EagwZXV1">加入公测</a>
+        <a class="btn btn--ghost" href="docs.html#install">安装指南</a>
+      </div>
+      <p class="hero__note">TestFlight 公测，需要 iOS 17。电脑用 Mac，Linux 也可以。开源，不用注册账号。</p>
+    </div>
+    <figure class="phone">
+      <picture>
+        <source type="image/avif" srcset="assets/shots/chat-zh.avif">
+        <img src="assets/shots/chat-zh.png" width="720" height="1564" alt="和 Claude Code 的一段对话：它查了三个地方，找到登录接口偶发 500 的原因，改好并通过测试">
+      </picture>
+    </figure>
+  </div>
+</section>
+
+<section class="section" id="features">
+  <div class="container">
+    <div class="head">
+      <h2>主要功能</h2>
+    </div>
+    <ol class="steps" role="list">
+      <li class="step">
+        <div class="step__text">
+          <h3>对话</h3>
+          <p>agent 在电脑上读文件、跑命令、改代码，每一步在对话里占一行，点开能看到 diff 或者完整的命令。</p>
+          <p>对话和电脑上的是同一批。在终端或编辑器里聊到一半的，手机上可以接着聊。</p>
+        </div>
+        <figure class="step__fig">
+          <picture>
+            <source type="image/avif" srcset="assets/shots/step-ask-zh.avif">
+            <img src="assets/shots/step-ask-zh.jpg" width="1320" height="1312" loading="lazy" alt="对话界面：工具调用一行一条，下面是它的结论">
+          </picture>
+          <figcaption>它查了三个地方，找到了登录接口偶尔返回 500 的原因。</figcaption>
+        </figure>
+      </li>
+      <li class="step">
+        <div class="step__text">
+          <h3>Run 模式</h3>
+          <p>任务跑在电脑上，不需要手机一直连着。锁屏、切到别的 app、断网都没关系，回来接着看就行。</p>
+          <p>它干活的时候你可以插一句话，不用等它停下来（Claude Code 和 Codex 支持）。它放到后台的命令和子 agent，在输入框上方有一行汇总，点开能看每一个在做什么。</p>
+        </div>
+        <figure class="step__fig">
+          <picture>
+            <source type="image/avif" srcset="assets/shots/step-run-zh.avif">
+            <img src="assets/shots/step-run-zh.jpg" width="1320" height="1532" loading="lazy" alt="一个还在跑的任务：中途插入的一句话，输入框上方一行写着后台还有一条命令在跑">
+          </picture>
+          <figcaption>全量测试在后台跑着，中途又发了一句话。</figcaption>
+        </figure>
+      </li>
+      <li class="step">
+        <div class="step__text">
+          <h3>审批</h3>
+          <p>agent 要改文件或者跑命令的时候会先停下来。手机上能看到它要执行什么，你点允许或拒绝。</p>
+          <p>不想每次都点，可以把权限放宽，比如文件改动不再问。也可以让它先出计划，你同意了再动手。</p>
+        </div>
+        <figure class="step__fig">
+          <picture>
+            <source type="image/avif" srcset="assets/shots/step-approve-zh.avif">
+            <img src="assets/shots/step-approve-zh.jpg" width="1320" height="1568" loading="lazy" alt="审批弹窗：agent 想执行 git push origin release，下面是允许和拒绝">
+          </picture>
+          <figcaption>它要执行 git push，先停下来问你。</figcaption>
+        </figure>
+      </li>
+      <li class="step">
+        <div class="step__text">
+          <h3>双开</h3>
+          <p>让两个模型一起做一件事，通常是不同的两家，比如 Claude 和 Codex。</p>
+          <p>「监督」是一个干活，另一个检查，有问题就打回去重做，最多三轮，需要你拿主意的时候会通知你。「头脑风暴」是两边各答各的，再由主对话把分歧和结论整理出来。</p>
+        </div>
+        <figure class="step__fig">
+          <picture>
+            <source type="image/avif" srcset="assets/shots/step-duet-zh.avif">
+            <img src="assets/shots/step-duet-zh.jpg" width="1320" height="1748" loading="lazy" alt="监督模式下的一组对话：主对话按监督者的意见改了第二遍，下面的横幅写着通过，轮次条上第一轮是继续、第二轮是通过">
+          </picture>
+          <figcaption>Claude 干活，Codex 检查。第一轮被打回，第二轮通过。</figcaption>
+        </figure>
+      </li>
+      <li class="step">
+        <div class="step__text">
+          <h3>工作流</h3>
+          <p>把几步事情串起来，定时在电脑上跑，跑完给你一份能直接读的成品，比如每天早上的论文晨报。</p>
+          <p>每一步可以交给不同的引擎，互不依赖的步骤同时跑。自带论文晨报、GitHub 热点日报、深度调研等几个模板，也可以让 agent 按你的描述搭一条。</p>
+        </div>
+        <figure class="step__fig">
+          <picture>
+            <source type="image/avif" srcset="assets/shots/step-workflow-zh.avif">
+            <img src="assets/shots/step-workflow-zh.jpg" width="1320" height="1644" loading="lazy" alt="一条工作流跑到一半的流程图：前四步已完成，第五步正在跑，后两步还没开始">
+          </picture>
+          <figcaption>自带的「深度调研」跑到一半：Claude 和 Codex 各查了一遍，合并做完了，正在复核。</figcaption>
+        </figure>
+      </li>
+    </ol>
+  </div>
+</section>
+
+<section class="section section--tight">
+  <div class="container">
+    <div class="head">
+      <h2>锁屏和通知</h2>
+      <p class="lead">任务做完了，或者停下来等你批准，手机会收到通知。任务在跑的时候，进度显示在灵动岛和锁屏上。</p>
+    </div>
+    <div class="away">
+      <figure>
+        <div class="away__surface well">
+          <div class="well__stack">
+            <img src="assets/shots/notif-approve-zh.png" width="1277" height="202" loading="lazy" alt="通知：Claude 在等你批准，跑命令">
+            <img src="assets/shots/notif-done-zh.png" width="1277" height="202" loading="lazy" alt="通知：shop-api 任务完成，合到 release 分支，再跑一遍全量测试">
+          </div>
+        </div>
+        <figcaption><b>通知</b>一条是在等你批准，一条是任务做完了。</figcaption>
+      </figure>
+      <figure>
+        <div class="away__surface pane">
+          <img src="assets/shots/island-zh.png" width="720" height="230" loading="lazy" alt="灵动岛展开：六步完成了四步，下面是它正在做的动作">
+        </div>
+        <figcaption><b>灵动岛</b>展开能看到进度。图里这条工作流一共六步，做完了四步。</figcaption>
+      </figure>
+    </div>
+  </div>
+</section>
+
+<section class="section">
+  <div class="container ledger">
+    <div class="head">
+      <h2>其他功能</h2>
+      <p class="lead">这些也都走那一条 SSH 连接，电脑上不用另外装东西（终端要装 tmux）。</p>
+    </div>
+    <ul class="rows" role="list">
+      <li>
+        <h3>引擎和供应商</h3>
+        <p>Claude Code、Codex、Cursor 都能用，用的就是你电脑上装好、登录好的那一份。也可以换成第三方供应商，比如智谱 GLM、Kimi、MiniMax、DeepSeek、通义千问、OpenRouter，API key 只存在电脑上。</p>
+      </li>
+      <li>
+        <h3>网页预览</h3>
+        <p>电脑上 localhost 的网页，比如开发服务器、文档站，可以直接在手机上打开。走的还是 SSH，端口不用对外开。看到的页面可以截图发回对话里。</p>
+      </li>
+      <li>
+        <h3>终端</h3>
+        <p>底下是 tmux，所以断线了会话还在，连回来还是原来那一屏。电脑上要装 tmux。</p>
+      </li>
+      <li>
+        <h3>文件</h3>
+        <p>照片、手机上的文件、电脑上的文件和目录、以前的对话，都可以附进对话里。回复里出现的文件路径，点一下就能打开看。</p>
+      </li>
+      <li>
+        <h3>多台电脑</h3>
+        <p>可以存多台电脑，也可以经跳板机连接。存了两台以上，一台上的文件和对话可以带到另一台的对话里。每台的主机密钥第一次核对后就固定下来，以后对不上会拒绝连接。</p>
+      </li>
+    </ul>
+  </div>
+</section>
+
+<section class="section section--tight" id="wire">
+  <div class="container wire">
+    <div class="wire__text">
+      <h2>对话只存在你的电脑上</h2>
+      <p>手机和电脑之间只有一条 SSH 连接，没有 Pervio 的账号，也没有 Pervio 的服务器。电脑上不装常驻服务，也不用对外开端口。</p>
+      <ul class="facts" role="list">
+        <li>SSH 密钥和密码存在手机的钥匙串里。</li>
+        <li>对话记录就是 Claude Code 这些工具自己存的文件，一直留在电脑上。</li>
+        <li>只有推送通知会经过我们的中继，经过的是通知的标题和正文。不想用可以关掉。</li>
+      </ul>
+    </div>
+    <figure class="map" aria-label="连接示意图：手机经 SSH 连到你的电脑，推送走另一条路">
+      <div class="map__node">
+        <h3>手机上的 Pervio <span>iPhone app</span></h3>
+        <ul role="list">
+          <li>对话、后台任务、审批、终端</li>
+          <li>密钥在 iOS 钥匙串，主机密钥已固定</li>
+        </ul>
+      </div>
+      <div class="map__link" aria-hidden="true"><span>SSH</span></div>
+      <div class="map__node">
+        <h3>你的电脑 <span>远程登录（sshd）</span></h3>
+        <ul role="list">
+          <li><code>~/.pervio/bin/pervio-*</code>，app 自带，连上时放好</li>
+          <li><code>claude</code>、<code>codex</code>、<code>agent</code>，用你自己的登录</li>
+          <li>会话记录、后台任务的输出，都在这台机器上</li>
+        </ul>
+      </div>
+      <p class="map__aside"><b>推送</b>走另一条路：从电脑到 <code>push.pervio.dev</code>，再经 Apple 到手机，带的只有通知上的文字。</p>
+    </figure>
+  </div>
+</section>
+
+<section class="section" id="start">
+  <div class="container">
+    <div class="head">
+      <h2>安装</h2>
+    </div>
+    <ol class="install" role="list">
+      <li>
+        <h3>准备电脑</h3>
+        <p>Mac 在系统设置里打开「远程登录」。Claude Code、Codex、Cursor 至少装一个，并且登录好。</p>
+      </li>
+      <li>
+        <h3>在手机上添加这台电脑</h3>
+        <p>从 TestFlight 装上 Pervio，在「服务器」里填电脑的地址和用户名，选密钥或密码登录，再核对一下主机密钥的指纹。</p>
+      </li>
+      <li>
+        <h3>开始对话</h3>
+        <p>第一次连上时，app 会把要用的脚本放到电脑的 <code>~/.pervio/bin</code>，不用手动装。</p>
+      </li>
+    </ol>
+    <div class="install__more">
+      <p>出门在外要连家里或公司的电脑，可以两边都装 Tailscale，不用把 SSH 开到公网。</p>
+      <a class="link" href="docs.html#install">完整安装指南</a>
+    </div>
+  </div>
+</section>
+
+<section class="section section--tight">
+  <div class="container open">
+    <div class="open__text">
+      <h2>开源</h2>
+      <p>app、电脑上的脚本、推送中继的代码都在 GitHub 上，MIT 许可。安全设计和已知的限制写在 SECURITY.md 里。</p>
+      <div class="actions">
+        <a class="btn btn--ghost" href="https://github.com/pervio/Pervio">GitHub</a>
+        <a class="btn btn--ghost" href="privacy.html">隐私</a>
+      </div>
+    </div>
+    <table class="tree">
+      <tbody>
+        <tr><th scope="row"><code>ios/</code></th><td>iPhone app(SwiftUI)</td></tr>
+        <tr><th scope="row"><code>server/bin/</code></th><td>放到电脑上的脚本，app 自带</td></tr>
+        <tr><th scope="row"><code>server/gateway/</code></th><td>推送中继</td></tr>
+        <tr><th scope="row"><code>server/tests/</code></th><td>服务端测试，CI 上全跑</td></tr>
+        <tr><th scope="row"><code>docs/</code></th><td>安装与功能文档</td></tr>
+        <tr><th scope="row"><code>SECURITY.md</code></th><td>安全设计与边界</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="close">
+  <picture class="close__photo">
+    <source type="image/avif" srcset="assets/photo/mattole-close.avif">
+    <img src="assets/photo/mattole-close.jpg" width="2340" height="900" loading="lazy" alt="同一片海岸，雾堤的尽头和天边最后的光">
+  </picture>
+  <div class="close__veil" aria-hidden="true"></div>
+  <div class="container">
+    <div class="close__panel glass">
+      <h2>试用</h2>
+      <p>现在在 TestFlight 公测，免费。需要一台装了 Claude Code、Codex 或 Cursor 的电脑。</p>
+      <div class="actions">
+        <a class="btn" href="https://testflight.apple.com/join/EagwZXV1">加入公测</a>
+        <a class="btn btn--ghost" href="docs.html">看文档</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<footer class="foot">
+  <div class="container">
+    <div class="foot__row">
+      <a class="brand" href="#top"><img src="assets/icon-64.png" width="28" height="28" alt="">Pervio</a>
+      <nav class="foot__links" aria-label="页脚">
+        <a href="docs.html">文档</a>
+        <a href="docs.html#install">安装</a>
+        <a href="privacy.html">隐私</a>
+        <a href="support.html">支持</a>
+        <a href="https://github.com/pervio/Pervio">GitHub</a>
+        <a href="en.html" lang="en">English</a>
+      </nav>
+    </div>
+    <p class="foot__note">Pervio 以 MIT 许可开源。照片：<a class="link" href="https://commons.wikimedia.org/wiki/File:Fog_bank_forming_over_Mattole_beach_(54103432351).jpg">Mattole 海滩上空正在形成的雾堤</a>，美国土地管理局加州分局拍摄，公有领域，取自 Wikimedia Commons。</p>
+  </div>
+</footer>
+
+<script>
+(function(){var n=document.querySelector(".nav");if(!n)return;
+function f(){n.toggleAttribute("data-stuck",window.scrollY>24)}
+f();addEventListener("scroll",f,{passive:true})})();
+</script>
+</body>
+</html>

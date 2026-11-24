@@ -1,0 +1,911 @@
+#!/usr/bin/env python3
+"""pervio-push — send a lock-screen alert to the user's iPhone via Apple's APNs,
+straight from this Mac. No third party: we open an HTTP/2 connection to
+api.push.apple.com ourselves (through curl) and authenticate with a JWT we sign
+here from the App Store Connect–style .p8 key.
+
+WHY THIS EXISTS. The iOS app's Tier-1 notifier only fires while the app is alive
+(foreground or the brief background grace). Once iOS suspends it, no Swift code
+runs and the SSH socket is gone — so a workflow finishing, failing, or pausing for
+approval at 6:30am can't ping the phone from there. This script is Tier 2: the
+server reaches the phone through Apple even when the app is fully asleep.
+
+GRACEFUL DEGRADATION IS THE POINT. The user has not generated the APNs key yet
+(they will, later, in the developer portal). Until the key AND at least one device
+token are present, `send` must be a silent no-op that EXITS 0 — it is called from
+fire-and-forget hooks in pervio-orchestrate, and a missing key must never turn a
+successful publish or a real failure notice into a hook error. The moment the key
+lands in ~/.pervio/apns/ and the phone has uploaded a token, the very same hooks
+start delivering. No code change, no redeploy.
+
+LAYOUT (mirrors ~/.pervio/asc/, the TestFlight key):
+    ~/.pervio/apns/AuthKey_<KEYID>.p8   the key from Apple Developer → Keys (APNs)
+    ~/.pervio/apns/key_id               the 10-char Key ID (else inferred from filename)
+    ~/.pervio/apns/issuer_id            the 10-char Team ID (the JWT issuer)
+    ~/.pervio/push/tokens/<device>      one hex device token per file (phone uploads these)
+    ~/.pervio/push/liveactivity/<runId> one hex ACTIVITY token per live run (ditto)
+
+SIGNING, PURE-PYTHON + openssl (no cryptography module on this box):
+  header.claims are base64url-encoded here; the ES256 signature is produced by
+  `openssl dgst -sha256 -sign key.p8`, whose DER ECDSA output we convert to the raw
+  64-byte r||s that JWS requires. The token is cached (~/.pervio/apns/.jwt_cache.json,
+  0600) and reused for <=50 min — Apple rejects a token older than 60 and throttles
+  minting a fresh one too often.
+
+SUBCOMMANDS:
+    pervio-push send  --title T --body B [--thread ID] [--sandbox] [--dry-run]
+    pervio-push dry-run  --title T --body B [...]     # alias for `send --dry-run`
+    pervio-push check [--sandbox]                     # is the key + a token present?
+    pervio-push liveactivity --run R [--event end|update] [--status S] [--detail D]
+                             [--step N] [--steps-done N] [--steps-total N] [--failed]
+                             [--tool-icon SYMBOL] [--tool-line TEXT] [--step-eta SECS]
+                             [--dismiss-after SECS] [--sandbox] [--dry-run]
+
+By default we talk to api.push.apple.com (production, which is what a TestFlight or
+App Store build uses). --sandbox switches to api.sandbox.push.apple.com, for a build
+signed with the development aps-environment (a debug build run from Xcode).
+
+THE LIVE ACTIVITY LEG (`liveactivity`). Every ActivityKit `end()` call lives in the
+iOS app PROCESS. A detached run finishes on this Mac tens of minutes after iOS
+suspended the app, so no Swift code is left to end the Dynamic Island card — it
+keeps counting forever (the user watched exactly this happen). The only cure is an
+ActivityKit push, which differs from a normal alert in three ways:
+
+  * `apns-push-type: liveactivity` (not `alert`);
+  * `apns-topic: <bundleid>.push-type.liveactivity` (a SUFFIXED topic);
+  * it goes to the token of ONE ACTIVITY, not to the device — the phone uploads
+    that per-run token to ~/.pervio/push/liveactivity/<runId> when it starts the
+    activity, and deletes it when the activity ends.
+
+Same .p8 key, same JWT, same HTTP/2 connection — nothing new to provision.
+"""
+import base64
+import glob
+import json
+import os
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+APNS_DIR = os.path.join(HOME, ".pervio", "apns")
+TOKENS_DIR = os.path.join(HOME, ".pervio", "push", "tokens")
+# One file per LIVE run: <runId> -> that Live Activity's own push token. Written by
+# the phone when it starts the activity, removed when the activity ends.
+LA_TOKENS_DIR = os.path.join(HOME, ".pervio", "push", "liveactivity")
+JWT_CACHE = os.path.join(APNS_DIR, ".jwt_cache.json")
+
+# The app's bundle id (project.yml: PRODUCT_BUNDLE_IDENTIFIER). APNs routes by it.
+TOPIC = "app.pervio"
+# ActivityKit pushes are routed on a SUFFIXED topic — Apple's documented format is
+# "<your bundleID>.push-type.liveactivity". Sending them on the plain topic is
+# rejected; sending an alert on this one is too.
+LA_TOPIC = TOPIC + ".push-type.liveactivity"
+
+# How long the ended card lingers before the system clears it. Mirrors the in-app
+# `dismissalPolicy: .after(now + 3)` so a push-ended run looks identical to one the
+# app ended itself: the final "Done" frame flashes, then the island collapses.
+# Apple caps a custom dismissal date at 4 hours past the end.
+LA_DISMISS_AFTER = 3
+LA_MAX_DISMISS_AFTER = 4 * 3600
+
+PROD_HOST = "api.push.apple.com"
+# The relay (server/gateway, docs/apns.md): the ONE machine that holds an APNs
+# key, so a Mac without ~/.pervio/apns still reaches its phone. Used only when
+# no local key exists (a local key keeps direct mode, byte-for-byte as before).
+# Override with ~/.pervio/push/gateway (a URL, or "off") or $PERVIO_PUSH_GATEWAY.
+GATEWAY_DEFAULT = "https://push.pervio.dev"
+GATEWAY_FILE = os.path.join(HOME, ".pervio", "push", "gateway")
+GATEWAY_PATH = "/v1/push"
+SANDBOX_HOST = "api.sandbox.push.apple.com"
+
+# Reuse a signed token for at most this long. Apple's hard limit is 60 min; 50
+# leaves margin for clock skew and a slow send.
+JWT_MAX_AGE = 50 * 60
+
+
+def _log(msg):
+    """One line to stderr, prefixed. Never to stdout — stdout is reserved for the
+    dry-run request dump so it can be captured/asserted on cleanly."""
+    sys.stderr.write("pervio-push: " + msg + "\n")
+
+
+def _b64url(raw):
+    """base64url without padding, over bytes, returning str (JWS wants no '=')."""
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+# ---------------------------------------------------------------------------
+# Key material discovery
+# ---------------------------------------------------------------------------
+
+def find_key():
+    """Locate the APNs signing material. Returns (key_path, key_id, team_id) or
+    None if anything required is missing. Never raises — a missing key is the
+    normal pre-provisioning state, not an error."""
+    try:
+        p8s = sorted(glob.glob(os.path.join(APNS_DIR, "AuthKey_*.p8")))
+    except OSError:
+        return None
+    if not p8s:
+        return None
+    key_path = p8s[0]
+
+    # key_id: prefer the explicit file, else parse it out of AuthKey_<KEYID>.p8.
+    key_id = _read_small(os.path.join(APNS_DIR, "key_id"))
+    if not key_id:
+        base = os.path.basename(key_path)
+        if base.startswith("AuthKey_") and base.endswith(".p8"):
+            key_id = base[len("AuthKey_"):-len(".p8")]
+    # issuer_id here holds the 10-char TEAM ID (the APNs JWT issuer), by analogy
+    # with ~/.pervio/asc/issuer_id (which holds the ASC issuer UUID). Same filename,
+    # so the docs can say "same layout as the TestFlight key".
+    team_id = _read_small(os.path.join(APNS_DIR, "issuer_id"))
+
+    if not (key_id and team_id):
+        return None
+    return (key_path, key_id, team_id)
+
+
+def gateway_url():
+    """The relay to use when there is no local key: $PERVIO_PUSH_GATEWAY, else
+    ~/.pervio/push/gateway, else the default. "" (or "off") = no relay."""
+    url = os.environ.get("PERVIO_PUSH_GATEWAY")
+    if url is None:
+        url = _read_small(GATEWAY_FILE)
+        if url is None or url == "":
+            url = GATEWAY_DEFAULT
+    url = (url or "").strip().rstrip("/")
+    if url.lower() in ("", "off", "none", "0"):
+        return ""
+    return url
+
+
+def gateway_send(url, kind, token, payload, collapse="", timeout=10):
+    """POST one push through the relay. Returns (http_status, body). The relay
+    derives topic + push-type from `kind` and signs with its own key; we send
+    the SAME payload the direct builders make."""
+    req = {"kind": kind, "token": token, "payload": payload}
+    if collapse:
+        req["collapse"] = collapse[:64]
+    cmd = ["curl", "-s", "-S", "--max-time", str(timeout), "-X", "POST",
+           "-H", "content-type: application/json", "-o", "-", "-w", "\n%{http_code}",
+           "--data-binary", "@-", url + GATEWAY_PATH]
+    try:
+        proc = subprocess.run(cmd, input=json.dumps(req, separators=(",", ":")).encode("utf-8"),
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout + 5)
+    except (OSError, subprocess.SubprocessError) as e:
+        return (0, "curl failed: %s" % e)
+    out = proc.stdout.decode("utf-8", "replace")
+    nl = out.rfind("\n")
+    status_str = out[nl + 1:].strip() if nl >= 0 else out.strip()
+    try:
+        status = int(status_str)
+    except ValueError:
+        status = 0
+    return (status, out[:nl] if nl >= 0 else "")
+
+
+def gateway_healthy(url, timeout=6):
+    """True when the relay answers /v1/health with a key on board."""
+    if not url:
+        return False
+    try:
+        proc = subprocess.run(["curl", "-s", "-S", "--max-time", str(timeout), url + "/v1/health"],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout + 5)
+        o = json.loads(proc.stdout.decode("utf-8", "replace") or "{}")
+        return bool(o.get("ok")) and bool(o.get("key"))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+
+
+def _gateway_reason(resp):
+    try:
+        o = json.loads(resp) if resp else {}
+        return o.get("error") or o.get("reason") or ""
+    except ValueError:
+        return (resp or "")[:120]
+
+
+def _read_small(path):
+    """Read a tiny single-line config file, stripped. '' if absent/unreadable."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def list_tokens(device=""):
+    """Every device token the phone(s) have uploaded. One hex string per file;
+    files are deduped by content so two devices with the same token (shouldn't
+    happen) collapse to one send. Returns a sorted list (deterministic for tests).
+
+    `device` narrows it to ONE phone — the one that started the work (pervio-run
+    records it, the phone sends it when it starts a run). Who starts a task is
+    the only one told it finished; a Mac with two phones on it used to buzz both
+    (2026-10-15: 谁发的推给谁). A device with no token on file gets nothing —
+    it could not be reached anyway, and the others were not asked."""
+    seen = {}
+    try:
+        names = os.listdir(TOKENS_DIR)
+    except OSError:
+        return []
+    for name in names:
+        if name.startswith("."):
+            continue
+        if device and name != device:
+            continue
+        path = os.path.join(TOKENS_DIR, name)
+        if not os.path.isfile(path):
+            continue
+        tok = _read_small(path)
+        # A device token is 64+ hex chars. Be lenient but reject obvious junk so a
+        # stray file can't become a garbage :path.
+        tok = tok.strip().lower()
+        if _is_token(tok):
+            seen[tok] = True
+    return sorted(seen.keys())
+
+
+def _is_token(tok):
+    """A push token is 64+ lowercase hex chars. Be lenient about the exact length
+    (Apple has widened it before) but reject obvious junk, so a stray file can never
+    become a garbage :path on the wire."""
+    tok = (tok or "").strip().lower()
+    return bool(tok) and len(tok) >= 32 and all(c in "0123456789abcdef" for c in tok)
+
+
+def activity_token(run_id):
+    """The push token of the Live Activity tracking `run_id`, or ''.
+
+    Missing is the NORMAL case, not an error: the phone only uploads a token when it
+    actually started an activity for that run, the user may have Live Activities
+    switched off, and the file is deleted the moment the activity ends. Every caller
+    treats '' as "nothing to end" and exits 0.
+
+    `run_id` is used as a FILENAME, so it is validated rather than escaped: bare
+    [A-Za-z0-9._-] only, which cannot traverse out of the directory."""
+    rid = (run_id or "").strip()
+    if not rid or not all(c in
+                          "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-"
+                          for c in rid):
+        return ""
+    tok = _read_small(os.path.join(LA_TOKENS_DIR, rid))
+    return tok.strip().lower() if _is_token(tok) else ""
+
+
+def list_activity_runs():
+    """Run ids that currently have a Live Activity token on file. Sorted, for a
+    deterministic `check` line."""
+    try:
+        names = os.listdir(LA_TOKENS_DIR)
+    except OSError:
+        return []
+    return sorted(n for n in names if not n.startswith(".") and activity_token(n))
+
+
+# ---------------------------------------------------------------------------
+# ES256 JWT (pure python framing + openssl signature)
+# ---------------------------------------------------------------------------
+
+def _der_ecdsa_to_raw(der, size=32):
+    """Convert an openssl ECDSA DER signature (SEQUENCE { INTEGER r, INTEGER s })
+    into the fixed-width r||s (2*size bytes) that JWS ES256 mandates. Pure python,
+    no dependencies — the whole reason we can sign without the `cryptography` wheel."""
+    if not der or der[0] != 0x30:
+        raise ValueError("not a DER SEQUENCE")
+    # SEQUENCE length (short or long form) — we only need to skip past it.
+    idx = 1
+    ln = der[idx]
+    idx += 1
+    if ln & 0x80:
+        idx += (ln & 0x7F)
+
+    def read_int(buf, i):
+        if buf[i] != 0x02:
+            raise ValueError("expected INTEGER")
+        length = buf[i + 1]
+        i += 2
+        val = buf[i:i + length]
+        i += length
+        # DER integers are signed big-endian: drop a leading 0x00 sign byte, then
+        # left-pad to the field width.
+        val = val.lstrip(b"\x00")
+        if len(val) > size:
+            raise ValueError("integer wider than field")
+        return val.rjust(size, b"\x00"), i
+
+    r, idx = read_int(der, idx)
+    s, idx = read_int(der, idx)
+    return r + s
+
+
+def sign_es256(signing_input, key_path):
+    """ES256-sign the ASCII `signing_input` with the P-256 key at key_path, using
+    the openssl CLI, and return the raw JWS signature bytes (r||s)."""
+    try:
+        proc = subprocess.run(
+            ["openssl", "dgst", "-sha256", "-sign", key_path],
+            input=signing_input.encode("ascii"),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise ValueError("openssl failed to run: %s" % e)
+    if proc.returncode != 0:
+        raise ValueError("openssl signing error: %s"
+                         % proc.stderr.decode("utf-8", "replace").strip()[:200])
+    return _der_ecdsa_to_raw(proc.stdout)
+
+
+def _cached_jwt(key_id):
+    """A still-fresh cached token for this key_id, or ''."""
+    try:
+        with open(JWT_CACHE, "r", encoding="utf-8") as f:
+            c = json.load(f)
+    except (OSError, ValueError):
+        return ""
+    if (c.get("kid") == key_id and c.get("jwt")
+            and (time.time() - float(c.get("iat", 0))) < JWT_MAX_AGE):
+        return c["jwt"]
+    return ""
+
+
+def _store_jwt(key_id, jwt, iat):
+    try:
+        # Owner-only from birth: it is a bearer credential.
+        fd = os.open(JWT_CACHE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({"kid": key_id, "jwt": jwt, "iat": iat}, f)
+    except OSError:
+        pass   # a non-writable cache just means we re-sign next time
+
+
+def make_jwt(key_path, key_id, team_id):
+    """Return a bearer JWT for APNs, minting (and caching) a fresh one only when
+    the cache is stale. Header {alg:ES256, kid}, claims {iss:team, iat}."""
+    hit = _cached_jwt(key_id)
+    if hit:
+        return hit
+    iat = int(time.time())
+    header = _b64url(json.dumps({"alg": "ES256", "kid": key_id},
+                                separators=(",", ":")).encode("ascii"))
+    claims = _b64url(json.dumps({"iss": team_id, "iat": iat},
+                                separators=(",", ":")).encode("ascii"))
+    signing_input = header + "." + claims
+    sig = _b64url(sign_es256(signing_input, key_path))
+    jwt = signing_input + "." + sig
+    _store_jwt(key_id, jwt, iat)
+    return jwt
+
+
+# ---------------------------------------------------------------------------
+# Request assembly
+# ---------------------------------------------------------------------------
+
+def build_payload(title, body, thread):
+    """The APNs JSON payload. A visible alert (title+body), default sound, and the
+    content-available flag off — this is a user-facing lock-screen alert, not a
+    silent background push."""
+    aps = {"alert": {"title": title, "body": body}, "sound": "default"}
+    if thread:
+        aps["thread-id"] = thread
+    return {"aps": aps}
+
+
+def build_request(host, token, jwt, payload, thread):
+    """Everything needed to describe (or make) ONE HTTP/2 POST to APNs, as a dict.
+    Kept as data so dry-run can print it and send can execute the identical thing."""
+    headers = {
+        "apns-topic": TOPIC,
+        "apns-push-type": "alert",
+        "apns-priority": "10",     # deliver immediately (user-facing)
+        "authorization": "bearer " + jwt,
+    }
+    if thread:
+        headers["apns-collapse-id"] = thread[:64]
+    return {
+        "method": "POST",
+        "host": host,
+        "path": "/3/device/" + token,
+        "headers": headers,
+        "body": json.dumps(payload, separators=(",", ":")),
+    }
+
+
+def build_activity_payload(event, status, detail, step, now, dismiss_after,
+                           steps_done=0, steps_total=0, failed=False,
+                           tool_icon="", tool_line="", step_eta=0):
+    """The ActivityKit payload, per Apple's "Starting and updating Live Activities
+    with ActivityKit push notifications".
+
+      aps.timestamp      REQUIRED on every ActivityKit push: epoch SECONDS. The
+                         system uses it to drop out-of-order deliveries, so it must
+                         be "now", not the run's start time.
+      aps.event          "update" | "end" (we never push "start" — the app owns that,
+                         and a push-to-start needs attributes-type/attributes too).
+      aps.content-state  Must decode into RunActivityAttributes.ContentState. Key
+                         names are the Swift property names verbatim, and we send
+                         EVERY ONE of them, because Swift's synthesized Codable does
+                         not apply property defaults — omit a key it treats as
+                         required and the whole push is silently discarded, leaving
+                         the island exactly as stuck as before.
+                         (ContentState holds no Date, so the .deferredToDate
+                         reference-date trap doesn't apply here — `stepStartedAt` is
+                         a plain epoch-seconds int for precisely that reason.)
+                         The app's side decodes the four newest keys with
+                         decodeIfPresent, so an OLD pervio-push against a NEW app
+                         still lands (no tool row, no self-filling cell) — but only
+                         in that direction, which is why this end sends them all.
+                         `failed` picks the island's terminal look on an `end`: a
+                         green flag + resting otter (clean) vs. a rust cairn + slumped
+                         otter (stopped/errored). `stepsDone`/`stepsTotal` draw the
+                         trail; this Mac-side end knows neither for an open-ended run,
+                         so they default to 0 (the receding path collapses, which is
+                         the honest end for a run of unknown length). A workflow is
+                         ended by the app, which fills in its real step counts.
+                         `toolIcon`/`toolLine` are the bottom row ("Bash · npm test");
+                         an `end` sends them empty because a finished card has no
+                         "currently doing".
+                         `stepETA` + `stepStartedAt` are the window the island fills
+                         the current trail cell over — its only motion between
+                         pushes. `stepStartedAt` is ALWAYS this push's own timestamp
+                         and takes no flag: a state update IS the step boundary, so
+                         the cell it starts began now, by definition. `stepETA` 0
+                         means "no estimate" and the island uses its own default.
+      aps.dismissal-date "end" only: when the system removes the ended card from the
+                         Lock Screen. Without it an ended activity lingers up to four
+                         hours — which for this bug looks exactly like not fixing it.
+    """
+    ending = event == "end"
+    aps = {
+        "timestamp": now,
+        "event": event,
+        "content-state": {
+            "status": status,
+            "detail": detail,
+            "finished": ending,
+            "step": step,
+            "stepsDone": steps_done,
+            "stepsTotal": steps_total,
+            "failed": bool(failed),
+            "toolIcon": "" if ending else tool_icon,
+            "toolLine": "" if ending else tool_line,
+            "stepETA": 0 if ending else step_eta,
+            "stepStartedAt": now,
+        },
+    }
+    if ending:
+        aps["dismissal-date"] = now + dismiss_after
+    return {"aps": aps}
+
+
+def build_activity_request(host, token, jwt, payload):
+    """ONE HTTP/2 POST that updates or ends a Live Activity. Same shape as
+    build_request, but the Live Activity push type, the suffixed topic, and no
+    collapse-id (these are addressed to a single activity, never coalesced)."""
+    return {
+        "method": "POST",
+        "host": host,
+        "path": "/3/device/" + token,
+        "headers": {
+            "apns-topic": LA_TOPIC,
+            "apns-push-type": "liveactivity",
+            "apns-priority": "10",     # the user is staring at a stuck island
+            "authorization": "bearer " + jwt,
+        },
+        "body": json.dumps(payload, separators=(",", ":")),
+    }
+
+
+def render_request(req, redact=True):
+    """A stable, line-oriented dump of a request for dry-run and for tests to assert
+    on byte-for-byte. The bearer token is redacted by default (it is a live
+    credential and the dump goes to stdout)."""
+    lines = ["%s https://%s%s" % (req["method"], req["host"], req["path"])]
+    for k in sorted(req["headers"].keys()):
+        v = req["headers"][k]
+        if redact and k == "authorization":
+            v = "bearer <redacted>"
+        lines.append("%s: %s" % (k, v))
+    lines.append("")
+    lines.append(req["body"])
+    return "\n".join(lines)
+
+
+def curl_send(req, timeout):
+    """POST one request over HTTP/2 with curl. Returns (http_status:int, body:str).
+    curl --http2 negotiates h2; APNs requires it."""
+    url = "https://%s%s" % (req["host"], req["path"])
+    cmd = ["curl", "--http2", "-s", "-S", "--max-time", str(timeout),
+           "-X", req["method"],
+           "-o", "-",                 # body to stdout
+           "-w", "\n%{http_code}",    # append status on its own line
+           ]
+    for k, v in req["headers"].items():
+        cmd += ["-H", "%s: %s" % (k, v)]
+    cmd += ["-d", req["body"], url]
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              timeout=timeout + 5)
+    except (OSError, subprocess.SubprocessError) as e:
+        return (0, "curl failed: %s" % e)
+    out = proc.stdout.decode("utf-8", "replace")
+    nl = out.rfind("\n")
+    status_str = out[nl + 1:].strip() if nl >= 0 else out.strip()
+    body = out[:nl] if nl >= 0 else ""
+    try:
+        status = int(status_str)
+    except ValueError:
+        status = 0
+    return (status, body)
+
+
+# ---------------------------------------------------------------------------
+# Subcommands
+# ---------------------------------------------------------------------------
+
+def parse_send_args(argv):
+    """Minimal flag parser for send/dry-run. Accepts --title/--body/--thread and
+    --sandbox/--dry-run; also tolerates two positional args (title body) so the
+    orchestrate hooks can stay short. Returns a dict."""
+    out = {"title": "", "body": "", "thread": "", "sandbox": False, "dry_run": False, "device": ""}
+    positional = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--title" and i + 1 < len(argv):
+            out["title"] = argv[i + 1]; i += 2
+        elif a == "--body" and i + 1 < len(argv):
+            out["body"] = argv[i + 1]; i += 2
+        elif a == "--thread" and i + 1 < len(argv):
+            out["thread"] = argv[i + 1]; i += 2
+        elif a == "--device" and i + 1 < len(argv):
+            # The phone that started the work: only it is told it finished.
+            out["device"] = argv[i + 1]; i += 2
+        elif a == "--sandbox":
+            out["sandbox"] = True; i += 1
+        elif a == "--dry-run":
+            out["dry_run"] = True; i += 1
+        elif a.startswith("--"):
+            _log("ignoring unknown flag %s" % a); i += 1
+        else:
+            positional.append(a); i += 1
+    if not out["title"] and positional:
+        out["title"] = positional.pop(0)
+    if not out["body"] and positional:
+        out["body"] = positional.pop(0)
+    return out
+
+
+def cmd_send(argv, force_dry=False):
+    """Send (or dry-run) an alert. Returns a process exit code. CRUCIAL: when the
+    key or a token is missing this logs ONE line and returns 0 — the hooks that
+    call us must never fail because push isn't set up yet."""
+    args = parse_send_args(argv)
+    dry = args["dry_run"] or force_dry
+    host = SANDBOX_HOST if args["sandbox"] else PROD_HOST
+    title = args["title"]
+    body = args["body"]
+    if not title and not body:
+        _log("nothing to send (no --title/--body)")
+        return 0
+
+    key = find_key()
+    tokens = list_tokens(args.get("device", ""))
+    if args.get("device") and not tokens:
+        _log("no token on file for device %s — nobody else is told" % args["device"])
+        return 0
+
+    # Dry-run: describe the request without needing a real key. If a key IS present
+    # we sign for real (so the dump is faithful); if not, we use a placeholder token
+    # and an unsigned marker so the SHAPE is still visible for review/tests.
+    if dry:
+        payload = build_payload(title, body, args["thread"])
+        if key and tokens:
+            key_path, key_id, team_id = key
+            try:
+                jwt = make_jwt(key_path, key_id, team_id)
+            except ValueError as e:
+                _log("dry-run: could not sign (%s); showing unsigned shape" % e)
+                jwt = "<unsigned>"
+            token = tokens[0]
+        else:
+            jwt = "<unsigned: no key/token yet>"
+            token = "<device-token>"
+        req = build_request(host, token, jwt, payload, args["thread"])
+        sys.stdout.write(render_request(req, redact=True) + "\n")
+        # Note extra recipients so a reviewer sees the fan-out without N dumps.
+        if key and len(tokens) > 1:
+            sys.stdout.write("(+ %d more device(s))\n" % (len(tokens) - 1))
+        return 0
+
+    # Real send. Absent prerequisites => quiet success (see docstring).
+    if not tokens:
+        _log("no device tokens in %s — skipping push (open the app once so the "
+             "phone uploads its token)" % TOKENS_DIR)
+        return 0
+    if not key:
+        gw = gateway_url()
+        if not gw:
+            _log("no APNs key in %s and no relay — skipping push (set one up: see docs/apns.md)"
+                 % APNS_DIR)
+            return 0
+        payload = build_payload(title, body, args["thread"])
+        sent = failed = 0
+        for token in tokens:
+            status, resp = gateway_send(gw, "alert", token, payload, args["thread"])
+            if status == 200:
+                sent += 1
+            else:
+                failed += 1
+                _log("relay send to %s… failed: HTTP %s %s" % (token[:8], status, _gateway_reason(resp)))
+                if status == 502 and "410" in (resp or ""):
+                    _prune_token(token)
+        _log("sent via relay to %d device(s)%s" % (sent, (", %d failed" % failed) if failed else ""))
+        return 0
+
+    key_path, key_id, team_id = key
+    try:
+        jwt = make_jwt(key_path, key_id, team_id)
+    except ValueError as e:
+        # A broken key must not crash a hook either — degrade to a logged no-op.
+        _log("could not sign APNs token (%s) — skipping push" % e)
+        return 0
+
+    payload = build_payload(title, body, args["thread"])
+    sent = 0
+    failed = 0
+    for token in tokens:
+        req = build_request(host, token, jwt, payload, args["thread"])
+        status, resp = curl_send(req, timeout=10)
+        if status == 200:
+            sent += 1
+        else:
+            failed += 1
+            reason = ""
+            try:
+                reason = (json.loads(resp).get("reason") if resp else "") or ""
+            except ValueError:
+                reason = (resp or "")[:120]
+            _log("send to %s… failed: HTTP %s %s" % (token[:8], status, reason))
+            # 410 = the device un-registered; prune its token so we stop trying.
+            if status == 410:
+                _prune_token(token)
+    if sent:
+        _log("delivered to %d device(s)" % sent)
+    # Even a total failure returns 0: a hook is fire-and-forget, and a transient
+    # APNs hiccup must not read as a workflow error.
+    return 0
+
+
+def _prune_token(token):
+    """Remove any token file whose content matches `token` (device un-registered)."""
+    try:
+        names = os.listdir(TOKENS_DIR)
+    except OSError:
+        return
+    for name in names:
+        if name.startswith("."):
+            continue
+        path = os.path.join(TOKENS_DIR, name)
+        if os.path.isfile(path) and _read_small(path).strip().lower() == token:
+            try:
+                os.unlink(path)
+                _log("pruned un-registered device token %s" % name)
+            except OSError:
+                pass
+
+
+def parse_activity_args(argv):
+    """Flags for `liveactivity`. Same forgiving style as parse_send_args: an unknown
+    flag is logged and ignored rather than fatal, because this is invoked from a
+    fire-and-forget run wrapper that must never fail the run."""
+    out = {"run": "", "event": "end", "status": "", "detail": "", "step": 0,
+           "steps_done": 0, "steps_total": 0, "failed": False,
+           "tool_icon": "", "tool_line": "", "step_eta": 0,
+           "dismiss_after": LA_DISMISS_AFTER, "sandbox": False, "dry_run": False}
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("--run", "--event", "--status", "--detail", "--step",
+                 "--steps-done", "--steps-total", "--dismiss-after",
+                 "--tool-icon", "--tool-line", "--step-eta") and i + 1 < len(argv):
+            key = a[2:].replace("-", "_")
+            val = argv[i + 1]
+            if key in ("step", "steps_done", "steps_total", "dismiss_after", "step_eta"):
+                try:
+                    val = int(val)
+                except ValueError:
+                    val = out[key]
+            out[key] = val
+            i += 2
+        elif a == "--failed":
+            out["failed"] = True; i += 1
+        elif a == "--sandbox":
+            out["sandbox"] = True; i += 1
+        elif a == "--dry-run":
+            out["dry_run"] = True; i += 1
+        else:
+            _log("ignoring unknown flag %s" % a); i += 1
+    if out["event"] not in ("end", "update"):
+        out["event"] = "end"
+    if not out["status"]:
+        out["status"] = "Done" if out["event"] == "end" else "Working…"
+    # A negative or absurd dismissal date is meaningless; Apple caps it at 4h.
+    out["dismiss_after"] = max(0, min(int(out["dismiss_after"]), LA_MAX_DISMISS_AFTER))
+    out["step"] = max(0, int(out["step"]))
+    out["steps_done"] = max(0, int(out["steps_done"]))
+    out["steps_total"] = max(0, int(out["steps_total"]))
+    # An ETA is a duration in seconds, never negative, and capped at an hour: past
+    # that the island's cell crawls so slowly it reads as frozen, which is worse
+    # than admitting we don't know (0 → the island's own default).
+    out["step_eta"] = max(0, min(int(out["step_eta"]), 3600))
+    return out
+
+
+def cmd_liveactivity(argv):
+    """End (or update) the Live Activity of ONE run. Always returns 0.
+
+    This is the fix for the stuck Dynamic Island: it is called from pervio-run's
+    completion wrapper, on the Mac, at the instant the detached run finishes —
+    which is precisely when the iOS app is suspended and cannot end the activity
+    itself. Every prerequisite is optional (no key / no activity / Live Activities
+    disabled / a token that already expired), and each missing one is a logged
+    no-op, because a run's exit code must never depend on the island."""
+    args = parse_activity_args(argv)
+    dry = args["dry_run"]
+    host = SANDBOX_HOST if args["sandbox"] else PROD_HOST
+
+    if not args["run"]:
+        _log("liveactivity needs --run <runId> — nothing to end")
+        return 0
+
+    token = activity_token(args["run"])
+    payload = build_activity_payload(args["event"], args["status"], args["detail"],
+                                     args["step"], int(time.time()), args["dismiss_after"],
+                                     steps_done=args["steps_done"],
+                                     steps_total=args["steps_total"],
+                                     failed=args["failed"],
+                                     tool_icon=args["tool_icon"],
+                                     tool_line=args["tool_line"],
+                                     step_eta=args["step_eta"])
+
+    if dry:
+        # Faithful when a key is present, shape-only when it isn't (same rule as
+        # `send --dry-run`), so the request can be reviewed before provisioning.
+        key = find_key()
+        if key and token:
+            try:
+                jwt = make_jwt(*key)
+            except ValueError as e:
+                _log("dry-run: could not sign (%s); showing unsigned shape" % e)
+                jwt = "<unsigned>"
+        else:
+            jwt = "<unsigned: no key/token yet>"
+        req = build_activity_request(host, token or "<activity-token>", jwt, payload)
+        sys.stdout.write(render_request(req, redact=True) + "\n")
+        return 0
+
+    if not token:
+        _log("no Live Activity token for run %s — nothing to end (the phone only "
+             "uploads one while a Live Activity is showing)" % args["run"][:24])
+        return 0
+    key = find_key()
+    if not key:
+        gw = gateway_url()
+        if not gw:
+            _log("no APNs key in %s and no relay — cannot end the Live Activity (see docs/apns.md)"
+                 % APNS_DIR)
+            return 0
+        status, resp = gateway_send(gw, "liveactivity", token, payload)
+        if status != 200:
+            resp = _gateway_reason(resp)
+    else:
+        try:
+            jwt = make_jwt(*key)
+        except ValueError as e:
+            _log("could not sign APNs token (%s) — skipping Live Activity push" % e)
+            return 0
+        req = build_activity_request(host, token, jwt, payload)
+        status, resp = curl_send(req, timeout=10)
+    if status == 200:
+        _log("%s the Live Activity for run %s%s" % ("ended" if args["event"] == "end" else "updated",
+                                                     args["run"][:24], "" if key else " (via relay)"))
+    else:
+        reason = ""
+        try:
+            reason = (json.loads(resp).get("reason") if resp else "") or ""
+        except ValueError:
+            reason = (resp or "")[:120]
+        _log("Live Activity push for run %s failed: HTTP %s %s"
+             % (args["run"][:24], status, reason))
+    # The activity is over either way — a successful end retires the token, and a
+    # rejected one (410 BadDeviceToken / the activity already ended) means the token
+    # is dead. Keeping it would just retry forever. An `update` keeps its token.
+    if args["event"] == "end" and status in (200, 400, 403, 410, 502):
+        _forget_activity(args["run"])
+    return 0
+
+
+def _forget_activity(run_id):
+    """Drop a spent per-activity token file. Best-effort; the phone also deletes it.
+    Re-validates the id (this deletes a file — it must not inherit trust from a
+    caller) with the same rule activity_token() reads by."""
+    if not activity_token(run_id):
+        return
+    try:
+        os.unlink(os.path.join(LA_TOKENS_DIR, run_id))
+    except OSError:
+        pass
+
+
+def cmd_check(argv):
+    """Report whether push is ready. Prints a short human status to stdout and
+    exits 0 if BOTH a key and at least one token are present, else 1 — so a setup
+    script or the user can gate on it. Never sends anything."""
+    sandbox = "--sandbox" in argv
+    host = SANDBOX_HOST if sandbox else PROD_HOST
+    key = find_key()
+    tokens = list_tokens()
+    print("APNs push readiness (%s):" % host)
+    gw = "" if key else gateway_url()
+    gw_ok = gateway_healthy(gw) if gw else False
+    if key:
+        key_path, key_id, team_id = key
+        print("  key:    OK  (%s, key_id=%s, team=%s)"
+              % (os.path.basename(key_path), key_id, team_id))
+    elif gw_ok:
+        print("  key:    via relay %s (no local key needed)" % gw)
+    elif gw:
+        print("  key:    MISSING, and the relay %s did not answer — put AuthKey_<KEYID>.p8 "
+              "+ key_id + issuer_id in %s (see docs/apns.md), or check the network" % (gw, APNS_DIR))
+    else:
+        print("  key:    MISSING  — put AuthKey_<KEYID>.p8 + key_id + issuer_id "
+              "in %s (see docs/apns.md)" % APNS_DIR)
+    if tokens:
+        print("  tokens: OK  (%d device(s))" % len(tokens))
+    else:
+        print("  tokens: NONE  — open the app once so the phone uploads a token "
+              "to %s" % TOKENS_DIR)
+    # The Live Activity leg is informational, never part of `ready`: an empty list
+    # is the normal state (it only fills while a run's island is actually showing).
+    runs = list_activity_runs()
+    print("  live activity: %s"
+          % (("%d run(s): %s" % (len(runs), ", ".join(runs[:5]))) if runs
+             else "none showing right now (%s)" % LA_TOKENS_DIR))
+    ready = bool((key or gw_ok) and tokens)
+    print("  => %s" % ("READY" if ready else "NOT READY (push will silently no-op)"))
+    return 0 if ready else 1
+
+
+USAGE = ("usage: pervio-push <send|dry-run|check|liveactivity> "
+         "[--title T --body B --thread ID --sandbox --dry-run]\n"
+         "       pervio-push liveactivity --run R [--event end|update] "
+         "[--status S] [--detail D] [--step N] [--steps-done N] [--steps-total N] "
+         "[--failed] [--tool-icon SYMBOL] [--tool-line TEXT] [--step-eta SECS] "
+         "[--dismiss-after SECS]")
+
+
+def main(argv):
+    if not argv:
+        _log(USAGE)
+        return 2
+    cmd = argv[0]
+    rest = argv[1:]
+    if cmd == "send":
+        return cmd_send(rest)
+    if cmd == "dry-run":
+        return cmd_send(rest, force_dry=True)
+    if cmd == "check":
+        return cmd_check(rest)
+    if cmd == "liveactivity":
+        return cmd_liveactivity(rest)
+    if cmd in ("-h", "--help", "help"):
+        print(USAGE)
+        return 0
+    _log("unknown subcommand %r\n%s" % (cmd, USAGE))
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,622 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Pervio 使用文档</title>
+<meta name="description" content="Pervio 使用文档：安装和连接、对话、Run 模式、审批、通知、网页预览、终端、双开、工作流、服务器与跳板机、常见问题、卸载。">
+<meta name="robots" content="noindex">
+<meta name="theme-color" content="#0E1017">
+<link rel="icon" type="image/png" sizes="64x64" href="assets/icon-64.png">
+<link rel="apple-touch-icon" href="assets/icon-180.png">
+<link rel="preload" href="assets/fonts/WixMadeforDisplay-latin.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="assets/fonts/WixMadeforText-latin.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="assets/fonts.css">
+<style>
+/* ============================================================
+   使用文档。颜色、字体、手机外框和首页是同一套(见 index.html 顶部的说明):
+   app 自己的调色板,系统字体,零外部请求,零脚本。左边目录,右边一栏正文。
+   按钮名照 app 里显示的写,套一个 .ui 小框,和正文里的普通词分开。
+   ============================================================ */
+:root{
+  --ground:#0E1017;
+  --bg:#151820;
+  --surface:#1E212A;
+  --line:rgba(244,241,237,.09);
+  --line-2:rgba(244,241,237,.16);
+  --ink:#F4F1ED;
+  --ink-2:#CACED4;
+  --ink-3:#999FA9;
+  --accent:#A0B0F4;
+  --accent-hi:#B9C7FF;
+  --accent-35:rgba(160,176,244,.35);
+  --accent-50:rgba(160,176,244,.5);
+  --accent-11:rgba(160,176,244,.11);
+  --well:#090B11;
+  --on-accent:#0F1223;
+  --sans:"Wix Madefor Text zh","PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans CJK SC",ui-sans-serif,system-ui,sans-serif;
+  --display:"Wix Madefor Display zh","PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans CJK SC",ui-sans-serif,system-ui,sans-serif;
+  --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+  --wrap:1160px;
+  color-scheme:dark;
+}
+*,*::before,*::after{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%;scroll-behavior:smooth}
+body{margin:0;background:var(--ground);color:var(--ink);font-family:var(--sans);font-size:16px;line-height:1.7;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+img{display:block;max-width:100%}
+a{color:inherit;text-decoration:none}
+::selection{background:var(--accent-35)}
+:focus-visible{outline:2px solid var(--accent);outline-offset:3px;border-radius:6px}
+.wrap{max-width:var(--wrap);margin-inline:auto;padding-inline:24px}
+h1,h2,h3,h4,p,figure{margin:0}
+h1,h2,h3,h4{font-family:var(--display);font-weight:600;letter-spacing:-.008em;line-height:1.25;text-wrap:balance}
+
+/* ---------- 顶栏(同首页) ---------- */
+.nav{position:sticky;top:env(safe-area-inset-top,0px);z-index:20;background:rgba(14,16,23,.72);-webkit-backdrop-filter:saturate(1.4) blur(18px);backdrop-filter:saturate(1.4) blur(18px);border-bottom:1px solid var(--line)}
+.nav .wrap{display:flex;align-items:center;gap:28px;height:60px}
+.brand{display:flex;align-items:center;gap:10px;font-weight:650;font-size:17px;letter-spacing:-.01em}
+.brand img{width:26px;height:26px;border-radius:7px}
+.nav nav{display:flex;gap:26px;margin-left:auto;font-size:14.5px;color:var(--ink-2)}
+.nav nav a:hover,.nav nav a[aria-current]{color:var(--ink)}
+.btn{display:inline-flex;align-items:center;justify-content:center;height:36px;padding:0 16px;border-radius:999px;font-size:14px;font-weight:600;white-space:nowrap;background:var(--accent);color:var(--on-accent);transition:background .15s}
+.btn:hover{background:var(--accent-hi)}
+
+/* ---------- 页头 ---------- */
+.head{padding-block:64px 0}
+.head h1{font-size:clamp(34px,4.4vw,48px);letter-spacing:-.026em}
+.head p{margin-top:18px;max-width:36em;font-size:18px;line-height:1.7;color:var(--ink-2)}
+
+/* ---------- 目录 + 正文 ---------- */
+.doc{display:grid;grid-template-columns:200px minmax(0,1fr);gap:76px;align-items:start;padding-block:8px 104px}
+.toc{position:sticky;top:calc(84px + env(safe-area-inset-top,0px));max-height:calc(100vh - 108px);overflow-y:auto;margin-top:56px;font-size:14px;line-height:1.5}
+.toc span{display:block;margin-bottom:12px;font-family:var(--mono);font-size:12.5px;color:var(--ink-3)}
+.toc ol{margin:0;padding:0;list-style:none;border-left:1px solid var(--line)}
+.toc a{display:block;margin-left:-1px;padding:6px 0 6px 16px;border-left:1px solid transparent;color:var(--ink-2)}
+.toc a:hover{color:var(--ink);border-left-color:var(--accent)}
+article{min-width:0;max-width:760px}
+article section{margin-top:56px;padding-top:56px;border-top:1px solid var(--line);scroll-margin-top:calc(60px + env(safe-area-inset-top,0px))}
+article section:first-child{border-top:0;margin-top:0}
+article h2{font-size:30px}
+article h3{margin-top:44px;font-size:19.5px;letter-spacing:-.012em;scroll-margin-top:calc(84px + env(safe-area-inset-top,0px))}
+article p{margin-top:14px;color:var(--ink-2);line-height:1.78}
+article h2+p{margin-top:18px}
+article ul,article ol{margin:14px 0 0;padding-left:1.3em;color:var(--ink-2);line-height:1.75}
+article li{margin-top:7px}
+article li::marker{color:var(--ink-3)}
+article b{color:var(--ink);font-weight:600}
+article p a,article li a,article td a,figcaption a{color:var(--accent);overflow-wrap:anywhere}
+article p a:hover,article li a:hover,article td a:hover{text-decoration:underline;text-underline-offset:4px}
+code{font-family:var(--mono);font-size:.88em;padding:1px 6px;border:1px solid var(--line);border-radius:6px;background:var(--surface);color:var(--ink);overflow-wrap:anywhere}
+pre{margin:16px 0 0;padding:16px 18px;border:1px solid var(--line);border-radius:14px;background:var(--well);font-family:var(--mono);font-size:13.5px;line-height:1.75;color:var(--ink);overflow-x:auto}
+pre i{font-style:normal;color:var(--ink-3)}
+.ui{display:inline-block;padding:0 7px;border:1px solid var(--line-2);border-radius:7px;background:var(--surface);color:var(--ink);font-size:.9em;line-height:1.6;white-space:nowrap}
+
+/* 步骤 */
+.steps{counter-reset:s;list-style:none;padding:0;margin-top:26px}
+.steps>li{counter-increment:s;position:relative;margin:0;padding:0 0 30px 46px}
+.steps>li::before{content:counter(s);position:absolute;left:0;top:0;display:flex;align-items:center;justify-content:center;width:28px;height:28px;border:1px solid var(--accent-50);border-radius:50%;color:var(--accent);font-family:var(--mono);font-size:13.5px}
+.steps>li::after{content:"";position:absolute;left:14px;top:36px;bottom:6px;width:1px;background:var(--line)}
+.steps>li:last-child{padding-bottom:0}
+.steps>li:last-child::after{display:none}
+.steps h4{padding-top:3px;font-size:16.5px;font-weight:650;letter-spacing:0}
+.steps p{margin-top:8px}
+
+/* 表格 */
+.tw{margin-top:18px;overflow-x:auto;border:1px solid var(--line);border-radius:14px;background:var(--bg)}
+table{width:100%;border-collapse:collapse;font-size:15px;line-height:1.6}
+th,td{padding:12px 16px;text-align:left;vertical-align:top;border-bottom:1px solid var(--line)}
+tr:last-child td{border-bottom:0}
+th{font-size:12.5px;font-weight:500;color:var(--ink-3);background:rgba(244,241,237,.025)}
+td{color:var(--ink-2)}
+td:first-child{color:var(--ink);font-weight:600;white-space:nowrap}
+td:first-child i{font-style:normal;font-family:var(--mono);font-weight:400;color:var(--accent);margin-right:8px}
+
+/* 提醒 */
+.note{margin-top:18px;padding:14px 18px;border:1px dashed var(--line-2);border-radius:14px;font-size:15px;line-height:1.7;color:var(--ink-2)}
+
+/* 图 */
+figure{margin-top:24px}
+figcaption{margin-top:10px;font-size:13px;line-height:1.55;color:var(--ink-3)}
+.shot{border:1px solid var(--line);border-radius:18px;overflow:hidden;background:var(--bg)}
+.shot img{width:100%;height:auto}
+.shot.small{max-width:400px}
+.split{display:grid;grid-template-columns:minmax(0,1fr) 280px;gap:36px;align-items:start}
+.split>figure{margin-top:22px}
+/* 手机外框:尺寸全部由 --pw 推出(同首页) */
+.phone{--pw:236px;position:absolute;width:var(--pw);aspect-ratio:462.9/978.9;padding:calc(var(--pw)*.0247);border-radius:calc(var(--pw)*.1586);background:#0A0A09;
+  box-shadow:0 0 0 1px rgba(255,255,255,.13) inset,0 0 0 1px #000,0 30px 60px -24px rgba(0,0,0,.85)}
+.phone img{width:100%;height:100%;object-fit:cover;border-radius:calc(var(--pw)*.134);background:var(--bg)}
+.phone::after{content:"";position:absolute;left:50%;top:calc(var(--pw)*.055);width:calc(var(--pw)*.272);height:calc(var(--pw)*.08);transform:translateX(-50%);background:#000;border-radius:999px}
+.plate{position:relative;height:430px;border:1px solid var(--line);border-radius:22px;overflow:hidden;display:flex;justify-content:center;
+  background:radial-gradient(90% 70% at 50% 0%,var(--accent-11),transparent 70%),var(--bg)}
+.plate.top .phone{top:30px}
+.plate.bottom .phone{bottom:30px}
+
+/* ---------- 页脚(同首页) ---------- */
+footer{border-top:1px solid var(--line);color:var(--ink-3);font-size:14px}
+footer .wrap{display:flex;flex-wrap:wrap;gap:14px 28px;align-items:center;padding-block:30px calc(30px + env(safe-area-inset-bottom,0px))}
+footer nav{display:flex;flex-wrap:wrap;gap:8px 24px;margin-left:auto}
+footer a:hover{color:var(--ink)}
+
+/* ---------- 窄屏 ---------- */
+@media (max-width:980px){
+  .head{padding-block:44px 0}
+  .doc{grid-template-columns:1fr;gap:0;padding-block:28px 72px}
+  .toc{position:static;max-height:none;margin-top:0;padding:18px 20px;border:1px solid var(--line);border-radius:16px;background:var(--bg)}
+  .toc ol{border-left:0;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:0 20px}
+  .toc a{margin-left:0;padding:6px 0;border-left:0}
+  article section:first-child{margin-top:44px}
+}
+@media (max-width:640px){
+  .wrap{padding-inline:20px}
+  .nav nav a.hide-s{display:none}
+  .nav .wrap{gap:16px}
+  .nav nav{gap:18px}
+  .head p{font-size:17px}
+  .toc ol{grid-template-columns:repeat(2,minmax(0,1fr))}
+  article h2{font-size:26px}
+  .split{grid-template-columns:1fr;gap:0}
+  .split>figure{max-width:320px}
+  td:first-child{white-space:normal;min-width:6.5em}
+  .keep td:first-child{white-space:nowrap}
+  th,td{padding:11px 13px}
+}
+@media (prefers-reduced-motion:reduce){html{scroll-behavior:auto}.btn{transition:none}}
+</style>
+</head>
+<body>
+
+<header class="nav">
+  <div class="wrap">
+    <a class="brand" href="index.html"><img src="assets/icon-64.png" alt="" width="26" height="26">Pervio</a>
+    <nav>
+      <a class="hide-s" href="index.html#features">功能</a>
+      <a href="docs.html" aria-current="page">文档</a>
+      <a class="hide-s" href="https://github.com/pervio/Pervio">GitHub</a>
+      <a class="hide-s" href="docs-en.html">EN</a>
+    </nav>
+    <a class="btn" href="https://testflight.apple.com/join/EagwZXV1">加入公测</a>
+  </div>
+</header>
+
+<div class="wrap head">
+  <h1>使用文档</h1>
+  <p>怎么装，每个功能怎么用，出了问题怎么查。Pervio 目前在 TestFlight 公开测试，界面有一部分还是英文，文档里的按钮名照 app 里显示的写。</p>
+</div>
+
+<div class="wrap doc">
+
+<aside class="toc" aria-label="目录">
+  <span>目录</span>
+  <ol>
+    <li><a href="#requirements">需要什么</a></li>
+    <li><a href="#install">安装</a></li>
+    <li><a href="#home">首页</a></li>
+    <li><a href="#chat">对话</a></li>
+    <li><a href="#run">Run 模式</a></li>
+    <li><a href="#approval">审批和权限</a></li>
+    <li><a href="#notify">锁屏和通知</a></li>
+    <li><a href="#web">网页预览</a></li>
+    <li><a href="#terminal">终端</a></li>
+    <li><a href="#duet">双开</a></li>
+    <li><a href="#workflow">工作流</a></li>
+    <li><a href="#servers">服务器</a></li>
+    <li><a href="#settings">设置</a></li>
+    <li><a href="#faq">常见问题</a></li>
+    <li><a href="#uninstall">卸载</a></li>
+    <li><a href="#privacy">隐私</a></li>
+  </ol>
+</aside>
+
+<article>
+
+<section id="requirements">
+  <h2>需要什么</h2>
+  <div class="tw"><table>
+    <tr><td>iPhone</td><td>iOS 17 及以上，从 TestFlight 安装。</td></tr>
+    <tr><td>电脑</td><td>一台 Mac，打开「远程登录」（SSH）。要有 <code>python3</code>，Claude Code、Codex、Cursor 至少装一个并登录好。要用手机上的终端，再装 <code>tmux</code>。</td></tr>
+    <tr><td>网络</td><td>手机要能连到电脑。在同一个 Wi-Fi 下就能用；出门在外推荐 <a href="https://tailscale.com">Tailscale</a>。</td></tr>
+  </table></div>
+  <p>电脑上不用装 Pervio 的任何东西。要用到的脚本打包在 app 里，第一次连接时由 app 通过 SSH 放到 <code>~/.pervio/bin</code>；以后 app 更新了，脚本跟着换。电脑上没有常驻的服务，脚本在手机叫它的时候才跑。</p>
+  <p>Linux 主机也能用，但每天在用的是 macOS。</p>
+</section>
+
+<section id="install">
+  <h2>安装</h2>
+  <p>第一次装大约十五分钟。下面按 Mac 写。</p>
+  <ol class="steps">
+    <li>
+      <h4>装 app</h4>
+      <p>手机上先装 Apple 的 TestFlight，再打开 <a href="https://testflight.apple.com/join/EagwZXV1">testflight.apple.com/join/EagwZXV1</a>，安装 Pervio。</p>
+    </li>
+    <li>
+      <h4>在 Mac 上打开远程登录</h4>
+      <p>系统设置 → 通用 → 共享 → 打开「远程登录」。「允许访问」可以只选你自己。</p>
+    </li>
+    <li>
+      <h4>装一个引擎并登录</h4>
+      <p>在电脑自己的「终端」里做。三个里装一个就行：</p>
+<pre>npm install -g @anthropic-ai/claude-code &amp;&amp; claude     <i># Claude Code</i>
+npm install -g @openai/codex &amp;&amp; codex login            <i># 或 Codex</i>
+curl https://cursor.com/install -fsS | bash            <i># 或 Cursor,然后 agent login</i></pre>
+      <p>Claude Code 的登录一定要在 Mac 自己的终端里做，原因见下面的<a href="#claude-login">「Claude Code 显示未登录」</a>。</p>
+    </li>
+    <li>
+      <h4>给手机生成一把 SSH 密钥</h4>
+      <p>也可以用密码登录，密钥更安全。在电脑的终端里：</p>
+<pre>ssh-keygen -t ed25519 -f ~/.ssh/pervio_phone -N ""
+cat ~/.ssh/pervio_phone.pub &gt;&gt; ~/.ssh/authorized_keys
+chmod 600 ~/.ssh/authorized_keys</pre>
+    </li>
+    <li>
+      <h4>在 app 里添加服务器</h4>
+      <p>服务器 → 添加。表单是英文的：</p>
+      <div class="tw"><table>
+        <tr><td>Name</td><td>随便起。</td></tr>
+        <tr><td>Host</td><td>电脑的地址：局域网 IP，或 Tailscale 的 <code>100.x.y.z</code>。</td></tr>
+        <tr><td>Port</td><td>默认 22。</td></tr>
+        <tr><td>Username</td><td>电脑的登录用户名，就是在电脑终端里跑 <code>whoami</code> 显示的那个。不是电脑名，也不是 Apple ID。</td></tr>
+        <tr><td>Method</td><td>选 Key，把 <code>cat ~/.ssh/pervio_phone</code> 的输出整段粘进去；或选 Password，填电脑的登录密码。两样都只存在 iOS 钥匙串里。</td></tr>
+        <tr><td>Project dir on server</td><td>默认 <code>~</code>。它决定这台服务器在手机上能看到哪些对话，见<a href="#scope">「工作目录」</a>。</td></tr>
+      </table></div>
+      <p>然后点 <span class="ui">Fetch host key from server</span>，核对指纹，保存。这一步只取指纹，不登录，密码和密钥这时不会发出去。以后每次连接都会核对这个指纹，对不上就直接拒绝连接。</p>
+    </li>
+    <li>
+      <h4>连接</h4>
+      <p>第一次连上时，app 会把脚本放到电脑上，要等几秒。首页出现问候语，就是装好了。</p>
+    </li>
+  </ol>
+
+  <h3 id="tailscale">不在同一个网络</h3>
+  <p>在电脑和手机上都装 Tailscale，登录同一个账号，然后把 app 里的 Host 换成电脑的 <code>100.x.y.z</code> 地址（Mac 菜单栏的 Tailscale 图标里能看到，或者在终端跑 <code>tailscale ip -4</code>）。这样不用把电脑的 SSH 开到公网。</p>
+  <p>如果这个 Tailscale 账号还加入了公司或学校的网络，两台设备都要切到你自己的那个网络。</p>
+
+  <h3 id="claude-login">Claude Code 显示未登录</h3>
+  <p>Claude Code 把登录凭据存在 macOS 钥匙串里。Pervio 是通过 SSH 启动 <code>claude</code> 的，SSH 下的进程读不到钥匙串，所以会出现这种情况：你在手机的终端里能正常用 claude，对话里却显示未登录。两种解决办法：</p>
+  <ul>
+    <li>在 Mac 自己的「终端」里运行一次 <code>claude</code>，按提示登录。</li>
+    <li>Mac 平时不登录图形界面的话，用长期令牌：在 Mac 上运行 <code>claude setup-token</code>，把得到的那串字符粘到 app 的服务器设置里「Claude 登录令牌(SSH 用)」一栏，点 <span class="ui">写到 Mac</span>。它只写进 Mac 的 <code>~/.pervio/credentials.env</code>，手机不保存。</li>
+  </ul>
+  <p>Codex 和 Cursor 的凭据是普通文件，没有这个问题。</p>
+
+  <h3 id="checkup">连不上</h3>
+  <p>首页、项目页、对话列表和工作流列表连不上电脑时，原来的内容留着不动，上面多一行橙色的字写明原因，并且自己重试：隔 2、4、8、15 秒各试一次，之后每 30 秒一次，这一页开着就一直试，连上后这行字自己消失。不用退出 app；想早点再试就下拉。打开这一页、从别的页回到这一页、app 回到前台时，也都会重新读一次。</p>
+  <p>密码或密钥被拒绝、主机密钥对不上这类问题，等多久也不会好，所以不自动重试：这行字是红色的，下面有 <span class="ui">去设置</span>，改完回来会重新读。</p>
+  <p>橙色那行下面有 <span class="ui">运行连接体检</span>。它依次检查 SSH 连接、Claude Code 有没有装、有没有登录、<code>python3</code>、服务器脚本，每一项没过都会写出怎么修。找 Claude Code 的位置和 app 实际启动它时找的位置是同一份。常见的三种：</p>
+  <div class="tw"><table>
+    <tr><td>连接被拒绝</td><td>多半是 Mac 的「远程登录」没开。</td></tr>
+    <tr><td>连接超时</td><td>手机和电脑不在同一个网络，或者电脑睡着了。检查 Wi-Fi 或 Tailscale，确认 Host 填的是电脑现在的地址。</td></tr>
+    <tr><td>认证失败</td><td>用户名、密码或密钥有一样不对。用户名是 <code>whoami</code> 的输出。</td></tr>
+  </table></div>
+  <p>电脑睡着时连不上，定时的工作流也会错过时间。长期开着用的 Mac，在系统设置里搜「睡眠」，打开「显示器关闭时防止自动进入睡眠」。</p>
+</section>
+
+<section id="home">
+  <h2>首页</h2>
+  <div class="split">
+    <div>
+      <div class="tw keep"><table>
+        <tr><td><i>1</i>输入框</td><td>打一句话，回车，直接开始一段新对话。</td></tr>
+        <tr><td><i>2</i>新对话</td><td>先进到对话页再说。长按可以先选目录。</td></tr>
+        <tr><td><i>3</i>搭建工作流</td><td>选从零新建，或者改一个现有模板。你描述要什么，agent 写出模板并自己验证。</td></tr>
+        <tr><td><i>4</i>刊物</td><td>你订阅的工作流交出来的成品。没用过的模板不会出现在这里。</td></tr>
+        <tr><td><i>5</i>N 个在跑</td><td>正在运行的后台任务，点进去看进度。</td></tr>
+      </table></div>
+      <p>下面的「最近」是最近的对话，点一条进去接着聊。在一行上向右滑是置顶，向左滑是删除。置顶记在电脑上，换手机、重装 app 之后还在；置顶的对话删不掉，要删先取消置顶。</p>
+      <p>最底下一行是当前连的服务器，点「服务器」可以添加、编辑、切换。</p>
+    </div>
+    <figure>
+      <div class="shot"><img loading="lazy" src="assets/docs/home-page-annotated.png" width="780" height="1360" alt="首页，五处标了数字：输入框、新对话、搭建工作流、刊物卡片、正在跑的任务"></div>
+    </figure>
+  </div>
+</section>
+
+<section id="chat">
+  <h2>对话</h2>
+  <div class="split">
+    <div>
+      <p>Pervio 读的是 Claude Code、Codex、Cursor 自己的会话记录。在电脑的终端或编辑器里开的对话，手机上能接着聊；手机上开的，回到电脑前也在。</p>
+      <p>回复是流式显示的。agent 读文件、跑命令、改代码，每一步在对话里是单独的一行，点开能看详情：Edit 是改动前后的对比，Bash 是完整的命令。</p>
+      <p>回复里写到的电脑上的文件路径可以点。图片、PDF、文本会从电脑取回来，用系统预览打开；超过 25 MB 的不取，会直接告诉你。</p>
+      <p>模型写的 LaTeX 公式会排成公式；排不出来的，显示原文。</p>
+    </div>
+    <figure>
+      <div class="plate top"><div class="phone"><img loading="lazy" src="assets/shots/chat-zh.png" width="720" height="1564" alt="对话页：顶部是引擎和模型的徽章，工具调用一行一条，下面是回复"></div></div>
+    </figure>
+  </div>
+
+  <h3>引擎、模型、供应商</h3>
+  <p>对话页顶部的徽章写着当前的引擎、模型和供应商，点开可以换。发出第一句话之后引擎就定了，要换引擎得新开一段对话；模型和供应商随时能换。菜单里的 <span class="ui">更多设置…</span> 是完整的设置：模型、Effort（推理深度）、权限、目录。</p>
+  <p>模型列表来自你的电脑，不是写死在 app 里的。Claude 的列表读自电脑上装的 <code>claude</code> 程序，Codex 的读自 Codex 自己的模型缓存，Cursor 的是你账号里的列表。电脑上的命令行工具更新之后，重新连接一次，新模型就在列表里了。</p>
+  <p>Claude Code 的对话里也可以直接输入 <code>/model 模型名</code> 来换，换了之后这段对话一直用它。</p>
+  <p>第三方供应商怎么加，见<a href="#providers">「供应商」</a>。</p>
+
+  <h3>发消息时带上东西</h3>
+  <p>输入框左边的 <span class="ui">＋</span>：</p>
+  <div class="tw"><table>
+    <tr><td>照片</td><td>相册里的图片。</td></tr>
+    <tr><td>文件</td><td>手机「文件」app 里的文件。</td></tr>
+    <tr><td>服务器文件…</td><td>浏览电脑上的目录，选一个文件附上。也可以点 <span class="ui">把此目录交给对话</span>，把整个文件夹交给 agent。</td></tr>
+    <tr><td>背景…</td><td>把以前的一段对话作为背景附上。</td></tr>
+    <tr><td>网页预览</td><td>打开电脑上的网页，见<a href="#web">「网页预览」</a>。</td></tr>
+    <tr><td>双开…</td><td>给这段对话配一个伙伴，见<a href="#duet">「双开」</a>。</td></tr>
+  </table></div>
+  <p>交给对话的文件夹不会被打包上传，交过去的只是路径。之后这段对话里 agent 可以读写这个文件夹，它显示在输入框上方；长按它，选「这个对话不再带上这个文件夹」可以取消。</p>
+  <p>添加了两台以上的服务器时，<span class="ui">服务器文件…</span> 和 <span class="ui">背景…</span> 的页面顶上多一行 <span class="ui">来自</span>，可以换成另一台（同一台电脑的另一个条目不算）。在另一台上选的文件，由手机先读下来，再传到这段对话所在的那台，作为附件；单个文件不超过 8 MB，超过的在列表里标着，不能选。输入框上方写着正在连接、正在读还是正在传，和进度，旁边的 ✕ 可以停下。传完之前不要离开 Pervio，中途被打断会有一条提示。另一台上的目录不能交给对话。</p>
+  <p>文件浏览器里，链接那一行会写出它实际指向哪。在另一台上选的名字如果是一个链接，而且指向它所在文件夹之外的文件，手机会先把真实位置给你看，你点 <span class="ui">带过来</span> 才会读。</p>
+  <p>在另一台上选的是对话时，带过来的是它的文稿。对话太长、文稿里放不下的部分，另作一份完整记录一起带过来，文稿开头写着它在哪；完整记录也不超过 8 MB，超出时留后面的部分，并写明哪些没带过来。一起勾选的说明和记忆文件，带过来的是开头 60 KB 的文字，开头标着来自哪台、哪个文件。带过来的都是当时的副本，放在这台的上传文件夹里，大约 7 天后清理。</p>
+
+  <h3>重新说、分支</h3>
+  <p>长按自己发过的一条消息，菜单里有 <span class="ui">从这里重新说</span>：复制出一段新对话，内容到这条消息之前为止，然后切过去，原话放回输入框，改完再发。</p>
+  <p>每一轮的最后一条回复下面有 <span class="ui">分支到新对话</span>：把到这一轮为止的内容复制成一段新对话并切过去。</p>
+  <p>两种做法都不动原来那段对话，它还在列表里。Cursor 的对话没有这两项。</p>
+
+  <h3>改名</h3>
+  <p>点顶部的徽章，选 <span class="ui">重命名对话</span>。留空就恢复默认的标题。</p>
+</section>
+
+<section id="run">
+  <h2>Run 模式</h2>
+  <div class="split">
+    <div>
+      <p>输入框上方左边的按钮写着 Chat 或 Run，点一下切换。这个选择按服务器记住。</p>
+      <div class="tw"><table>
+        <tr><td>Chat</td><td>这一轮和 app 的连接绑在一起。离开 app 或者断线，这一轮就停了。</td></tr>
+        <tr><td>Run</td><td>任务是电脑上的一个后台进程。手机锁屏、切到别的 app、断网都不影响；重新打开时，从上次读到的位置接着读。</td></tr>
+      </table></div>
+      <p>Run 模式下：</p>
+      <ul>
+        <li>任务还在跑的时候可以继续发消息。这句话会进到正在跑的这一轮里，消息上标着「插入本轮」。Claude Code 和 Codex 支持。Codex 要等手上这一步做完才接这句话，在那之前消息上标的是「已送达,等当前这步做完」。</li>
+        <li>agent 派出去的子 agent 和它放到后台的命令（比如一遍全量测试），在输入框上方合成一行：几个子 agent、几个后台命令、已经跑了多久。点这一行看列表：每个子 agent 的类型、用时、用掉的 token、调了几次工具、正在做什么；子 agent 自己开的命令排在它下面；结束的带着它的结论。全部结束后，对话末尾留一行结果，点开是同一张列表；离开这段对话再回来它还在，到你发下一条消息为止（最多留半天）。任务还在跑的时候可以接着聊，回答你的是同一个进程。</li>
+        <li>Claude Code、Codex、Cursor 的子 agent 都会出现在这一行。Codex 的子 agent 标的是它用的模型；Cursor 不报 token 和工具次数，只有用时和结论。Chat 模式下，一轮还没结束的时候也有这一行。</li>
+        <li>Run 模式下用 Claude Code 时，列表里每个进行中的任务右边有一个停止键：确认后只停这一个，子 agent 自己开的后台命令跟着停，对话和其他任务不受影响。</li>
+        <li>进度显示在灵动岛和锁屏上；回复完成时有一条推送，见<a href="#notify">「锁屏和通知」</a>。</li>
+        <li>首页的「N 个在跑」列出所有还在跑的任务。</li>
+      </ul>
+      <p>后台任务的输出写在电脑的 <code>~/.pervio/runs/</code> 里。</p>
+    </div>
+    <figure>
+      <div class="plate bottom"><div class="phone"><img loading="lazy" src="assets/shots/running-zh.png" width="720" height="1564" alt="Run 模式下一个还在跑的任务：中途插入的一句话，输入框上方一行写着后台还有一条命令在跑，再上面是 Run 按钮和 Terminal 按钮"></div></div>
+    </figure>
+  </div>
+</section>
+
+<section id="approval">
+  <h2>审批和权限</h2>
+  <div class="split">
+    <div>
+      <p>在需要审批的权限档位下，agent 要改文件、跑命令时会停下来。手机上弹出它要执行的内容，你点 Allow 或 Deny。拒绝之后任务不会中断，agent 会收到「被拒绝」这个结果，接着往下做。</p>
+      <p>你不在 app 里的时候，锁屏上会有一条提醒，告诉你它在等。</p>
+      <p>档位在徽章菜单的 <span class="ui">更多设置…</span> 里选。名字是英文的，两家引擎不一样。</p>
+    </div>
+    <figure>
+      <div class="plate bottom"><div class="phone"><img loading="lazy" src="assets/shots/approval-zh.png" width="720" height="1564" alt="审批弹窗：agent 想执行 git push origin release，下面是 Allow 和 Deny"></div></div>
+    </figure>
+  </div>
+
+  <h3>Claude Code</h3>
+  <div class="tw"><table>
+    <tr><td>Auto</td><td>由 Claude Code 按任务自己决定用哪一档。</td></tr>
+    <tr><td>Ask before edits</td><td>每次改文件、跑命令之前都问你。</td></tr>
+    <tr><td>Edit automatically</td><td>文件改动直接应用，不问。</td></tr>
+    <tr><td>Plan</td><td>只读。先看代码、给出计划，你同意之后才动手。</td></tr>
+    <tr><td>Bypass</td><td>什么都不问。只在你信得过的机器上用。</td></tr>
+  </table></div>
+
+  <h3>Codex</h3>
+  <div class="tw"><table>
+    <tr><td>Full access</td><td>不设沙箱，从不询问。这是 Codex 自己的 app 的默认，也是这里的默认。</td></tr>
+    <tr><td>Approve for me</td><td>限制在项目目录里。超出范围的操作由 Codex 自己的审查器决定。</td></tr>
+    <tr><td>Ask for approval</td><td>限制在项目目录里。超出范围的操作等你在手机上点 Allow 或 Deny。只在 Chat 模式下会问；Run 模式下没有人在线回答，不会问。</td></tr>
+    <tr><td>Read-only</td><td>只读、只出计划，不能改文件，不能跑命令。</td></tr>
+  </table></div>
+</section>
+
+<section id="notify">
+  <h2>锁屏和通知</h2>
+  <figure>
+    <div class="shot small"><img loading="lazy" src="assets/snap-island-expanded-zh.png" width="784" height="300" alt="灵动岛展开：六步完成了四步，下面是正在做的动作"></div>
+    <figcaption>后台任务在灵动岛上的样子：完成了几步，现在在做什么。</figcaption>
+  </figure>
+  <p>后台任务跑着的时候，灵动岛和锁屏上显示它的进度：工作流显示走到第几步，对话显示当前的动作（在读哪个文件、跑哪条命令）。</p>
+  <p>下面这些事会推送到锁屏：</p>
+  <ul>
+    <li>一轮后台任务完成或失败。标题是项目名加结果，正文是这个任务开头的几十个字。</li>
+    <li>agent 在等你审批。</li>
+    <li>工作流跑完或失败，订阅的刊物送达。</li>
+    <li>双开的监督任务有了结果：通过、需要你、三轮没通过。</li>
+  </ul>
+  <p>通知不用配置。它是整个产品里唯一经过 Pervio 服务器的东西：电脑把通知的标题和正文交给 <code>push.pervio.dev</code> 上的中继，中继签名后转给 Apple。中继不保存内容。不想经过它，在电脑上执行：</p>
+<pre>mkdir -p ~/.pervio/push &amp;&amp; echo off &gt; ~/.pervio/push/gateway</pre>
+  <p>关掉之后，app 开着的时候仍然有本地提醒。</p>
+</section>
+
+<section id="web">
+  <h2>网页预览</h2>
+  <p>电脑上只监听 <code>localhost</code> 的网页，比如开发服务器、文档站，在手机的 Safari 里是打不开的。网页预览让它经 SSH 连接在手机上打开，端口不用对外开。</p>
+  <ul>
+    <li><span class="ui">＋</span> → <span class="ui">网页预览</span>，列出电脑上正在监听的端口，每行写着是哪个程序。点一行打开，也可以自己输入端口号。标着「仅本机」的是只绑在 localhost 上的。</li>
+    <li>回复里出现 <code>http://localhost:3000</code> 这样的链接，点一下就在预览里打开。</li>
+    <li>预览页上有 <span class="ui">截图到对话</span>：当前页面的截图放进输入框，你接着打字说哪里不对。</li>
+    <li>页面里指向电脑其他端口的链接留在预览里打开；指向外网的链接可以 <span class="ui">在 Safari 打开</span>。</li>
+  </ul>
+  <p>预览页上有一行写着隧道的状态。app 退到后台时隧道会断开，回来时自动重连。</p>
+  <p>如果提示电脑不允许端口转发，是电脑的 sshd 把 <code>AllowTcpForwarding</code> 关了，要在电脑上打开它。</p>
+</section>
+
+<section id="terminal">
+  <h2>终端</h2>
+  <p>输入框上方右边的 <span class="ui">Terminal</span>，打开电脑上的一个 shell，目录是这段对话的项目目录。</p>
+  <ul>
+    <li>底下是 tmux。连接断了，里面跑的东西不会停；重新打开，回到原来的屏幕。</li>
+    <li>键盘上方有一排手机键盘没有的键：Esc、Tab、方向键、Ctrl 组合键、常用符号。vim 这样的全屏程序能用。</li>
+    <li>它用的是单独的一组 tmux 会话，不会和你自己在电脑上开的 tmux 混在一起。</li>
+  </ul>
+  <p>电脑上需要装 tmux（Mac 上是 <code>brew install tmux</code>）。没装的话，打开终端时会直接提示。</p>
+</section>
+
+<section id="duet">
+  <h2>双开</h2>
+  <p>把两段对话配成一组，通常是两家不同的模型。在一段对话的 <span class="ui">＋</span> 里选 <span class="ui">双开…</span>，给它配一个伙伴：新开一段另一家的对话，或者选一段已有的对话。然后选一种搭法。</p>
+  <p>组的状态存在电脑上，整轮由电脑推进，手机锁屏也照样跑完。</p>
+
+  <h3>头脑风暴</h3>
+  <p>你说一句，主对话和伙伴同时各自回答，两个答案并排显示。然后主对话汇总：先列分歧，再给结论，显示在单独的「第 N 轮结论」框里。框里的 <span class="ui">交给主去做</span> 会跳到主对话，让它按结论动手。</p>
+  <p>默认两边都是只读的。想让谁动手，在成员的参数里改。</p>
+
+  <h3>监督</h3>
+  <p>你给主对话一个任务，它去做。监督者（另一家模型）看结果、跑测试、提意见；意见回给主对话，它再做。最多三轮。监督者每次回复的最后一行只能是三种结论之一：</p>
+  <div class="tw"><table>
+    <tr><td>通过</td><td>任务结束，监督者的总结推送给你。</td></tr>
+    <tr><td>继续</td><td>意见发回主对话，进入下一轮。第三轮还是「继续」，任务停在那里并推送给你，你可以选 <span class="ui">再来 3 轮</span>。</td></tr>
+    <tr><td>需要你</td><td>它写清楚要你决定什么，循环暂停。你在输入框里回答，两边都带着你的决定继续。</td></tr>
+  </table></div>
+  <p>循环跑着的时候不能直接插话，只有 <span class="ui">停</span>；要改主意，先停，再重新发。监督者和主对话在同一个目录里，它只检查，不改东西。</p>
+  <p>主对话的权限如果是 Ask before edits，开始时会改成 Edit automatically，因为后台的循环里没法弹审批。</p>
+
+  <h3>双窗</h3>
+  <p>两段对话并排，各聊各的。可以只跟一边说，也可以同时问两边。两边不会自动互通，只有在你点 <span class="ui">让伙伴 1 点评伙伴 2</span>（或者反过来）的时候，才把对方最后一条回复递过去请它评；你在输入框里打的字会作为补充一起带上。</p>
+</section>
+
+<section id="workflow">
+  <h2>工作流</h2>
+  <p>工作流是多步骤的流水线，可以定时。它在电脑上跑完，交出来的是一份能直接读的成品，不是聊天记录。自带几个模板，其中论文晨报和 GitHub 热点日报是每天定时出的刊物。这两份刊物每一步用的都是 Claude Code，只装了 Codex 或 Cursor 的话暂时跑不了，市场里会灰掉并写明原因。</p>
+
+  <h3>订阅</h3>
+  <p>在市场里点一个模板的 <span class="ui">订阅</span>。订阅只是登记，不会马上跑：到了你定的时间，电脑自己跑一期，那一行会写着第一期什么时候送到。不想等，点 <span class="ui">现在来一期</span>。</p>
+  <figure>
+    <div class="shot small"><img loading="lazy" src="assets/docs/market-row-subscribed-annotated.png" width="780" height="300" alt="市场里已订阅的一行：左边是已订阅，右边是现在来一期"></div>
+  </figure>
+  <p>定时靠 Mac 上的一条 launchd 任务（Linux 上是一行 cron），每五分钟看一次有没有到点的。只有设了定时才会有这条任务。</p>
+
+  <h3>读一期</h3>
+  <div class="split">
+    <div>
+      <p>首页的刊物卡片点「阅读」。论文晨报每期分三档：必读、速读、扫过。</p>
+      <ul>
+        <li>长按一篇可以打分，你的评分会影响之后几期怎么选。</li>
+        <li>图可以点开放大。往期都留着。</li>
+        <li>可以在电脑的浏览器里看大屏版。这时电脑会在 <code>127.0.0.1</code> 上起一个阅读页，闲置之后自己退出。</li>
+      </ul>
+    </div>
+    <figure>
+      <div class="shot"><img loading="lazy" src="assets/docs/reader.png" width="780" height="1400" alt="一期论文晨报：必读部分的三篇，每篇有标题、结论和怎么用"></div>
+    </figure>
+  </div>
+
+  <h3>自己搭一条</h3>
+  <p>首页点 <span class="ui">搭建工作流</span>，选从零新建或者改一个现有模板，用一句话描述你要什么。agent 会写出模板并自己验证一遍。</p>
+  <p>对话里输入框旁边的分叉按钮打开工作流面板。上面的开关打开之后，这段对话里的 agent 可以列出和运行你的工作流、查运行结果；关着就是普通对话。</p>
+  <figure>
+    <div class="shot small"><img loading="lazy" src="assets/docs/chat-composer-annotated.png" width="780" height="760" alt="对话里的工作流面板：1 是分叉按钮，2 是开关，3 是从零新建和现有模板"></div>
+  </figure>
+  <p>开关打开时，如果 agent 想替你新建或修改订阅，会先弹一张确认单：订什么、几点、周几、保留几期，你点允许才生效。你自己在市场里点订阅不会弹。</p>
+  <p>agent 从对话里启动工作流时，确认单上列的是这条工作流实际要做的事：每一步的权限、所在目录、要在电脑上运行的每一行命令。手机读不出来或者显示不全的，不能点允许。</p>
+  <p>它启动的工作流不会比这段对话的权限高：Plan 档下不能启动；某一步的权限高过对话当前的档位，也不能启动，要么换档，要么你自己在工作流页面启动。在不询问你的档位（Auto）下，它自己写的工作流不能带命令行，也不能跑到对话目录之外；你保存的模板不受这两条限制。</p>
+</section>
+
+<section id="servers">
+  <h2>服务器</h2>
+  <p>可以存多台服务器，每台有自己的凭据和目录。首页底部的「服务器」里添加、编辑、删除；其中一台是主服务器，首页显示的是它上面的东西。</p>
+  <p>连上一台服务器时，app 会看它装了哪些引擎。默认的引擎没装、别的装了，就自动用装了的那个。</p>
+
+  <h3 id="scope">工作目录</h3>
+  <p>添加服务器时填的目录（Project dir）决定这台服务器在手机上的范围：对话列表、搜索、后台任务、新对话选目录，都只在这个目录和它的子目录里。填 <code>~</code> 看整台电脑，填 <code>~/a</code> 只看 a。</p>
+  <p>给对话附加文件不受这个限制。同一台电脑可以添加多次，每条配一个目录。</p>
+
+  <h3>跳板机</h3>
+  <p>要经过别的机器才能连到的服务器，在服务器设置的「经由」里加跳板，可以加多跳。每一跳都要固定主机密钥，没固定就不连。每一跳可以用和目标机器不同的凭据。</p>
+  <figure>
+    <div class="shot small"><img loading="lazy" src="assets/docs/route-editor.png" width="780" height="400" alt="经由：第 1 跳和第 2 跳，各自的主机密钥已固定，第 2 跳用独立凭据"></div>
+  </figure>
+
+  <h3 id="providers">供应商</h3>
+  <p>Claude Code 和 Codex 可以接第三方的模型接口。在对话设置或服务器设置里点「添加供应商」：</p>
+  <ul>
+    <li>从常用的里选一家：智谱 GLM、Kimi、MiniMax、DeepSeek、通义千问、OpenRouter。有地区之分的再选中国区或国际版。地址和模型名会自动填好，你只需要粘 API key。</li>
+    <li>保存时会用这个 key 向供应商查一次模型列表。</li>
+    <li>key 写在电脑的 <code>~/.pervio/providers/</code> 里，手机不保存。</li>
+    <li>已经按官方方式配在 <code>~/.claude/settings.json</code> 或 <code>~/.codex/config.toml</code> 里的供应商会自动出现。</li>
+  </ul>
+  <p>加好之后，在任何对话顶部的徽章菜单里切换。Cursor 只能用它自己的账号。</p>
+</section>
+
+<section id="settings">
+  <h2>设置</h2>
+  <div class="tw"><table>
+    <tr><td>App 语言</td><td>中文或英文。界面、app 写给模型的提示词、推送一起换，马上生效。工作流模板的内容保持它原来的语言。</td></tr>
+    <tr><td>文字大小</td><td>整个 app 的文字一起缩放，终端的字号跟着变。也可以跟随系统。</td></tr>
+    <tr><td>存储</td><td>论文晨报里的图缓存在手机上。超过 500 MB，或者 90 天没看过的，启动时自动清理；也可以手动清空。</td></tr>
+    <tr><td>隐私政策</td><td>在浏览器里打开<a href="privacy.html">隐私政策</a>。</td></tr>
+  </table></div>
+</section>
+
+<section id="faq">
+  <h2>常见问题</h2>
+
+  <h3>发消息被拒绝，提示对话正在别处运行</h3>
+  <p>Codex 规定一段对话同一时间只能有一个客户端在写。这段对话如果还开在终端、VS Code 或另一部手机上，手机发的消息会被拒绝，同时出现 <span class="ui">强制接管</span>。确认之后，另一边会被断开，刚才那句话自动重发，历史不会丢。</p>
+
+  <h3>收不到推送</h3>
+  <ul>
+    <li>在 iOS 设置里确认允许了 Pervio 的通知。</li>
+    <li>手机要连上过这台电脑一次。手机是在连接时把自己的推送凭证交给电脑的。</li>
+    <li>在电脑上运行 <code>~/.pervio/bin/pervio-push check</code>，它会说缺什么。</li>
+    <li>自己从源码编译的版本收不到 Pervio 中继的推送，见仓库 README 的「从源码构建」。</li>
+  </ul>
+
+  <h3>对话里没有回复</h3>
+  <p>先在电脑自己的终端里确认引擎能用、已经登录（<code>claude</code>、<code>codex</code> 或 <code>agent</code>）。Claude Code 在终端里能用、在 Pervio 里显示未登录，见<a href="#claude-login">上面</a>。</p>
+
+  <h3>换了网络要重新配置吗</h3>
+  <p>用 Tailscale 的话不用，地址不变。用局域网 IP 的话，换了 Wi-Fi 之后电脑的地址可能变了，到服务器设置里改 Host。</p>
+
+  <h3>电脑重启了</h3>
+  <p>app 重新连接就行。重启前还在跑的后台任务和终端会话不会回来。定时的工作流要等你在电脑上登录之后才会继续。</p>
+
+  <h3>我的数据经过谁的服务器</h3>
+  <p>对话、文件、任务只在手机和你自己的电脑之间，走 SSH。只有推送通知的标题和正文经过 Pervio 的中继，可以关掉。没有账号，没有统计。详细的见<a href="privacy.html">隐私</a>。</p>
+</section>
+
+<section id="uninstall">
+  <h2>卸载</h2>
+  <p>手机上删掉 app。电脑是 Mac 的，在终端里运行：</p>
+<pre>launchctl bootout gui/$(id -u)/com.pervio.schedule 2&gt;/dev/null   <i># 设过定时工作流才需要</i>
+rm -f ~/Library/LaunchAgents/com.pervio.schedule.plist
+tmux -L pervio kill-server 2&gt;/dev/null                           <i># 还开着的终端会话</i>
+rm -rf ~/.pervio</pre>
+  <p>电脑是 Linux 的，运行这三行：</p>
+<pre>crontab -l | grep -v '# pervio-schedule' | crontab -             <i># 设过定时工作流才需要</i>
+tmux -L pervio kill-server 2&gt;/dev/null                           <i># 还开着的终端会话</i>
+rm -rf ~/.pervio</pre>
+  <p>Claude Code、Codex、Cursor 和它们的对话记录是你自己装的，不受影响。</p>
+</section>
+
+<section id="privacy">
+  <h2>隐私</h2>
+  <ul>
+    <li>对话、文件、任务只在你的手机和你的电脑之间，在 SSH 里传输，不经过 Pervio 的任何服务器。app 里没有账号、统计、崩溃上报。</li>
+    <li>SSH 密钥和密码存在 iOS 钥匙串里。供应商的 API key 存在电脑上。</li>
+    <li>推送通知的标题和正文经过 Pervio 的中继，中继不保存内容，可以关掉。</li>
+  </ul>
+  <p>完整的说明在<a href="privacy.html">隐私政策</a>；代码在 <a href="https://github.com/pervio/Pervio">GitHub</a> 上，MIT 许可。</p>
+</section>
+
+</article>
+</div>
+
+<footer>
+  <div class="wrap">
+    <span>Pervio，MIT 许可</span>
+    <nav>
+      <a href="index.html">首页</a>
+      <a href="privacy.html">隐私</a>
+      <a href="support.html">支持</a>
+      <a href="https://github.com/pervio/Pervio">GitHub</a>
+      <a href="docs-en.html">English</a>
+    </nav>
+  </div>
+</footer>
+
+</body>
+</html>

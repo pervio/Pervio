@@ -1,0 +1,484 @@
+#!/usr/bin/env python3
+"""pervio-arxiv-fetch — deterministic arXiv feed for the paper-digest workflow.
+
+Fetches the newest submissions in the given categories from the arXiv Atom API,
+filters to a recency window, drops papers already recommended on earlier days
+(the --seen file), and prints an LLM-friendly numbered list. This is the DATA
+layer of the scheduled 论文晨报: zero tokens, zero parsing left to a model, so a
+6:30 unattended run can't fail on a flaky LLM parse. The digest step downstream
+gets clean input and spends its one smart turn purely on editorial judgment.
+
+  pervio-arxiv-fetch --cats cs.CL,cs.AI,cs.LG --days 3 --max 40 \
+                     --seen ~/.pervio/paper-digest-seen.txt
+
+The fetch is PAGED and bounded by the WINDOW, not by a count: it keeps asking
+for the next page until the oldest paper it has seen is older than the cutoff.
+cs.CL alone runs 65-86 submissions a day, so a 3-day window is routinely >200
+papers — one request could only ever return the newest page of that and the
+header would still claim "last 3d". The only things that can stop the sweep
+early are the anti-runaway guardrails below, and every one of them prints a
+"TRUNCATED: …" note in the header: this command never cuts silently.
+
+--max is an OUTPUT bound, not a fetch bound. When more unseen papers qualify
+than --max allows, the ones KEPT are the OLDEST — they are the ones about to
+fall out of the window — and the newest are held back for the next run, where
+they will lead. So a held-back paper is not lost, it is deferred, and the
+header says how many. (The downstream fan-out truncates at fanout.max shards,
+which is why an output bound has to exist at all.)
+
+Output: "NEW PAPERS (…)" header + numbered entries (title / arXiv id+cat+date+
+authors / link / abstract), or the single line "NO_NEW_PAPERS (…)" when nothing
+qualifies — the digest prompt handles that case explicitly. Exit 0 either way;
+network/parse failure exits 1 (the step fails visibly instead of an empty digest).
+--shard-size N (default 0 = off) regroups the entries into "K) 分片 …" blocks
+sized for the fan-out score step; 0 keeps the classic format byte-for-byte.
+
+Hermetic testing: --feed FILE reads Atom XML from disk instead of the network
+(FILE,FILE2,… serves them as successive pages); PERVIO_NOW (ISO, UTC) pins
+"now" for the window filter.
+"""
+import datetime
+import os
+import re
+import sys
+import time
+import urllib.request
+import xml.etree.ElementTree as ET
+
+ATOM = "{http://www.w3.org/2005/Atom}"
+ARX = "{http://arxiv.org/schemas/atom}"
+OS_ = "{http://a9.com/-/spec/opensearch/1.1/}"
+API = "https://export.arxiv.org/api/query"
+UA = "pervio-arxiv-fetch/1 (Pervio paper digest)"
+
+PAGE = 200              # entries per request; arXiv's own advice is to slice
+                        # large queries into chunks and stay well under 2000
+PAGE_DELAY = 3.0        # arXiv asks for >=3s between requests from one client
+
+# Anti-runaway guardrails. These are NOT a business limit on how many papers a
+# digest may cover — they exist so a bad cutoff, a clock skew or an arXiv that
+# keeps handing back the same page can't spin here until the orchestrator kills
+# the step. Normal load is ~221 entries / 2 pages / ~7s, so every value below
+# is more than an order of magnitude above anything healthy.
+MAX_PAGES = 25          # 25 x 200 = MAX_ENTRIES; ~10x a full cs.* 3d window
+MAX_ENTRIES = 5000
+DEADLINE_S = 400.0      # wall clock for the whole sweep — see the budget below
+
+
+def die(msg):
+    sys.stderr.write("pervio-arxiv-fetch: %s\n" % msg)
+    sys.exit(1)
+
+
+def parse_args(argv):
+    o = {"cats": "cs.CL,cs.AI,cs.LG", "days": "3", "max": "40", "seen": "",
+         "pending": "", "feed": "", "query": "", "shard-size": "0"}
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a.startswith("--") and a[2:] in o and i + 1 < len(argv):
+            o[a[2:]] = argv[i + 1]
+            i += 2
+        else:
+            die("unknown/malformed arg: %s" % a)
+    return o
+
+
+def now_utc():
+    v = os.environ.get("PERVIO_NOW")
+    if v:
+        # datetime.fromisoformat() didn't accept a trailing 'Z' until Python 3.11,
+        # but the docs advertise 'ISO, UTC' (2026-07-08T06:03Z). Normalize it so a
+        # 3.9/3.10 Linux server doesn't crash the whole fetch on a documented input.
+        d = datetime.datetime.fromisoformat(v.replace("Z", "+00:00"))
+        return d if d.tzinfo else d.replace(tzinfo=datetime.timezone.utc)
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def build_search(cats, query):
+    """arXiv search_query: categories OR'd together; a --query phrase ANDs an
+    all-fields search on top (the literature-survey template's topic knob). Both
+    cats and query are URL-encoded so a stray & / % / quote can't inject extra
+    query parameters."""
+    import urllib.parse
+    cat_q = "+OR+".join("cat:%s" % urllib.parse.quote(c, safe="") for c in cats)
+    if not query:
+        return cat_q
+    phrase = 'all:%s' % urllib.parse.quote('"%s"' % query)
+    return "%%28%s%%29+AND+%s" % (cat_q, phrase) if cat_q else phrase
+
+
+def fetch_xml(cats, want, feed, query="", start=0, deadline=None, required=True):
+    """One page. `deadline` (time.monotonic() seconds) gates every retry and
+    clamps every backoff sleep, so this can't outlive the sweep's budget.
+    required=False turns "gave up" into None instead of exit 1 — a page that
+    fails after page 1 already landed is a truncation to report, not a dead run.
+
+    TIME BUDGET, recomputed for paging. The orchestrator kills a step at
+    CMD_TIMEOUT = 600s and we want >=20% headroom, i.e. done under 480s. Paging
+    turns "one request" into "up to MAX_PAGES requests", so a per-request bound
+    no longer bounds the step — the bound has to be the wall clock:
+      * fetch_window() sets deadline = start + DEADLINE_S (400s) and no NEW
+        request and no sleep is ever begun at or after it;
+      * the one request already in flight when the deadline passes can still
+        cost a urlopen timeout, 30s;
+      * worst case 400 + 30 = 430s < 480s, i.e. 28% headroom on CMD_TIMEOUT.
+    The 400s is chosen so page 1 still gets the WHOLE retry ladder unchanged
+    (5 tries x 30s = 150s, plus 4 between-try sleeps at the 60s Retry-After
+    ceiling = 240s; the exponential path 4+8+16+32 = 60s is smaller — 390s
+    total), so a flaky arXiv degrades to "page 1 only, header says TRUNCATED"
+    instead of dying. Happy path is 2 pages: ~2s + 3s politeness + ~2s = ~7s.
+    (urlopen's timeout is per socket operation, so a server dripping bytes can
+    outlast it; CMD_TIMEOUT stays the backstop for that.)"""
+    if feed:
+        try:
+            with open(feed, "rb") as f:
+                return f.read()
+        except OSError as e:
+            die("feed: %s" % e)
+    q = build_search(cats, query)
+    url = ("%s?search_query=%s&sortBy=submittedDate&sortOrder=descending"
+           "&start=%d&max_results=%d" % (API, q, start, want))
+    last = None
+    for attempt in range(5):
+        if attempt and deadline is not None and time.monotonic() >= deadline:
+            break
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": UA})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.read()
+        except OSError as e:
+            last = e
+            if attempt == 4:
+                break                               # no pointless sleep before dying
+            delay = 4 * (2 ** attempt)              # 4 / 8 / 16 / 32
+            # urllib.error.HTTPError is an OSError subclass and the only one
+            # carrying .headers: honor an integer Retry-After (arXiv rate-limits
+            # send plain seconds), clamped to [0, 60] so a huge or negative value
+            # can't stall or crash the fetch; an HTTP-date or absent header
+            # falls back to the exponential delay.
+            hdrs = getattr(e, "headers", None)
+            ra = hdrs.get("Retry-After") if hdrs is not None else None
+            try:
+                delay = min(60, max(0, int(ra)))
+            except (TypeError, ValueError):
+                pass
+            if deadline is not None:
+                delay = min(delay, max(0.0, deadline - time.monotonic()))
+            time.sleep(delay)
+    if not required:
+        return None
+    die("arXiv API unreachable after 5 tries: %s" % last)
+
+
+def fetch_window(cats, cutoff, feed, query="", started=None):
+    """Page until the recency WINDOW is covered — i.e. until a page hands back
+    something older than `cutoff` — rather than until some entry count is hit.
+    That "count" is what used to truncate the digest: a single 200-entry request
+    over a 221-paper window dropped the 21 oldest and still printed "last 3d".
+
+    Returns (entries, truncated): `truncated` is "" after a complete sweep, else
+    a one-line human reason main() appends to the header. Every early exit that
+    is NOT "the window is covered" or "arXiv has no more results" sets it.
+
+    --feed takes a comma-separated list of files served as successive pages, so
+    the loop is testable without touching the network."""
+    started = time.monotonic() if started is None else started
+    deadline = started + DEADLINE_S
+    files = [f for f in feed.split(",") if f.strip()] if feed else []
+    out, have, truncated, total = [], set(), "", None
+
+    for page in range(MAX_PAGES + 1):
+        if page == MAX_PAGES:
+            truncated = ("hit the %d-page fetch guardrail after %d entries"
+                         % (MAX_PAGES, len(out)))
+            break
+        if files:
+            if page >= len(files):
+                break                               # fixture pages exhausted
+            xml = fetch_xml(cats, PAGE, files[page], query)
+        else:
+            if page and time.monotonic() >= deadline:
+                truncated = ("hit the %ds fetch time budget after %d entries"
+                             % (int(DEADLINE_S), len(out)))
+                break
+            if page:                                # be a good arXiv citizen
+                time.sleep(min(PAGE_DELAY, max(0.0, deadline - time.monotonic())))
+            xml = fetch_xml(cats, PAGE, "", query, start=page * PAGE,
+                            deadline=deadline, required=(page == 0))
+            if xml is None:                         # page 1 would have exit(1)'d
+                truncated = ("arXiv stopped answering at page %d, %d entries in hand"
+                             % (page + 1, len(out)))
+                break
+
+        got = parse_entries(xml)                    # DOCTYPE/XXE guard runs first
+        if total is None:
+            total = parse_total(xml)
+        # arXiv can repeat an entry across page boundaries when something is
+        # submitted mid-sweep; dedupe by id so it can't be printed twice.
+        for e in got:
+            if e["id"] not in have:
+                have.add(e["id"])
+                out.append(e)
+
+        if not got:
+            break                                   # arXiv ran out of results
+        if min(e["published"] for e in got) < cutoff:
+            break                                   # WINDOW COVERED — the normal exit
+        if len(out) >= MAX_ENTRIES:
+            truncated = "hit the %d-entry fetch guardrail" % MAX_ENTRIES
+            break
+        if not files:
+            # totalResults is the authority when arXiv sends it: the API is known
+            # to return a short page transiently, and treating that as "the end"
+            # would silently re-open the truncation this whole function fixes.
+            if total is not None:
+                if (page + 1) * PAGE >= total:
+                    break
+            elif len(got) < PAGE:
+                break
+    return out, truncated
+
+
+def collapse(s):
+    return re.sub(r"\s+", " ", s or "").strip()
+
+
+def short_id(raw):
+    """http://arxiv.org/abs/2507.01234v2 -> 2507.01234 (version-independent)."""
+    m = re.search(r"abs/([^/\s]+?)(v\d+)?$", raw or "")
+    return m.group(1) if m else collapse(raw)
+
+
+def parse_entries(xml_bytes):
+    # Refuse any DTD outright: the real arXiv Atom feed has none, and a DOCTYPE is
+    # the entry point for entity-expansion (billion-laughs) and external-entity
+    # (file-read / SSRF) attacks. Cheaper and more certain than wrangling expat
+    # handlers, and dependency-free (no defusedxml). Scan only the leading bytes.
+    head = xml_bytes[:4096]
+    if isinstance(head, bytes):
+        head = head.decode("latin-1", "replace")
+    if re.search(r"<!DOCTYPE", head, re.I):
+        die("arXiv feed contains a DOCTYPE (refused: entity-expansion / XXE guard)")
+    try:
+        root = ET.fromstring(xml_bytes)
+    except ET.ParseError as e:
+        die("arXiv returned unparseable XML: %s" % e)
+    out = []
+    for e in root.findall(ATOM + "entry"):
+        raw_id = (e.findtext(ATOM + "id") or "")
+        pub = (e.findtext(ATOM + "published") or "")
+        try:
+            pub_dt = datetime.datetime.strptime(pub, "%Y-%m-%dT%H:%M:%SZ") \
+                .replace(tzinfo=datetime.timezone.utc)
+        except ValueError:
+            continue
+        cat_el = e.find(ARX + "primary_category")
+        authors = [collapse(a.findtext(ATOM + "name") or "")
+                   for a in e.findall(ATOM + "author")]
+        # Every field that reaches the digest prompt is collapsed (newlines/space
+        # runs removed, so a paper can't inject fake structure) AND length-bounded
+        # so one degenerate entry can't push an unbounded blob into the prompt. The
+        # abstract bound (3000) is a garbage guard, NOT trimming: real arXiv abstracts
+        # run ~1000-1800 chars, so a normal abstract passes WHOLE — the digest judges
+        # on the full abstract, only a pathological entry gets clipped.
+        out.append({
+            "id": short_id(raw_id),
+            "title": collapse(e.findtext(ATOM + "title") or "")[:300],
+            "abstract": collapse(e.findtext(ATOM + "summary") or "")[:3000],
+            "published": pub_dt,
+            "cat": collapse((cat_el.get("term") if cat_el is not None else "") or "")[:40],
+            "authors": authors,
+        })
+    return out
+
+
+def parse_total(xml_bytes):
+    """<opensearch:totalResults> — how many papers the query matches in total.
+    Only used to decide whether a short page really means "no more results".
+    Returns None if absent or unparseable; the caller then falls back to the
+    page length. Safe to re-parse: parse_entries() has already vetted the DTD."""
+    try:
+        root = ET.fromstring(xml_bytes)
+    except ET.ParseError:
+        return None
+    try:
+        return int(collapse(root.findtext(OS_ + "totalResults")))
+    except (TypeError, ValueError):
+        return None
+
+
+def load_seen(path):
+    """Previously recommended ids, oldest first (file order is the age order the
+    2000-line cap trims by)."""
+    if not path:
+        return []
+    try:
+        with open(os.path.expanduser(path), "r", errors="replace") as f:
+            return [l.strip() for l in f if l.strip()]
+    except OSError:
+        return []
+
+
+def save_seen(path, seen_list, new_ids):
+    if not path or not new_ids:
+        return
+    path = os.path.expanduser(path)
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, mode=0o700, exist_ok=True)
+    have = set(seen_list)
+    lines = (seen_list + [i for i in new_ids if i not in have])[-2000:]
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    os.replace(tmp, path)
+
+
+def save_pending(path, new_ids):
+    """Two-phase seen: with --pending, today's ids go to a staging file (OVERWRITE —
+    a stale pending from a failed day must not linger) and only a later commit step,
+    which runs after the digest verifiably succeeded, merges them into the seen
+    file. Otherwise a failed digest would permanently swallow the day's papers:
+    marked seen, never shown."""
+    path = os.path.expanduser(path)
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, mode=0o700, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        if new_ids:
+            f.write("\n".join(new_ids) + "\n")
+    os.replace(tmp, path)
+
+
+def emit_shards(fresh, size, report_date):
+    """Sharded paper list for the fan-out score step. INVARIANT: the "K)" shard
+    headers must be the ONLY lines matching the orchestrator's numbered-split
+    anchor, re.split(r"(?m)^(?=\\s*\\d+[.)])", text) — body lines are made
+    structurally safe: every paper line starts "- P", metadata lines start with
+    two spaces then a/h/摘, and the abstract sits behind a "摘要: " prefix so
+    one that opens with a number ("2.5 times faster …") can't become a split
+    point. Each header repeats REPORT_DATE because the split drops everything
+    before the first numbered line (the child judge still needs the date), and
+    P<n> is globally sequential across shards so the editor can cite papers
+    from any shard unambiguously."""
+    total = (len(fresh) + size - 1) // size
+    for k in range(total):
+        chunk = fresh[k * size:(k + 1) * size]
+        print("%d) 分片 %d/%d · 论文 %d-%d · REPORT_DATE: %s"
+              % (k + 1, k + 1, total, k * size + 1, k * size + len(chunk),
+                 report_date))
+        for n, p in enumerate(chunk, k * size + 1):
+            who = ", ".join(p["authors"][:3]) + (" et al." if len(p["authors"]) > 3 else "")
+            print("- P%d · %s" % (n, p["title"]))
+            print("  arXiv:%s [%s] · %s · %s" % (p["id"], p["cat"] or "-",
+                                                 p["published"].strftime("%Y-%m-%d"), who))
+            print("  https://arxiv.org/abs/%s" % p["id"])
+            print("  摘要: %s\n" % p["abstract"])
+
+
+def main():
+    o = parse_args(sys.argv[1:])
+    cats = [c.strip() for c in o["cats"].split(",") if c.strip()]
+    if not cats:
+        die("--cats needs at least one category")
+    try:
+        days = max(1, int(o["days"]))
+        cap = max(1, int(o["max"]))
+    except ValueError:
+        die("--days/--max must be integers")
+    try:
+        shard = int(o["shard-size"])
+        if shard < 0:
+            raise ValueError
+    except ValueError:
+        die("--shard-size must be a non-negative integer")
+
+    started = time.monotonic()
+    now = now_utc()
+    cutoff = now - datetime.timedelta(days=days)
+    # NOT bounded by cap: the sweep's job is to cover the window. cap used to
+    # double as the fetch size (min(200, cap*4)), which is how "last 3d" ended
+    # up printed over 2.7 days of papers.
+    entries, truncated = fetch_window(cats, cutoff, o["feed"], o["query"], started)
+
+    # First line: the UTC date of THIS fetch — the same clock the window is cut
+    # on, so the issue's name can never disagree with its contents. It used to
+    # be the server's LOCAL date, which is 8 hours ahead of the announcement
+    # clock on this box: a manual fire at 00:57 Beijing (16:57Z the previous
+    # day) fetched the previous UTC cycle but titled the issue with the next
+    # local day — the empty「2026-08-14」issue that was really 08-13's papers.
+    # The scheduled 12:30 fire (04:30Z) names the same date either way.
+    report_date = now.strftime("%Y-%m-%d")
+    print("REPORT_DATE: %s" % report_date)
+
+    seen_list = load_seen(o["seen"])
+    seen = set(seen_list)
+    fresh, skipped = [], 0
+    for p in entries:
+        if p["published"] < cutoff:
+            continue
+        if p["id"] in seen:
+            skipped += 1
+            continue
+        fresh.append(p)
+    fresh.sort(key=lambda p: p["published"], reverse=True)
+    # cap is an EMIT bound (the fan-out truncates at fanout.max shards, so one
+    # has to exist) and the cut goes EXPIRY-FIRST: keep the cap OLDEST papers,
+    # hold the newest back. The old fresh[:cap] cut the other way and threw away
+    # precisely the papers that could never return — the oldest are the ones
+    # about to leave the window, while the newest are still deep inside it and
+    # are guaranteed to be swept again next run, where they'll be the oldest
+    # unseen and so lead it. Nothing is written to the ledgers for held-back
+    # papers ON PURPOSE: seen/pending mean "already recommended", and staging
+    # an unshown paper there would suppress it forever — the opposite of
+    # deferring it. Display order stays newest-first.
+    held, fresh = fresh[:-cap], fresh[-cap:]
+    # Deferral only works while cap >= the daily arrival rate. If it isn't, the
+    # backlog can't drain and the oldest held-back papers really do age out
+    # before the next daily run. Count them and say so rather than lose them
+    # quietly — that is the one residual loss this design cannot prevent.
+    doomed = [p for p in held
+              if p["published"] < now - datetime.timedelta(days=max(0, days - 1))]
+
+    notes = ""
+    if truncated:
+        notes += " · TRUNCATED: %s" % truncated
+    if held:
+        notes += " · %d held for the next run (--max %d)" % (len(held), cap)
+    if doomed:
+        notes += (" · WARNING: %d of those age out of the %dd window before the "
+                  "next run" % (len(doomed), days))
+
+    if o["pending"]:
+        save_pending(o["pending"], [p["id"] for p in fresh])
+
+    if not fresh:
+        print("NO_NEW_PAPERS (nothing new in %s over the last %dd; %d already "
+              "recommended earlier%s)" % (",".join(cats), days, skipped, notes))
+        if shard:
+            # The numbered split must yield exactly ONE item so the fan-out runs
+            # a single child, which echoes NO_NEW_PAPERS back to the editor.
+            print("\n1) NO_NEW_PAPERS")
+        return
+
+    print("NEW PAPERS (%s · last %dd · %d new, %d already recommended earlier%s)\n"
+          % (",".join(cats), days, len(fresh), skipped, notes))
+    if shard:
+        emit_shards(fresh, shard, report_date)
+    else:
+        for i, p in enumerate(fresh, 1):
+            who = ", ".join(p["authors"][:3]) + (" et al." if len(p["authors"]) > 3 else "")
+            print("%d. %s" % (i, p["title"]))
+            print("   arXiv:%s [%s] · %s · %s" % (p["id"], p["cat"] or "-",
+                                                  p["published"].strftime("%Y-%m-%d"), who))
+            print("   https://arxiv.org/abs/%s" % p["id"])
+            print("   %s\n" % p["abstract"])
+
+    if not o["pending"]:                       # two-phase mode defers this to commit
+        save_seen(o["seen"], seen_list, [p["id"] for p in fresh])
+
+
+if __name__ == "__main__":
+    main()

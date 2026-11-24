@@ -1,0 +1,45 @@
+# XcodeGen output + Xcode build/user state (regenerated from project.yml)
+ios/Pervio.xcodeproj/
+ios/.build/
+ios/DerivedData/
+**/xcuserdata/
+**/*.xcworkspace/xcshareddata/swiftpm/Package.resolved
+
+# macOS / Xcode noise
+.DS_Store
+*.xcuserstate
+
+# Never commit key material or agent/CLI credentials. These normally live in ~/
+# (outside the repo), but if one is ever copied into the tree, don't let `git add`
+# stage it. Covers SSH keys, TLS keys, Apple .p8 signing keys (APNs / App Store
+# Connect), and the Claude/Codex token files.
+*.pem
+*.key
+*.p8
+id_rsa
+id_ed25519
+id_dsa
+id_ecdsa
+.credentials.json
+auth.json
+*.env
+!.env.example
+
+# Python bytecode cache
+__pycache__/
+*.pyc
+
+# Local design reference images / screenshots (not part of the app)
+/截屏*.png
+/*.jpg
+/otter_icon_traced_1024.png
+/pervio-org-avatar-1024.png
+.claude/
+ios/Signing.local.xcconfig
+
+# The app pave stamps the installed revision here on a Mac; the e2e sandbox used to
+# symlink its bin to the repo and leave this behind.
+server/bin/.pervio-rev
+
+# The private list of literals scripts/public_scan.py refuses to publish.
+.public-scan.local

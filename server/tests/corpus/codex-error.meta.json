@@ -1,0 +1,40 @@
+{
+  "scenario": "codex-error",
+  "backend": "codex",
+  "model": "gpt-nope-9",
+  "capturedUTC": "2026-08-07T08:58:19Z",
+  "cliVersion": "codex-cli 0.146.1",
+  "command": "server/bin/pervio-chat --text --backend codex --dir /home/pervio/work --prompt-b64 aGk= --sandbox read-only --model gpt-nope-9",
+  "prompt": "hi",
+  "exitCode": 1,
+  "events": 5,
+  "seconds": 11.2,
+  "usage": {},
+  "sessionIdRedactedTo": "00000000-0000-4000-8000-000000000001",
+  "covers": [
+    "item.completed with item.type=error",
+    "error",
+    "turn.failed"
+  ],
+  "twin": "claude-error",
+  "noTwinBecause": null,
+  "free": true,
+  "redactions": [
+    "workdir (plain, realpath, and '-'-encoded) -> /home/pervio/work",
+    "$HOME -> /home/pervio, username -> pervio",
+    "hostname -> pervio-host",
+    "IANA timezone -> Etc/UTC",
+    "UUIDs -> 00000000-0000-4000-8000-0000000000NN (consistent within a file)",
+    "req_… -> req_000…NN",
+    "bulk vendor/environment values -> '<redacted: …>' markers (keys and types preserved; see 'scrubbedPaths')"
+  ],
+  "scrubbedPaths": [
+    "payload.base_instructions.text",
+    "payload.content.text",
+    "payload.state.environments.timezone",
+    "payload.state.host_skills.body",
+    "payload.timezone"
+  ],
+  "regenerate": "python3 server/tests/capture_corpus.py --only codex-error",
+  "note": "REAL agent output. Everything except the values listed under 'redactions' is byte-for-byte what the CLI emitted."
+}

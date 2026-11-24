@@ -1,0 +1,608 @@
+#!/usr/bin/env python3
+"""pervio-provider — the Mac's roster of third-party model providers, and the
+one place a Claude setup-token is written.
+
+A "provider" is a base URL + API key + model list for an engine that can be
+pointed at another vendor: Claude Code (ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN,
+the way GLM / Kimi / MiniMax document it) and Codex (a model_providers entry).
+Cursor has none — it only speaks to its own account.
+
+Accounts are never touched here: Claude's login lives in the keychain, Codex's in
+~/.codex/auth.json, Cursor's in ~/.cursor. This roster is only for keys the
+person got from a provider's website.
+
+    ~/.pervio/providers/<name>.env      one file per provider, 0600, KEY='value'
+        ENGINE=claude|codex  LABEL  BASE_URL  API_KEY  MODELS (comma)  DEFAULT_MODEL
+        WIRE_API=chat|responses (codex only)
+
+Also discovered, read-only, so people who already configured a vendor the
+official way see it in the list without typing it again:
+    ~/.claude/settings.json  → its "env" block, when it sets ANTHROPIC_BASE_URL
+                               (name "claude-settings")
+    ~/.codex/config.toml     → every [model_providers.<x>] section
+                               (name "codex:<x>"; its key must still be reachable:
+                               the env var it names, from ~/.pervio/credentials.env)
+
+Verbs (all print JSON; `shell` prints bash):
+    list                                   the roster, never a key value
+    presets                                the vendor table (_pervio_lib.PROVIDER_PRESETS)
+    add --b64 <json>                       {name, engine, label, baseUrl, apiKey,
+                                            models:[…] | "a,b", defaultModel, wireApi,
+                                            preset, region, modelsUrl, fetchModels}
+                                           a preset (+ region when it has several) fills
+                                           the URLs/models; fetchModels asks the vendor's
+                                           /models with the key and keeps what it says
+    refresh --name <n>                     ask the vendor's /models again
+    remove --name <n>
+    shell --name <n> --engine claude|codex what pervio-chat evals before launching:
+                                           export lines + PERVIO_CODEX_PROVIDER_ARGS=( … )
+                                           + PERVIO_PROVIDER_DEFAULT_MODEL
+    claude-token --b64 <token> | --clear   CLAUDE_CODE_OAUTH_TOKEN in ~/.pervio/credentials.env
+    cursor-key   --b64 <key>   | --clear   CURSOR_API_KEY in the same file (Cursor's agent without the keychain)
+    cursor-login --start | --status | --cancel   log the agent in to its file store: the link to open, then "done"
+"""
+import base64
+import json
+import os
+import re
+import shlex
+import sys
+import urllib.request
+
+SELF_DIR = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, SELF_DIR)
+try:
+    from _pervio_lib import provider_presets
+except Exception:                      # a bin dir without the lib: no presets, nothing else lost
+    def provider_presets():
+        return []
+
+HOME = os.path.expanduser("~")
+PDIR = os.path.join(HOME, ".pervio", "providers")
+CRED = os.path.join(HOME, ".pervio", "credentials.env")
+CLAUDE_SETTINGS = os.path.join(HOME, ".claude", "settings.json")
+CODEX_CONFIG = os.path.join(HOME, ".codex", "config.toml")
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+ENGINES = ("claude", "codex")
+
+
+def _die(msg, code=2):
+    sys.stderr.write(msg + "\n")
+    sys.exit(code)
+
+
+def _parse(argv, keys, flags=("clear", "start", "status", "cancel")):
+    o, i = {}, 0
+    while i < len(argv):
+        a = argv[i]
+        if a.startswith("--") and a[2:] in flags:
+            o[a[2:]] = True
+            i += 1
+        elif a.startswith("--") and a[2:] in keys and i + 1 < len(argv):
+            o[a[2:]] = argv[i + 1]
+            i += 2
+        else:
+            _die("unknown arg: %s" % a)
+    return o
+
+
+# ---------- the files ----------
+
+def _read_env_file(path):
+    """KEY='value' lines (our own writer's format; a bare value also parses)."""
+    out = {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                try:
+                    parts = shlex.split(v)
+                    v = parts[0] if parts else ""
+                except ValueError:
+                    v = v.strip()
+                out[k.strip()] = v
+    except OSError:
+        pass
+    return out
+
+
+def _write_env_file(path, kv):
+    os.makedirs(PDIR, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(PDIR, 0o700)
+    except OSError:
+        pass
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        for k, v in kv.items():
+            f.write("%s=%s\n" % (k, shlex.quote(str(v))))
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def _models(v):
+    if isinstance(v, list):
+        return [str(x).strip() for x in v if str(x).strip()]
+    return [x.strip() for x in str(v or "").split(",") if x.strip()]
+
+
+def _own_providers():
+    out = []
+    if not os.path.isdir(PDIR):
+        return out
+    for fn in sorted(os.listdir(PDIR)):
+        if not fn.endswith(".env"):
+            continue
+        name = fn[:-4]
+        if not NAME_RE.match(name):
+            continue
+        kv = _read_env_file(os.path.join(PDIR, fn))
+        engine = kv.get("ENGINE", "claude")
+        if engine not in ENGINES:
+            continue
+        out.append({
+            "name": name, "engine": engine, "label": kv.get("LABEL") or name,
+            "baseUrl": kv.get("BASE_URL", ""), "models": _models(kv.get("MODELS", "")),
+            "defaultModel": kv.get("DEFAULT_MODEL", ""), "wireApi": kv.get("WIRE_API", ""),
+            "hasKey": bool(kv.get("API_KEY")), "source": "pervio",
+            "preset": kv.get("PRESET", ""), "region": kv.get("REGION", ""),
+            "modelsSource": kv.get("MODELS_SOURCE", "manual"),
+        })
+    return out
+
+
+def _claude_settings_env():
+    try:
+        with open(CLAUDE_SETTINGS, "r", encoding="utf-8") as f:
+            env = (json.load(f) or {}).get("env") or {}
+    except (OSError, ValueError):
+        return {}
+    return {k: str(v) for k, v in env.items() if isinstance(v, (str, int, float))}
+
+
+def _claude_settings_provider():
+    env = _claude_settings_env()
+    base = env.get("ANTHROPIC_BASE_URL", "")
+    if not base:
+        return None
+    models = [m for m in (env.get("ANTHROPIC_MODEL", ""),) if m]
+    return {
+        "name": "claude-settings", "engine": "claude", "label": "settings.json",
+        "baseUrl": base, "models": models, "defaultModel": models[0] if models else "",
+        "wireApi": "", "hasKey": bool(env.get("ANTHROPIC_AUTH_TOKEN") or env.get("ANTHROPIC_API_KEY")),
+        "source": "claude-settings",
+    }
+
+
+def _codex_config_providers():
+    """[model_providers.<x>] sections of ~/.codex/config.toml, read with a
+    small section parser (this python has no tomllib): name / base_url /
+    env_key / wire_api, quoted values only."""
+    out = []
+    try:
+        with open(CODEX_CONFIG, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return out
+    cur, fields = None, {}
+    def flush():
+        if cur:
+            out.append({
+                "name": "codex:" + cur, "engine": "codex", "label": fields.get("name") or cur,
+                "baseUrl": fields.get("base_url", ""), "models": [], "defaultModel": "",
+                "wireApi": fields.get("wire_api", ""), "envKey": fields.get("env_key", ""),
+                "hasKey": bool(fields.get("env_key")) and bool(_credential(fields.get("env_key", ""))),
+                "source": "codex-config",
+            })
+    for line in lines:
+        s = line.strip()
+        m = re.match(r'^\[model_providers\.([A-Za-z0-9_\-]+)\]$', s)
+        if m:
+            flush()
+            cur, fields = m.group(1), {}
+            continue
+        if s.startswith("["):
+            flush()
+            cur, fields = None, {}
+            continue
+        if cur:
+            kv = re.match(r'^([A-Za-z_]+)\s*=\s*"([^"]*)"', s)
+            if kv:
+                fields[kv.group(1)] = kv.group(2)
+    flush()
+    return out
+
+
+def _credential(var):
+    """A key's VALUE for a codex env_key: ~/.pervio/credentials.env first, then
+    this process's environment."""
+    if not var:
+        return ""
+    return _read_env_file(CRED).get(var) or os.environ.get(var, "")
+
+
+def roster():
+    out = _own_providers()
+    cs = _claude_settings_provider()
+    if cs:
+        out.append(cs)
+    out += _codex_config_providers()
+    return out
+
+
+def _fetch_models(url, key, timeout=8):
+    """GET an OpenAI-style /models with the key; [ids] or None on any failure.
+    Vendors list hundreds of ids (OpenRouter): the first 40 keep a menu a menu."""
+    if not url:
+        return None
+    try:
+        req = urllib.request.Request(url, headers={"Authorization": "Bearer " + key,
+                                                   "User-Agent": "pervio-provider"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            body = json.loads(r.read().decode("utf-8", "replace"))
+    except Exception:
+        return None
+    rows = body.get("data") if isinstance(body, dict) else body
+    if not isinstance(rows, list):
+        return None
+    ids = [str(x.get("id")) for x in rows if isinstance(x, dict) and x.get("id")]
+    ids = [i for i in ids if i]
+    return ids[:40] if ids else None
+
+
+def _preset(pid):
+    for p in provider_presets():
+        if p["id"] == pid:
+            return p
+    return None
+
+
+def _apply_fetch(kv, key):
+    """Replace MODELS with the vendor's live list when it answers; the default
+    stays if the vendor still has it, else the first live id."""
+    ids = _fetch_models(kv.get("MODELS_URL", ""), key)
+    if not ids:
+        return False
+    kv["MODELS"] = ",".join(ids)
+    if kv.get("DEFAULT_MODEL") not in ids:
+        kv["DEFAULT_MODEL"] = ids[0]
+    kv["MODELS_SOURCE"] = "live"
+    return True
+
+
+# ---------- verbs ----------
+
+def cmd_presets(_o):
+    print(json.dumps(provider_presets(), ensure_ascii=False))
+
+
+def cmd_list(_o):
+    print(json.dumps(roster(), ensure_ascii=False))
+
+
+def cmd_add(o):
+    try:
+        spec = json.loads(base64.b64decode(o.get("b64", "")).decode("utf-8"))
+    except Exception as e:
+        _die("add needs --b64 <json>: %s" % e)
+    if not isinstance(spec, dict):
+        _die("add: payload must be an object")
+    engine = str(spec.get("engine") or "claude")
+    if engine not in ENGINES:
+        _die("add: engine must be claude or codex", 4)
+    # A preset fills what the person did not type: the URLs for the region, the
+    # vendor's model names, the wire api. The name defaults to the preset id.
+    preset = None
+    if spec.get("preset"):
+        preset = _preset(str(spec.get("preset")))
+        if preset is None:
+            _die("add: unknown preset: %s" % spec.get("preset"), 4)
+    region = None
+    if preset:
+        regions = preset.get("regions") or []
+        rid = str(spec.get("region") or "")
+        if len(regions) > 1 and not rid:
+            _die("add: this provider has several regions — pick one (region)", 4)
+        region = next((r for r in regions if r["id"] == rid), None) or (regions[0] if len(regions) == 1 else None)
+        if region is None:
+            _die("add: unknown region for this preset", 4)
+    name = str(spec.get("name") or (preset["id"] if preset else "")).strip().lower()
+    if not NAME_RE.match(name):
+        _die("add: name must be [a-z0-9][a-z0-9_-]{0,31}", 4)
+    base = str(spec.get("baseUrl") or "").strip()
+    if not base and region:
+        base = region["claudeUrl"] if engine == "claude" else region["codexUrl"]
+    if not re.match(r"^https?://", base):
+        _die("add: baseUrl must start with http:// or https://", 4)
+    path = os.path.join(PDIR, name + ".env")
+    prev = _read_env_file(path) if os.path.isfile(path) else {}
+    key = str(spec.get("apiKey") or "").strip() or prev.get("API_KEY", "")
+    if not key:
+        _die("add: apiKey is required for a new provider", 4)
+    models = _models(spec.get("models")) or (list(preset.get("models") or []) if preset else [])
+    default = str(spec.get("defaultModel") or "").strip() or (preset.get("defaultModel", "") if preset else "") or (models[0] if models else "")
+    if default and default not in models:
+        models = [default] + models
+    source = "preset" if (preset and not spec.get("models")) else "manual"
+    if prev and spec.get("models") and ",".join(models) == prev.get("MODELS", ""):
+        # An edit that left the names alone keeps where they came from (live /
+        # preset), so fixing a URL does not demote the vendor's list to "typed".
+        source = prev.get("MODELS_SOURCE") or source
+    kv = {"ENGINE": engine, "LABEL": str(spec.get("label") or (preset["label"] if preset else name)).strip() or name,
+          "BASE_URL": base, "API_KEY": key, "MODELS": ",".join(models), "DEFAULT_MODEL": default,
+          "MODELS_SOURCE": source}
+    if preset:
+        kv["PRESET"] = preset["id"]
+        kv["REGION"] = region["id"]
+    models_url = str(spec.get("modelsUrl") or (region.get("modelsUrl", "") if region else "")).strip()
+    if models_url:
+        kv["MODELS_URL"] = models_url
+    if engine == "codex":
+        wire = str(spec.get("wireApi") or (preset.get("wireApi") if preset else "") or prev.get("WIRE_API") or "chat")
+        kv["WIRE_API"] = wire if wire in ("chat", "responses") else "chat"
+    if spec.get("fetchModels") and models_url:
+        _apply_fetch(kv, key)
+    _write_env_file(path, kv)
+    cmd_list(o)
+
+
+def cmd_refresh(o):
+    """Ask the vendor's /models again with the stored key."""
+    name = str(o.get("name") or "")
+    if not NAME_RE.match(name):
+        _die("refresh: bad name", 4)
+    path = os.path.join(PDIR, name + ".env")
+    if not os.path.isfile(path):
+        _die("refresh: provider not found: %s" % name, 4)
+    kv = _read_env_file(path)
+    if not kv.get("MODELS_URL"):
+        _die("refresh: this provider has no models URL to ask", 4)
+    if not _apply_fetch(kv, kv.get("API_KEY", "")):
+        _die("refresh: the vendor did not answer /models (key, network, or no such endpoint)", 5)
+    _write_env_file(path, kv)
+    cmd_list(o)
+
+
+def cmd_remove(o):
+    name = str(o.get("name") or "")
+    if not NAME_RE.match(name):
+        _die("remove: bad name", 4)
+    try:
+        os.remove(os.path.join(PDIR, name + ".env"))
+    except FileNotFoundError:
+        pass
+    cmd_list(o)
+
+
+def _find(name):
+    for p in roster():
+        if p["name"] == name:
+            return p
+    return None
+
+
+def cmd_shell(o):
+    """Bash for pervio-chat to eval. Claude: the two ANTHROPIC_* exports. Codex: the
+    key's export plus PERVIO_CODEX_PROVIDER_ARGS (-c overrides). Both: the
+    provider's default model, for a turn that names none."""
+    name = str(o.get("name") or "")
+    engine = str(o.get("engine") or "")
+    p = _find(name)
+    if not p:
+        _die("provider not found: %s" % name, 4)
+    if engine and p["engine"] != engine:
+        _die("provider %s is for %s, not %s" % (name, p["engine"], engine), 4)
+    lines = ["PERVIO_PROVIDER_DEFAULT_MODEL=%s" % shlex.quote(p.get("defaultModel", "")),
+             "PERVIO_CODEX_PROVIDER_ARGS=( )"]
+    if p["source"] == "pervio":
+        kv = _read_env_file(os.path.join(PDIR, name + ".env"))
+        if p["engine"] == "claude":
+            lines.append("export ANTHROPIC_BASE_URL=%s" % shlex.quote(kv.get("BASE_URL", "")))
+            lines.append("export ANTHROPIC_AUTH_TOKEN=%s" % shlex.quote(kv.get("API_KEY", "")))
+            # The person's own Anthropic credentials must never travel to a
+            # third party: the key blanked (OpenRouter's docs insist on an
+            # EMPTY string, not unset), the setup-token dropped for this turn.
+            lines.append("export ANTHROPIC_API_KEY=''")
+            lines.append("unset CLAUDE_CODE_OAUTH_TOKEN")
+        else:
+            var = "PERVIO_PROVIDER_KEY_" + re.sub(r"[^A-Z0-9]", "_", name.upper())
+            pid = "pervio_" + re.sub(r"[^a-z0-9_]", "_", name)
+            lines.append("export %s=%s" % (var, shlex.quote(kv.get("API_KEY", ""))))
+            args = ["-c", 'model_provider="%s"' % pid,
+                    "-c", 'model_providers.%s.name="%s"' % (pid, kv.get("LABEL", name).replace('"', "")),
+                    "-c", 'model_providers.%s.base_url="%s"' % (pid, kv.get("BASE_URL", "")),
+                    "-c", 'model_providers.%s.env_key="%s"' % (pid, var),
+                    "-c", 'model_providers.%s.wire_api="%s"' % (pid, kv.get("WIRE_API", "chat"))]
+            lines.append("PERVIO_CODEX_PROVIDER_ARGS=( %s )" % " ".join(shlex.quote(a) for a in args))
+    elif p["source"] == "claude-settings":
+        env = _claude_settings_env()
+        for k, v in env.items():
+            if k.startswith("ANTHROPIC_"):
+                lines.append("export %s=%s" % (k, shlex.quote(v)))
+        if "ANTHROPIC_API_KEY" not in env:
+            lines.append("export ANTHROPIC_API_KEY=''")
+        lines.append("unset CLAUDE_CODE_OAUTH_TOKEN")
+    else:   # codex-config: codex has the rest in its own config; we supply the key
+        raw = name.split(":", 1)[1]
+        var = p.get("envKey", "")
+        if var:
+            val = _credential(var)
+            if val:
+                lines.append("export %s=%s" % (var, shlex.quote(val)))
+        lines.append("PERVIO_CODEX_PROVIDER_ARGS=( %s )" % " ".join(
+            shlex.quote(a) for a in ["-c", 'model_provider="%s"' % raw]))
+    print("\n".join(lines))
+
+
+def _write_credential(o, var, verb, out_key):
+    """Write one secret into ~/.pervio/credentials.env (0600), which pervio-chat
+    sources — so a login made on the Mac reaches the non-interactive SSH
+    process Pervio starts. --clear removes it. Prints {out_key: present}."""
+    kv = _read_env_file(CRED)
+    if o.get("clear"):
+        kv.pop(var, None)
+    else:
+        try:
+            tok = base64.b64decode(o.get("b64", "")).decode("utf-8").strip()
+        except Exception:
+            _die("%s needs --b64 <token> or --clear" % verb)
+        if not tok or any(c.isspace() for c in tok):
+            _die("%s: token looks wrong (empty or has spaces)" % verb, 4)
+        kv[var] = tok
+    os.makedirs(os.path.dirname(CRED), mode=0o700, exist_ok=True)
+    tmp = CRED + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        for k, v in kv.items():
+            f.write("%s=%s\n" % (k, shlex.quote(v)))
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, CRED)
+    print(json.dumps({out_key: bool(kv.get(var))}))
+
+
+def cmd_claude_token(o):
+    """CLAUDE_CODE_OAUTH_TOKEN from `claude setup-token`."""
+    _write_credential(o, "CLAUDE_CODE_OAUTH_TOKEN", "claude-token", "claudeToken")
+
+
+# ---------- Cursor: log in to the agent's FILE credential store ----------
+# `agent login` keeps its tokens in the macOS keychain, which an SSH session
+# finds locked; the agent's file store (AGENT_CLI_CREDENTIAL_STORE=file →
+# ~/.cursor/auth.json, 0600) has no such problem, and pervio-chat runs on it
+# whenever that file exists. Logging in to it is: start `agent login` with the
+# browser suppressed, hand the link it prints to the phone, let the person sign
+# in there, and watch the log for "Logged in as …" (2026-10-16).
+
+LOGIN_DIR = os.path.join(HOME, ".pervio", "cache")
+LOGIN_LOG = os.path.join(LOGIN_DIR, "cursor-login.log")
+LOGIN_PID = os.path.join(LOGIN_DIR, "cursor-login.pid")
+AUTH_FILE = os.path.join(HOME, ".cursor", "auth.json")
+
+
+def _cursor_agent():
+    import glob, shutil
+    for name in ("agent", "cursor-agent"):
+        p = shutil.which(name)
+        if p:
+            return p
+        for d in (os.path.join(HOME, ".local", "bin"), "/opt/homebrew/bin", "/usr/local/bin"):
+            c = os.path.join(d, name)
+            if os.access(c, os.X_OK):
+                return c
+    found = sorted(glob.glob(os.path.join(HOME, ".local", "share", "cursor-agent", "versions", "*", "cursor-agent")))
+    return found[-1] if found else ""
+
+
+def _login_pid():
+    try:
+        pid = int(open(LOGIN_PID).read().strip())
+        os.kill(pid, 0)
+        return pid
+    except (OSError, ValueError):
+        return 0
+
+
+def _login_state():
+    try:
+        log = open(LOGIN_LOG, encoding="utf-8", errors="replace").read()
+    except OSError:
+        log = ""
+    log = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", log)
+    lines = [l.strip() for l in log.splitlines() if l.strip()]
+    url = next((m.group(0) for m in re.finditer(r"https://\S+", log)), "")
+    ok = re.search(r"Logged in as (\S+)", log)
+    try:
+        login = os.path.getsize(AUTH_FILE) > 0
+    except OSError:
+        login = False
+    st = {"state": "idle", "url": url, "account": "", "error": "", "login": login}
+    if ok:
+        st["state"], st["account"] = "done", ok.group(1)
+    elif _login_pid():
+        st["state"] = "waiting"
+    elif lines:
+        st["state"], st["error"] = "failed", lines[-1][:300]
+    return st
+
+
+def _login_cancel():
+    pid = _login_pid()
+    if pid:
+        try:
+            os.killpg(pid, 15)
+        except OSError:
+            try:
+                os.kill(pid, 15)
+            except OSError:
+                pass
+    for f in (LOGIN_PID, LOGIN_LOG):
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+
+
+def cmd_cursor_login(o):
+    """--start: launch `agent login` (file store, no browser) and print the link
+    once it appears; --status: where it stands; --cancel: stop a waiting one.
+    One JSON: {state: idle|waiting|done|failed, url, account, error, login}."""
+    import subprocess, time
+    if o.get("status"):
+        print(json.dumps(_login_state()))
+        return
+    if o.get("cancel"):
+        _login_cancel()
+        print(json.dumps(_login_state()))
+        return
+    agent = _cursor_agent()
+    if not agent:
+        _die("cursor-login: cursor agent not found (install: curl https://cursor.com/install -fsS | bash)", 4)
+    _login_cancel()
+    os.makedirs(LOGIN_DIR, mode=0o700, exist_ok=True)
+    env = dict(os.environ, NO_OPEN_BROWSER="1", AGENT_CLI_CREDENTIAL_STORE="file")
+    with open(LOGIN_LOG, "w") as logf:
+        p = subprocess.Popen([agent, "login"], stdin=subprocess.DEVNULL, stdout=logf, stderr=subprocess.STDOUT,
+                             env=env, start_new_session=True)
+    with open(LOGIN_PID, "w") as f:
+        f.write(str(p.pid))
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        st = _login_state()
+        if st["url"] or st["state"] in ("done", "failed"):
+            break
+        if p.poll() is not None:
+            time.sleep(0.2)
+            st = _login_state()
+            break
+        time.sleep(0.2)
+    st = _login_state()
+    if st["state"] == "waiting" and not st["url"]:
+        _login_cancel()
+        st = {"state": "failed", "url": "", "account": "", "error": "agent login printed no link within 20s", "login": st["login"]}
+    print(json.dumps(st))
+
+
+def cmd_cursor_key(o):
+    """CURSOR_API_KEY for Cursor's `agent`: its `agent login` keeps the login
+    in the macOS keychain, which an SSH session usually finds LOCKED ("Run
+    security unlock-keychain and try again" — a tester's second turn,
+    2026-10-16). An API key from cursor.com needs no keychain at all."""
+    _write_credential(o, "CURSOR_API_KEY", "cursor-key", "cursorKey")
+
+
+def main():
+    if len(sys.argv) < 2:
+        _die("usage: pervio-provider list|presets|add|refresh|remove|shell|claude-token …")
+    cmd, argv = sys.argv[1], sys.argv[2:]
+    o = _parse(argv, {"b64", "name", "engine"})
+    {"list": cmd_list, "presets": cmd_presets, "add": cmd_add, "refresh": cmd_refresh, "remove": cmd_remove,
+     "shell": cmd_shell, "claude-token": cmd_claude_token,
+     "cursor-key": cmd_cursor_key, "cursor-login": cmd_cursor_login}.get(cmd, lambda _o: _die("unknown command: %s" % cmd))(o)
+
+
+if __name__ == "__main__":
+    main()

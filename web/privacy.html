@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pervio — 隐私政策</title>
+<meta name="robots" content="noindex">
+<link rel="preload" href="assets/fonts/WixMadeforDisplay-latin.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="assets/fonts/WixMadeforText-latin.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="assets/fonts.css">
+<style>
+:root{--bg:#0E1017;--ink:#F4F1ED;--ink-2:#CACED4;--accent:#A0B0F4;--hair:rgba(244,241,237,.09);
+  --sans:"Wix Madefor Text zh","PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans CJK SC",ui-sans-serif,system-ui,sans-serif;--display:"Wix Madefor Display zh","PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans CJK SC",ui-sans-serif,system-ui,sans-serif;color-scheme:dark}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:var(--sans);-webkit-font-smoothing:antialiased;background:var(--bg);color:var(--ink);font-size:16px;line-height:1.8}
+main{max-width:680px;margin:0 auto;padding:72px 22px 96px}
+h1{font-size:28px;margin-bottom:8px}
+.date{color:var(--ink-2);font-size:13px;margin-bottom:40px}
+h1,h2{font-family:var(--display);font-weight:600;letter-spacing:-.008em;line-height:1.3}
+h2{font-size:19px;margin:36px 0 10px;color:var(--ink)}
+p,li{color:var(--ink-2)}
+ul{padding-left:20px}
+strong{color:var(--ink)}
+a{color:var(--accent);text-underline-offset:.2em}
+:focus-visible{outline:2px solid var(--accent);outline-offset:3px;border-radius:6px}
+code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.9em;color:var(--ink)}
+h1[id]{margin-top:8px}
+hr{border:0;border-top:1px solid var(--hair);margin:40px 0}
+</style>
+</head>
+<body>
+<main>
+<h1>隐私政策 · Privacy Policy</h1>
+<div class="date">2026-11-17 更新 · <a href="#en">English below</a></div>
+
+<h2>一句话</h2>
+<p><strong>Pervio 没有账号、没有遥测、没有崩溃上报，也没有广告或统计类的 SDK。</strong>对话、文件和任务只在你的手机和你自己的电脑之间传输。唯一经过 Pervio 服务器的东西是锁屏推送，下面写清楚它经手什么。</p>
+
+<h2>你的数据在哪里</h2>
+<ul>
+<li><strong>SSH 密钥和密码</strong>只保存在你手机的系统钥匙串里，仅用于连接你自己的电脑。服务器地址、用户名这类配置保存在 app 的本地设置里。</li>
+<li><strong>对话、文件与工作流内容</strong>存在你自己的电脑上，经手机与电脑之间的 SSH 加密连接传输，不经过 Pervio 的任何服务器。</li>
+<li><strong>第三方模型的 API key</strong>（如果你添加了供应商）写在你电脑的 <code>~/.pervio/providers/</code> 里，手机不保存。</li>
+<li><strong>手机本地</strong>只有服务器配置、界面偏好和缓存（例如图片），卸载 app 即清除。</li>
+</ul>
+
+<h2>锁屏推送：唯一经过我们的一段</h2>
+<p>苹果只接受由 app 所属开发者的密钥签名的推送，所以这把密钥不可能放在你的电脑上。做法是：</p>
+<ul>
+<li>手机把自己的<strong>推送 token</strong>经 SSH 交给你的电脑，存在电脑上。</li>
+<li>需要提醒你时，你的电脑把这条通知写好，连同 token 发给 Pervio 的推送中继 <code>push.pervio.dev</code>；中继签名后转交 Apple 推送服务（APNs），由 Apple 送到你的手机。</li>
+<li><strong>中继经手的内容</strong>：推送 token、通知的标题和正文、灵动岛上的状态行，以及发送方的 IP 地址。通知正文可能包含任务或对话的名字、回复开头的几十个字、当前步骤的说明（例如正在处理的文件名）。</li>
+<li><strong>中继不保存通知内容。</strong>它的日志每条只有 token 的前 8 位、推送类型和 Apple 返回的状态码；限流计数（按 token、按来源地址）只在内存里，不写日志、不落盘，重启即清零。中继的代码在开源仓库的 <code>server/gateway/</code>。</li>
+<li><strong>不想经过中继</strong>：在电脑上把 <code>off</code> 写进 <code>~/.pervio/push/gateway</code>，电脑就不再向中继发任何东西，锁屏推送随之关闭（app 在前台时仍有本地提醒）。</li>
+<li><strong>自己从源码编译的版本</strong>：中继推不到它，但电脑默认仍会把通知发给中继——请同样写上 <code>off</code>，或按仓库里的 <code>docs/apns.md</code> 配自己的推送密钥；配了之后，通知由你的电脑直接交给 Apple，不经过中继。</li>
+</ul>
+
+<h2>我们能看到什么</h2>
+<p>除了上面推送中继转发时经手的内容，什么也看不到。应用内没有任何打点、分析或日志回传。通过 TestFlight 安装时，Apple 会按它自己的规则向开发者提供崩溃报告和你主动提交的反馈。</p>
+
+<h2>第三方</h2>
+<p>应用驱动的 AI 工具（Claude Code、Codex、Cursor）运行在<strong>你自己的电脑</strong>上，受你与相应服务商的协议约束；Pervio 不代你调用、不中转、不留存。你用来组网的服务（例如 Tailscale）和 Apple 的推送服务，各自适用它们的隐私政策。</p>
+<p>app 自身只在两种情况下直接访问互联网：论文晨报里的配图，电脑上没有缓存时由手机直接向 arxiv.org 请求（对方会看到你的 IP 和这张图的地址）；网页预览里打开的页面如果引用了外部资源，由那个页面自己加载。app 用到的开源库列在仓库的 <code>THIRD_PARTY_NOTICES.md</code>，其中没有统计或广告组件。</p>
+
+<h2>代码开源</h2>
+<p>代码开源，包括手机 app、铺到你电脑上的脚本和推送中继，欢迎审计。</p>
+
+<hr>
+
+<h1 id="en">Privacy Policy</h1>
+<div class="date">Updated 2026-11-17</div>
+
+<h2>In one sentence</h2>
+<p><strong>Pervio has no account, no telemetry, no crash reporting and no advertising or analytics SDK.</strong> Conversations, files and tasks travel only between your phone and your own computer. The one thing that passes through a Pervio server is the lock-screen notification, described below.</p>
+
+<h2>Where your data lives</h2>
+<ul>
+<li><strong>SSH keys and passwords</strong> are stored only in the Keychain of your phone and used only to connect to your own computer. Server addresses, user names and similar settings are kept in the app's local preferences.</li>
+<li><strong>Conversations, files and workflow content</strong> stay on your own computer and travel over the encrypted SSH connection between your phone and that computer. They do not pass through any Pervio server.</li>
+<li><strong>API keys for third-party model providers</strong>, if you add one, are written to <code>~/.pervio/providers/</code> on your computer. The phone does not keep them.</li>
+<li><strong>On the phone</strong> there are only your server entries, interface preferences and caches (images, for example). Deleting the app removes them.</li>
+</ul>
+
+<h2>Lock-screen notifications: the one part that passes through us</h2>
+<p>Apple accepts a notification only when it is signed with a key that belongs to the app's developer, so that key cannot live on your computer. Instead:</p>
+<ul>
+<li>Your phone hands its <strong>push token</strong> to your computer over SSH; it is stored there.</li>
+<li>When there is something to tell you, your computer writes the notification and sends it with the token to Pervio's push relay, <code>push.pervio.dev</code>. The relay signs it and passes it to the Apple Push Notification service, which delivers it.</li>
+<li><strong>What the relay handles</strong>: the push token, the notification's title and text, the status line shown in the Dynamic Island, and the sender's IP address. The text may contain the name of a task or conversation, the first words of a reply, or a description of the current step (the name of a file being worked on, for example).</li>
+<li><strong>The relay does not store notification content.</strong> Each log line holds the first 8 characters of the token, the kind of push and the status Apple returned; rate-limit counters (per token and per source address) exist only in memory — never in a log or on disk — and a restart clears them. The relay's code is in the open-source repository under <code>server/gateway/</code>.</li>
+<li><strong>To keep the relay out of it</strong>: write <code>off</code> into <code>~/.pervio/push/gateway</code> on your computer. The computer then sends nothing to the relay, and lock-screen notifications stop (the app still notifies locally while it is open).</li>
+<li><strong>A build you compile yourself</strong> cannot be reached by the relay, but your computer would by default still send notifications to it — write <code>off</code> as above, or set up your own push key as described in <code>docs/apns.md</code> in the repository; with your own key the computer hands notifications to Apple directly and the relay is not involved.</li>
+</ul>
+
+<h2>What we can see</h2>
+<p>Nothing beyond what the push relay handles while forwarding. The app contains no analytics, tracking or log upload. When you install through TestFlight, Apple shares crash reports and any feedback you choose to send with the developer, under Apple's own rules.</p>
+
+<h2>Third parties</h2>
+<p>The AI tools the app drives (Claude Code, Codex, Cursor) run on <strong>your own computer</strong> under your agreement with each vendor; Pervio does not call them on your behalf, relay them, or keep anything. The network service you use to reach your computer (Tailscale, for example) and Apple's push service apply their own privacy policies.</p>
+<p>The app itself goes to the internet in two cases only: a figure in a paper digest is requested from arxiv.org when your computer has no cached copy (arxiv.org sees your IP address and which figure), and a page you open in Web preview loads whatever outside resources that page refers to. The open-source libraries the app uses are listed in <code>THIRD_PARTY_NOTICES.md</code> in the repository; none of them is an analytics or advertising component.</p>
+
+<h2>Open to inspection</h2>
+<p>The code is open source: the phone app, the scripts laid down on your computer, and the push relay.</p>
+
+<hr>
+<p>问题或建议 · Questions：<a href="./support.html">支持页 / Support</a>。</p>
+</main>
+</body>
+</html>

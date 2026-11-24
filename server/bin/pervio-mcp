@@ -1,0 +1,1243 @@
+#!/usr/bin/env python3
+"""pervio-mcp — stdio MCP server exposing the Pervio orchestration layer as tools.
+
+pervio-chat (claude branch, pervio_ctx on) mounts this per-session as service
+`perviotools` (tool names mcp__perviotools__<tool>), replacing the prose
+pointer: the agent CALLS the orchestration layer instead of re-reading a brief
+and shelling out. The seven read-only tools go on the session's --allowedTools
+(no approval friction); the four write/spend tools (pervio_start, pervio_rerun,
+pervio_schedule, pervio_feedback) are NOT allowlisted, so they fall into the
+existing approval flow (phone Allow/Deny) automatically. Machine sub-agents
+(PERVIO_WF_ID set) get neither the pointer nor this mount — enforced in
+pervio-chat, not here.
+
+Protocol: line-delimited JSON-RPC on stdio, envelope mirrored field-for-field
+from pervio-approve (the repo's proven MCP implementation):
+  initialize  -> {protocolVersion, capabilities:{tools:{}}, serverInfo}
+  tools/list  -> {tools:[{name, description, inputSchema}]}
+  tools/call  -> ok:    {content:[{type:"text",text:<json string>}]}
+                 error: {content:[{type:"text",text:<message>}], isError:true}
+Unknown methods get a JSON-RPC error; notifications/* get no response; a bad
+stdin line never exits the process. Unlike pervio-approve there is no FIFO to
+block on, so tools/call runs synchronously on the main loop (no threads).
+
+NOTHING one message does may end the loop: a live mount that dies takes all 11
+tools out of an in-flight chat with no error the client can render. So every
+field is shape-checked before use — non-object message, non-string method,
+non-object params (a batch array included) draw -32600 at the message's own id
+(id null when it hasn't got a usable one) — and _dispatch additionally runs
+inside a per-message boundary that answers -32603 rather than unwinding.
+
+Subprocess layer: tools shell out to the sibling pervio-orchestrate /
+pervio-feedback / pervio-sessions (the two session tools, pervio_sessions and
+pervio_transcript, are read-only passthroughs over that CLI's projects / list /
+transcript verbs), falling back to ~/.pervio/bin when no sibling exists — the
+same resolution pervio-chat uses for pervio-approve. 60s timeout (start: 120s),
+each child in its OWN session with killpg on timeout (the _call_gated pattern
+from pervio-orchestrate) so a hung child leaves no zombies behind.
+
+Dynamic named tools (F3): besides the static tools above, every template file
+under ~/.pervio/templates whose WRAPPER opts in with "expose": true (wrapper-only
+— a bare-spec template has no wrapper to declare on, so it cannot expose) becomes
+one tool "pervio_run_<slug>" (slug: required wrapper field, ^[a-z][a-z0-9_]{0,31}$).
+Its inputSchema is generated from the wrapper's "params" declaration (string/
+integer/boolean, required per declaration) plus an ever-present optional "dir"
+that overrides spec.dir. The scan happens FRESH on every tools/list AND every
+tools/call (the chat can rewrite templates concurrently; resolve-at-use keeps
+both views consistent with the same disk state). A template with expose but a
+bad slug / bad params declaration is skipped with one stderr line, never
+breaking the rest; at most 20 named tools, first-by-filename. tools/call
+validates the arguments against the declaration (unknown / missing-required /
+type mismatch -> isError; defaults fill in), then launches via orchestrate
+start --spec-b64 + --params-b64 and returns {wfId}. Named tools SPEND MODEL
+QUOTA and are deliberately NOT on pervio-chat's read-only allowlist — like
+pervio_start they ride the approval flow.
+
+Playbooks: a template with kind=="playbook" is conversation methodology, not a
+runnable spec. pervio_templates passes its kind/body through verbatim (there is
+no spec to strip); pervio_start by its name refuses with "playbook cannot be
+started as a workflow — load it into a conversation" (spec_b64 / rerun /
+schedule paths surface orchestrate's identical gate); the named-tool scan skips
+it — expose:true earns one stderr line, never a tool.
+
+Read-only mount (X1): with PERVIO_MCP_RO in the environment (pervio-chat's codex
+branch mounts the server per-invocation with =1), the surface shrinks to the
+seven read-only tools, SERVER-enforced: tools/list serves only those seven (the
+four write verbs are unlisted and the pervio_run_* scan is skipped entirely —
+named tools always spend), and tools/call refuses every write verb and every
+pervio_run_*-shaped name with isError "read-only mount: <name> unavailable",
+deliberately distinct from the unknown-tool error so a policy denial never
+reads as a typo. This gate exists because codex has NO approval mechanism
+(no --permission-prompt-tool / allowlist): every mounted tool is callable
+un-confirmed, so allowlisting-at-the-client is not a boundary there — spend
+must be unreachable AT THE SERVER. Without the env, behavior is byte-for-byte
+the full surface described above.
+"""
+import base64
+import binascii
+import hashlib
+import json
+import os
+import re
+import signal
+import stat
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+WF = os.path.join(HOME, ".pervio", "wf")
+TPL = os.path.join(HOME, ".pervio", "templates")
+SELF_DIR = os.path.dirname(os.path.realpath(__file__))
+
+TIMEOUT = 60.0            # every subprocess call …
+START_TIMEOUT = 120.0     # … except `orchestrate start` (spawns the detached runner)
+RUN_ID = re.compile(r"^[a-z0-9]{12}$")
+SLUG_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")        # wrapper "slug" -> pervio_run_<slug>
+PARAM_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,23}$")  # wrapper params[].name
+PARAM_TYPES = ("string", "integer", "boolean")
+DYN_PREFIX = "pervio_run_"
+DYN_CAP = 20              # named tools, first-by-filename; the rest logged + skipped
+TRANSCRIPT_CAP = 60000    # pervio_transcript: total serialized chars returned
+
+# Read-only mount (X1). ANY non-empty value flips the gate — fail closed: a
+# mounter that sets the env at all clearly wants read-only, and "=0 means
+# writable" would be a foot-gun on a server whose whole point is that the
+# CLIENT side (codex) cannot gate anything. Unset = the full surface, verbatim.
+RO_MODE = bool(os.environ.get("PERVIO_MCP_RO"))
+
+# ---------- the ceiling: a workflow started from a conversation does no more than it ----------
+# A turn steered by something it read — a web page, a file in a repository —
+# must not come out of these tools with more than its conversation had: not a
+# step with more permission, not another directory, not a shell line nobody
+# was shown, not a schedule that fires for good (security review 2026-11-18 #2;
+# the routes that still went round it, 2026-11-22 #1 and #2).
+#
+# pervio-chat says which permission mode the conversation runs in
+# (PERVIO_MCP_CEILING), its directory (PERVIO_MCP_DIR) and, when the phone is
+# asked before a call runs, the approval channel's id (PERVIO_SID) — all
+# written into the MCP config, where a turn cannot reach them.
+#
+# EVERY way a workflow leaves here goes through the same two steps, on the
+# workflow AS IT WOULD RUN (the template looked up, a directory override
+# applied, parameters filled in, the result validated by `orchestrate resolve`
+# — the same code `start` runs):
+#
+#   1. _hold_to_ceiling.
+#      * plan (read-only) starts and schedules nothing.
+#      * No step holds more power than the conversation — the scale is
+#        _pervio_lib.tier_power's: 0 read (plan, default, read-only), 1 write
+#        (acceptEdits, auto, workspace-write), 2 full.
+#      * Where nobody is shown the call first (auto, dontAsk), what the MODEL
+#        chose stays inside the conversation:
+#          - a spec it wrote, or a past run it picked to run again: no shell
+#            lines (command steps, setup, verify, a report's actions — they run
+#            outside any sandbox), nothing published, and every directory —
+#            the one a missing `dir` would fall back to included — inside the
+#            conversation's own;
+#          - a saved template (by name, or through its named tool): the model
+#            chose only WHICH one, perhaps a directory and the declared
+#            parameters, so the directory it would run in must be the one the
+#            template was saved with, or inside the conversation's. The
+#            template's own shell lines and directory are the person's: running
+#            their saved workflows is what switching these tools on is for.
+#            (A turn that can write a file into ~/.pervio/templates unasked can
+#            write ~/.zshrc as well; that is not a line this file can hold.)
+#      * bypassPermissions is the person's own "ask me nothing": no ceiling.
+#   2. _take_shown, where the phone is asked (default, acceptEdits): the
+#      approval tool (pervio-approve) asks this file what the call would run
+#      (`pervio-mcp --resolve`), sends THAT to the phone's sheet, and on Allow
+#      leaves a one-use token named by its hash. The start goes ahead only if
+#      what it is about to run hashes to a token: what was approved is what
+#      runs, and a template edited between the tap and the start is refused.
+#
+# Unset (an older pervio-chat, a direct caller) = no ceiling, as before.
+CEILING = os.environ.get("PERVIO_MCP_CEILING", "")
+CEILING_DIR = os.environ.get("PERVIO_MCP_DIR", "")
+SID = os.environ.get("PERVIO_SID", "")
+SHOWN_TTL = 300.0             # seconds an Allow stays good for (the start follows it at once)
+_POWER_CLAUDE = {"plan": 0, "default": 0, "acceptEdits": 1, "dontAsk": 1, "auto": 1,
+                 "bypassPermissions": 2}
+_POWER_CODEX = {"read-only": 0, "workspace-write": 1, "danger-full-access": 2}
+_PHONE_IS_ASKED = ("default", "acceptEdits")      # pervio-chat's approval path
+MODEL, TEMPLATE = "model", "template"             # who chose what the workflow does
+
+
+def _ceiling_power():
+    """None = no ceiling in force."""
+    if not CEILING:
+        return None
+    p = _POWER_CLAUDE.get(CEILING, 0)             # an unknown mode is held to the least
+    return None if p >= 2 else p
+
+
+def _step_tier(s):
+    """(the step's own word for its permission, its power). A word this file
+    does not know counts as full power — refused, not waved through."""
+    if (s.get("backend") or "claude") == "codex":
+        tier = s.get("sandbox", "workspace-write")
+        return tier, _POWER_CODEX.get(tier, 2)
+    tier = s.get("perm", "default")
+    return tier, _POWER_CLAUDE.get(tier, 2)
+
+
+def _shell_lines(spec):
+    """Every place a spec carries a line this Mac's shell would run."""
+    out = []
+    def take(where, v):
+        if isinstance(v, str) and v.strip():
+            out.append(where)
+    take("setup", spec.get("setup"))
+    for s in spec.get("steps") or []:
+        if isinstance(s, dict):
+            for k in ("command", "setup", "verify"):
+                take("step %s: %s" % (s.get("id"), k), s.get(k))
+    for a in spec.get("actions") or []:
+        if isinstance(a, dict):
+            take("actions: run", a.get("run"))
+    return out
+
+
+def _has_dir(d):
+    return isinstance(d, str) and bool(d.strip())
+
+
+def _outside_conversation(d, base=None):
+    """Is directory `d` outside the conversation's own? (False when the
+    conversation's directory is not known — nothing to measure against.)"""
+    if not CEILING_DIR or not _has_dir(d):
+        return False
+    root = os.path.realpath(os.path.expanduser(CEILING_DIR))
+    path = os.path.expanduser(d)
+    if not os.path.isabs(path):
+        path = os.path.join(os.path.expanduser(base) if base else root, path)
+    path = os.path.realpath(path)
+    return not (path == root or path.startswith(root.rstrip("/") + "/"))
+
+
+def _unasked():
+    """A ceiling is in force and nobody is shown the call before it runs."""
+    return _ceiling_power() is not None and CEILING not in _PHONE_IS_ASKED
+
+
+def _hold_to_ceiling(spec, origin=MODEL, saved_dir=None):
+    """Refuse (with words the model can pass on) a workflow that would do more
+    than the conversation it is started from. `spec` is the workflow as it
+    would run; `origin` says who chose its content (see the rules above), and
+    for a saved template `saved_dir` is the directory it was saved with."""
+    limit = _ceiling_power()
+    if limit is None:
+        return
+    if CEILING == "plan":
+        raise ToolError("this conversation is in plan mode (read-only), so it cannot start or "
+                        "schedule a workflow. The person can switch the conversation's mode, "
+                        "or start it from the Workflows page in the Pervio app.")
+    steps = [s for s in (spec.get("steps") or []) if isinstance(s, dict)]
+    over = ["%s (%s)" % (s.get("id"), _step_tier(s)[0]) for s in steps if _step_tier(s)[1] > limit]
+    if over:
+        raise ToolError(
+            "this conversation runs in %s mode; a workflow started from it may not give its steps "
+            "more power than that. Over the limit: %s. Allowed here: %s. The person can switch "
+            "the conversation's mode, or start the workflow from the Workflows page in the "
+            "Pervio app." % (CEILING, ", ".join(over),
+                             "perm plan/default or sandbox read-only" if limit == 0
+                             else "perm up to acceptEdits, sandbox up to workspace-write"))
+    if not _unasked():
+        return                                    # the phone's sheet shows the rest (_take_shown)
+    top = spec.get("dir")
+    if origin == TEMPLATE:
+        # The template's own content is the person's; the directory it would
+        # run in is the model's only if it is not the one it was saved with
+        # (an override, or a parameter that lands in `dir`).
+        if top != saved_dir and _outside_conversation(top if _has_dir(top) else "~"):
+            raise ToolError("this conversation runs in %s mode and works in %s; it cannot "
+                            "start a workflow in another directory (%s)."
+                            % (CEILING, CEILING_DIR, top if _has_dir(top) else "~"))
+        return
+    shell = _shell_lines(spec)
+    if shell:
+        raise ToolError(
+            "this conversation runs in %s mode, where nobody is shown a workflow before it starts; "
+            "one that runs shell lines on the Mac (%s) cannot be started from it. Leave them out, "
+            "or have the person start it from the Workflows page in the Pervio app."
+            % (CEILING, "; ".join(shell[:6])))
+    publishing = [str(s.get("id")) for s in steps if s.get("publish")]
+    if publishing:
+        # A published step's output is written by the Mac itself, outside any
+        # sandbox, to a directory the spec names (or to the archive shelf the
+        # home page reads) — a file nobody was shown, in a place nobody chose.
+        raise ToolError(
+            "this conversation runs in %s mode, where nobody is shown a workflow before it starts; "
+            "one that publishes (step %s) cannot be started from it. Leave `publish` out, or have "
+            "the person start it from the Workflows page in the Pervio app."
+            % (CEILING, ", ".join(publishing)))
+    base = top if _has_dir(top) else "~"          # what the runner falls back to
+    outside = [base] if _outside_conversation(base) else []
+    outside += [str(s.get("dir")) for s in steps if _outside_conversation(s.get("dir"), base)]
+    if outside:
+        raise ToolError(
+            "this conversation runs in %s mode and works in %s; a workflow started from it must "
+            "stay inside that directory. Outside it: %s."
+            % (CEILING, CEILING_DIR, ", ".join(sorted(set(outside)))))
+
+
+def _sha(spec, extra=None):
+    """The name of one exact request: the workflow as it would run, plus (for a
+    schedule) the fields saved beside it. Canonical JSON, so the approval tool
+    and this server compute the same thing in separate processes."""
+    blob = json.dumps({"spec": spec, "extra": extra}, sort_keys=True, ensure_ascii=False,
+                      separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+_NOT_SHOWN = ("this conversation asks the person on their phone before a workflow starts, and "
+              "what would run now is not what they were shown and allowed%s. Nothing was started. "
+              "Call the tool again to ask once more.")
+
+
+def _take_shown(spec, extra=None):
+    """Where the phone is asked: go ahead only on the token the approval tool
+    left for exactly this request, and use it up (one Allow, one start)."""
+    if _ceiling_power() is None or CEILING not in _PHONE_IS_ASKED:
+        return
+    if not re.match(r"^[A-Za-z0-9_-]{1,64}$", SID):
+        raise ToolError(_NOT_SHOWN % " (no approval channel)")
+    path = os.path.join(HOME, ".pervio", "chat", SID, "shown", _sha(spec, extra))
+    try:
+        st = os.lstat(path)
+    except OSError:
+        raise ToolError(_NOT_SHOWN % "")
+    try:
+        os.unlink(path)
+    except OSError:
+        raise ToolError(_NOT_SHOWN % "")          # someone else used it first
+    if not stat.S_ISREG(st.st_mode) or time.time() - st.st_mtime > SHOWN_TTL:
+        raise ToolError(_NOT_SHOWN % " (the approval is too old)")
+
+
+RO_TOOLS = ("pervio_list_runs", "pervio_ledger", "pervio_templates",
+            "pervio_archives", "pervio_schedules", "pervio_sessions",
+            "pervio_transcript")
+
+# Every tool description ends with this etiquette line (the agent should narrate,
+# not dump), and pervio_start additionally carries the spend warning verbatim.
+ETIQUETTE = "结果要用对话总结给用户,别只丢 JSON。"
+# Every named template tool carries the same spend warning pervio_start does.
+SPEND = "启动会消耗真实模型额度;调用前先用一句话向用户确认。"
+
+
+def _bin(name):
+    """Sibling binary first (repo checkout / deployed dir), else ~/.pervio/bin —
+    byte-for-byte the BIN_DIR fallback pervio-chat uses for pervio-approve."""
+    p = os.path.join(SELF_DIR, name)
+    return p if os.path.exists(p) else os.path.join(HOME, ".pervio", "bin", name)
+
+
+ORCH = _bin("pervio-orchestrate")
+FEEDBACK = _bin("pervio-feedback")
+SESSIONS = _bin("pervio-sessions")
+
+
+def _send(obj):
+    """One JSON-RPC message to stdout (mirrors pervio-approve's _send; single
+    thread here, so no lock needed). Tolerant of a closed pipe."""
+    try:
+        sys.stdout.write(json.dumps(obj) + "\n")
+        sys.stdout.flush()
+    except (BrokenPipeError, ValueError):
+        pass
+
+
+class ToolError(Exception):
+    """A tool-level failure -> MCP isError result (never a dead server)."""
+
+
+class _RawText(str):
+    """A tool result that is ALREADY the wire text: _handle_call ships it
+    verbatim instead of json.dumps-ing it again. Used by pervio_transcript's
+    total-size cap, whose cut lands mid-JSON — re-encoding would double-quote
+    the payload instead of showing the truncated transcript + marker."""
+
+
+def _run(cmd, timeout):
+    """Run a subprocess in its OWN session; on timeout killpg the whole group
+    (pervio-orchestrate's _call_gated pattern — no lingering grandchildren).
+    Returns stdout text; raises ToolError on timeout / non-zero exit."""
+    try:
+        p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, start_new_session=True)
+    except OSError as e:
+        raise ToolError("cannot run %s: %s" % (os.path.basename(cmd[1]), e))
+    try:
+        out_b, err_b = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+        except OSError:
+            p.kill()
+        try:
+            p.communicate(timeout=5)
+        except (subprocess.SubprocessError, OSError):
+            pass
+        raise ToolError("%s timed out (>%ds)" % (os.path.basename(cmd[1]), int(timeout)))
+    if p.returncode != 0:
+        tail = (err_b or b"").decode("utf-8", "replace").strip()[-300:]
+        raise ToolError("%s exit %d: %s" % (os.path.basename(cmd[1]), p.returncode,
+                                            tail or "failed"))
+    return (out_b or b"").decode("utf-8", "replace")
+
+
+def _orch_json(args, timeout=TIMEOUT):
+    """pervio-orchestrate <args>, stdout parsed as JSON."""
+    out = _run([sys.executable, ORCH] + args, timeout)
+    try:
+        return json.loads(out)
+    except ValueError:
+        raise ToolError("unparseable output from pervio-orchestrate %s: %s"
+                        % (args[0], out[:200]))
+
+
+def _int_arg(args, key, default, lo, hi):
+    """Integer argument, clamped to [lo, hi]. bool is rejected (int subclass);
+    an integral float (some clients send 20.0) is tolerated."""
+    v = args.get(key, default)
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or v != int(v):
+        raise ToolError("%s must be an integer" % key)
+    return max(lo, min(int(v), hi))
+
+
+# ---------- read-only tools (allowlisted by pervio-chat) ----------
+
+def t_list_runs(args):
+    limit = _int_arg(args, "limit", 20, 1, 100)
+    return _orch_json(["list"])[:limit]         # fields pass through verbatim
+
+
+def t_ledger(args):
+    run_id = args.get("runId")
+    if not isinstance(run_id, str) or not RUN_ID.match(run_id):
+        raise ToolError("runId must match ^[a-z0-9]{12}$")
+    cap = _int_arg(args, "output_chars", 2000, 0, 20000)
+    path = os.path.join(WF, run_id, "ledger.json")
+    try:
+        with open(path, "r", errors="replace") as f:
+            led = json.load(f)
+    except FileNotFoundError:
+        raise ToolError("no such run: %s" % run_id)
+    except (OSError, ValueError) as e:
+        raise ToolError("unreadable ledger for %s: %s" % (run_id, str(e)[:200]))
+    for s in led.get("steps") or []:
+        if not isinstance(s, dict):
+            continue
+        out = s.get("output")
+        if isinstance(out, str) and len(out) > cap:
+            s["output"] = out[:cap] + "…[truncated %d chars]" % (len(out) - cap)
+        # A failed agent step stores the model's FULL final message in `error`
+        # (uncapped upstream, unlike output) — the same cap must apply.
+        err = s.get("error")
+        if isinstance(err, str) and len(err) > cap:
+            s["error"] = err[:cap] + "…[truncated %d chars]" % (len(err) - cap)
+    return led
+
+
+def t_templates(args):
+    items = _orch_json(["templates", "list"])
+    if args.get("include_spec"):
+        return items
+    # default: metadata only — the spec bodies are big and rarely needed to browse
+    return [{k: v for k, v in it.items() if k != "spec"} if isinstance(it, dict) else it
+            for it in items]
+
+
+def t_archives(args):
+    items = _orch_json(["archives", "list"])
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        files = it.get("files") or []
+        it["filesTotal"] = len(files)
+        it["files"] = files[:10]
+    return items
+
+
+def t_schedules(args):
+    return _orch_json(["schedule", "list"])     # verbatim
+
+
+def _sessions_json(cli_args, timeout=TIMEOUT):
+    """pervio-sessions <args>, stdout parsed as JSON (read-only CLI)."""
+    out = _run([sys.executable, SESSIONS] + cli_args, timeout)
+    try:
+        return json.loads(out)
+    except ValueError:
+        raise ToolError("unparseable output from pervio-sessions %s: %s"
+                        % (cli_args[0], out[:200]))
+
+
+def t_sessions(args):
+    d = args.get("dir")
+    if d is None:
+        return _sessions_json(["projects"])     # projects with sessions, verbatim
+    if not isinstance(d, str) or not d.strip():
+        raise ToolError("dir must be a non-empty string (a path from pervio_sessions)")
+    return _sessions_json(["list", "--dir", d])
+
+
+def t_transcript(args):
+    d = args.get("dir")
+    if not isinstance(d, str) or not d.strip():
+        raise ToolError("dir is required (the project path from pervio_sessions)")
+    sid = args.get("session")
+    if not isinstance(sid, str) or not sid.strip():
+        raise ToolError("session is required (the session id from pervio_sessions)")
+    limit = _int_arg(args, "limit", 40, 1, 200)
+    cmd = ["transcript", "--dir", d, "--session", sid, "--limit", str(limit)]
+    backend = args.get("backend")
+    if backend is not None:
+        if not isinstance(backend, str) or not backend.strip():
+            raise ToolError("backend must be a non-empty string")
+        cmd += ["--backend", backend]
+    turns = _sessions_json(cmd)
+    # Passthrough with a TOTAL-size cap (ledger truncation style): one giant
+    # turn must not blow up the calling conversation's context.
+    s = json.dumps(turns, ensure_ascii=False)
+    if len(s) > TRANSCRIPT_CAP:
+        return _RawText(s[:TRANSCRIPT_CAP]
+                        + "…[truncated %d chars]" % (len(s) - TRANSCRIPT_CAP))
+    return turns
+
+
+# ---------- write / spend tools (NOT allowlisted -> approval flow) ----------
+
+def _b64_json(obj):
+    """A python object as the base64(JSON) the orchestrate CLI's --b64/--spec-b64
+    flags take (start / schedule add / schedule update all share the envelope)."""
+    return base64.b64encode(
+        json.dumps(obj, ensure_ascii=False).encode("utf-8")).decode("ascii")
+
+
+def _launch(spec):
+    """orchestrate start on a workflow already resolved (_final): the last line
+    of stdout parsed to {wfId} — the one launch behind pervio_start,
+    pervio_rerun and the named template tools."""
+    out = _run([sys.executable, ORCH, "start", "--spec-b64", _b64_json(spec)], START_TIMEOUT)
+    try:
+        return {"wfId": json.loads(out.strip().splitlines()[-1])["wfId"]}
+    except (ValueError, KeyError, IndexError):
+        raise ToolError("start did not return a wfId: %s" % out[:200])
+
+
+def _final(spec, params=None):
+    """The workflow as `orchestrate start` would run it: parameters filled in
+    (and the leftover-placeholder probe run), the result validated — asked of
+    orchestrate itself, so there is one answer to "what would run"."""
+    cmd = [sys.executable, ORCH, "resolve", "--spec-b64", _b64_json(spec)]
+    if params is not None:
+        cmd += ["--params-b64", _b64_json(params)]
+    out = _run(cmd, TIMEOUT)
+    try:
+        final = json.loads(out.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        raise ToolError("unparseable output from pervio-orchestrate resolve: %s" % out[:200])
+    if not isinstance(final, dict):
+        raise ToolError("pervio-orchestrate resolve did not return a spec")
+    return final
+
+
+def _spec_from_b64(spec_b64):
+    """A spec the model submits. Decoded strictly — padding, alphabet, no stray
+    whitespace — and re-encoded from the parsed object before anything else
+    reads it: the phone's sheet and the runner are both handed OUR bytes, never
+    two readings of the model's (a lenient decoder here used to accept what
+    the phone could not read, and the sheet then showed only a size)."""
+    if not isinstance(spec_b64, str) or not spec_b64.strip():
+        raise ToolError("spec_b64 must be a base64 string")
+    try:
+        spec = json.loads(base64.b64decode(spec_b64, validate=True).decode("utf-8"))
+    except (binascii.Error, ValueError) as e:
+        raise ToolError("spec_b64 is not base64(JSON): %s" % str(e)[:200])
+    if not isinstance(spec, dict):
+        raise ToolError("spec_b64 must decode to a spec JSON object")
+    return spec
+
+
+def _own_spec(spec_b64):
+    """The model's own spec, as it would run from THIS conversation: left
+    without a directory, it works in the conversation's — not in the home
+    directory the runner would otherwise fall back to."""
+    spec = _spec_from_b64(spec_b64)
+    if _ceiling_power() is not None and CEILING_DIR and not _has_dir(spec.get("dir")):
+        spec = dict(spec)
+        spec["dir"] = CEILING_DIR
+    return _final(spec)
+
+
+# Each _plan_* answers "what would this call run, and who chose it" without
+# running it: (the final spec, MODEL or TEMPLATE, the template's saved dir).
+# The tool itself and `--resolve` (the approval tool's question) share them.
+
+def _plan_start(args):
+    tpl = args.get("template")
+    spec_b64 = args.get("spec_b64")
+    if bool(tpl) == bool(spec_b64):
+        raise ToolError("give exactly one of template or spec_b64")
+    if not tpl:
+        return _own_spec(spec_b64), MODEL, None
+    if not isinstance(tpl, str):
+        raise ToolError("template must be a string")
+    items = _orch_json(["templates", "list"])
+    # Prefer a startable (non-playbook) entry: a playbook sharing a
+    # workflow's name must not shadow it into unstartability. The playbook
+    # refusal fires only when ONLY a playbook bears the name.
+    named = [it for it in items
+             if isinstance(it, dict) and it.get("ok") and it.get("name") == tpl]
+    match = next((it for it in named if it.get("kind") != "playbook"),
+                 named[0] if named else None)
+    if match is None:
+        names = [it.get("name") for it in items
+                 if isinstance(it, dict) and it.get("ok")]
+        raise ToolError("template %r not found; available: %s"
+                        % (tpl, ", ".join(names) or "(none)"))
+    if match.get("kind") == "playbook":
+        # A playbook has a body, not a spec — the same words orchestrate's
+        # own gate uses, so both doors refuse with one voice.
+        raise ToolError("playbook cannot be started as a workflow — "
+                        "load it into a conversation")
+    spec = match.get("spec")                # cmd_templates already unwrapped {name,summary,spec}
+    if not isinstance(spec, dict):
+        raise ToolError("template %r has no usable spec" % tpl)
+    saved_dir = spec.get("dir")
+    d = args.get("dir")
+    if d:
+        if not isinstance(d, str):
+            raise ToolError("dir must be a string")
+        spec = dict(spec)
+        spec["dir"] = d                     # orchestrate re-validates (no '..' etc.)
+    return _final(spec), TEMPLATE, saved_dir
+
+
+def _plan_rerun(args):
+    run_id = args.get("runId")
+    if not isinstance(run_id, str) or not RUN_ID.match(run_id):
+        raise ToolError("runId must match ^[a-z0-9]{12}$")
+    # `orchestrate spec --wf` returns the spec the run was started from,
+    # verbatim; an unknown runId surfaces its "no such workflow" here.
+    spec = _orch_json(["spec", "--wf", run_id])
+    if not isinstance(spec, dict) or not spec:
+        raise ToolError("run %s has no usable spec on disk" % run_id)
+    # Which past run to run again is the model's pick, and a past run may have
+    # been started with more than this conversation has: held as its own spec.
+    return _final(spec), MODEL, None
+
+
+def _go(plan, extra=None):
+    """The one way out: held to the ceiling, shown where the phone is asked."""
+    spec, origin, saved_dir = plan
+    _hold_to_ceiling(spec, origin, saved_dir)
+    _take_shown(spec, extra)
+    return spec
+
+
+def t_start(args):
+    return _launch(_go(_plan_start(args)))
+
+
+def t_rerun(args):
+    return _launch(_go(_plan_rerun(args)))
+
+
+_SCHEDULE_FIELDS = ("action", "id", "time", "days", "keepRuns", "enabled")
+
+
+def _plan_schedule(args):
+    """(action, the final spec or None, the fields the phone's sheet shows beside it)."""
+    action = args.get("action")
+    if action not in ("update", "pause", "resume", "delete", "create"):
+        raise ToolError("action must be one of update|pause|resume|delete|create")
+    if args.get("enabled") is not None and not isinstance(args.get("enabled"), bool):
+        # 1 is not `True`: it used to slip past "is this switching it on?" here
+        # and then be saved as on by the runner.
+        raise ToolError("enabled must be true or false")
+    if action == "create":
+        missing = [k for k in ("spec_b64", "time")
+                   if not isinstance(args.get(k), str) or not args.get(k).strip()]
+        if missing:
+            raise ToolError("create needs %s" % " and ".join(missing))
+    spec = None
+    if action == "create" or (action == "update" and args.get("spec_b64") is not None):
+        spec = _own_spec(args["spec_b64"])
+    extra = {k: args.get(k) for k in _SCHEDULE_FIELDS if args.get(k) is not None}
+    return action, spec, extra
+
+
+def t_schedule(args):
+    action, spec, extra = _plan_schedule(args)
+    if spec is not None:
+        _go((spec, MODEL, None), extra)
+    if action == "create":
+        payload = {"time": args["time"], "spec": spec}
+        for k in ("days", "keepRuns"):        # optional knobs pass through; the
+            if args.get(k) is not None:       # CLI validates shape/range
+                payload[k] = args[k]
+        if _unasked():
+            # Nobody was shown this before it was saved, and a schedule goes on
+            # firing after the conversation is gone: it waits, switched off,
+            # for the person to turn it on from the phone.
+            payload["enabled"] = False
+        made = _orch_json(["schedule", "add", "--b64", _b64_json(payload)])
+        if _unasked() and isinstance(made, dict):
+            made["note"] = ("saved PAUSED: this conversation runs in %s mode, so the person turns "
+                            "the schedule on themselves — Workflows → Schedules in the Pervio app."
+                            % CEILING)
+        return made
+    sid = args.get("id")
+    if not isinstance(sid, str) or not sid.strip():
+        raise ToolError("%s needs id (the id from pervio_schedules)" % action)
+    if action == "delete":
+        return _orch_json(["schedule", "remove", "--id", sid])
+    turning_on = action == "resume" or (action == "update" and args.get("enabled") is True)
+    if turning_on and _unasked():
+        raise ToolError("this conversation runs in %s mode and cannot switch a schedule on — the "
+                        "person does that themselves: Workflows → Schedules in the Pervio app."
+                        % CEILING)
+    paused_for_new_content = False
+    if action in ("pause", "resume"):
+        payload = {"id": sid, "enabled": action == "resume"}
+    else:                                     # update: only the given fields move
+        payload = {"id": sid}
+        if spec is not None:
+            payload["spec"] = spec
+        for k in ("time", "days", "keepRuns", "enabled"):
+            if args.get(k) is not None:
+                payload[k] = args[k]
+        if len(payload) == 1:
+            raise ToolError("update needs at least one of "
+                            "time/days/keepRuns/enabled/spec_b64")
+        if spec is not None and _unasked():
+            # New content under a clock somebody else armed would fire with
+            # nobody having seen it: the same update switches the schedule off
+            # (the runner applies that before it writes the spec).
+            payload["enabled"] = False
+            paused_for_new_content = True
+    out = _orch_json(["schedule", "update", "--b64", _b64_json(payload)])
+    if paused_for_new_content and isinstance(out, dict):
+        out["note"] = ("saved PAUSED: this conversation runs in %s mode, so a schedule whose "
+                       "workflow it replaced waits for the person to turn it on — Workflows → "
+                       "Schedules in the Pervio app." % CEILING)
+    return out
+
+
+def t_feedback(args):
+    arxiv_id = args.get("arxiv_id")
+    verdict = args.get("verdict")
+    if not isinstance(arxiv_id, str) or not arxiv_id.strip():
+        raise ToolError("arxiv_id is required")
+    if not isinstance(verdict, str) or not verdict.strip():
+        raise ToolError("verdict is required")
+    cmd = [sys.executable, FEEDBACK, "--id", arxiv_id, "--verdict", verdict]
+    note = args.get("note")
+    if note:
+        cmd += ["--note", str(note)]
+    out = _run(cmd, TIMEOUT)                    # its own whitelist validates id/verdict
+    try:
+        return json.loads(out)                  # {"ok":true,"line":…} passed through
+    except ValueError:
+        raise ToolError("unparseable output from pervio-feedback: %s" % out[:200])
+
+
+TOOLS = {
+    "pervio_list_runs": {
+        "fn": t_list_runs,
+        "description": "列出 Pervio 工作流运行记录(orchestrate list 原样,最近的在前)。" + ETIQUETTE,
+        "inputSchema": {"type": "object", "properties": {
+            "limit": {"type": "integer", "description": "最多返回条数,默认 20,上限 100"}},
+            "required": []},
+    },
+    "pervio_ledger": {
+        "fn": t_ledger,
+        "description": ("读取一次运行的 ledger(每步状态/输出/错误;超长输出会截断并标注)。"
+                        "runId 是 12 位 [a-z0-9]。") + ETIQUETTE,
+        "inputSchema": {"type": "object", "properties": {
+            "runId": {"type": "string", "pattern": "^[a-z0-9]{12}$"},
+            "output_chars": {"type": "integer",
+                             "description": "每步 output 保留的最大字符数,默认 2000,上限 20000"}},
+            "required": ["runId"]},
+    },
+    "pervio_templates": {
+        "fn": t_templates,
+        "description": ("列出工作流模板(默认只含元信息;include_spec=true 才带完整 spec)。"
+                        "用户提出重活(深度审计、批量调研等)时,先查这里有没有现成模板可启动。"
+                        ) + ETIQUETTE,
+        "inputSchema": {"type": "object", "properties": {
+            "include_spec": {"type": "boolean", "description": "true 时每项附完整 spec,默认 false"}},
+            "required": []},
+    },
+    "pervio_archives": {
+        "fn": t_archives,
+        "description": ("列出出版物(晨报等归档);每个出版物只带最近 10 期文件,"
+                        "filesTotal 为已知最近期数(服务端最多统计 90)。") + ETIQUETTE,
+        "inputSchema": {"type": "object", "properties": {}, "required": []},
+    },
+    "pervio_schedules": {
+        "fn": t_schedules,
+        "description": "列出定时任务(schedule list 原样)。" + ETIQUETTE,
+        "inputSchema": {"type": "object", "properties": {}, "required": []},
+    },
+    "pervio_sessions": {
+        "fn": t_sessions,
+        "description": ("列出对话会话(只读;出处是本服务器 Claude/Codex 的会话记录):"
+                        "不带 dir 列出有会话的项目(path/sessions);带 dir 列出该项目的"
+                        "会话(id/preview/backend)。") + ETIQUETTE,
+        "inputSchema": {"type": "object", "properties": {
+            "dir": {"type": "string",
+                    "description": "项目目录(pervio_sessions 不带 dir 时返回的 path);缺省则列项目"}},
+            "required": []},
+    },
+    "pervio_transcript": {
+        "fn": t_transcript,
+        "description": ("读取一段会话的文字记录(只读;dir 和 session 用 pervio_sessions "
+                        "查到的值;limit 取最近几轮,默认 40,上限 200;backend 可选 "
+                        "codex;超长会截断并标注)。引用内容时简要说明出处(哪个项目"
+                        "哪个会话)。") + ETIQUETTE,
+        "inputSchema": {"type": "object", "properties": {
+            "dir": {"type": "string", "description": "项目目录(pervio_sessions 里的 path)"},
+            "session": {"type": "string", "description": "会话 id(pervio_sessions 带 dir 时的 id)"},
+            "limit": {"type": "integer", "description": "最近几轮,默认 40,上限 200"},
+            "backend": {"type": "string", "description": "claude(默认)或 codex"}},
+            "required": ["dir", "session"]},
+    },
+    "pervio_start": {
+        "fn": t_start,
+        "description": ("启动一个工作流:template(按模板名)或 spec_b64(base64 的 spec JSON)"
+                        "二选一,不可同给;dir 非空时覆盖模板 spec.dir。返回 {wfId}。"
+                        "重型/长时任务(全库深度审计、多 agent 并行调研等)应优先启动服务器工作流,"
+                        "不要在对话内自己展开:手机对话的回合会随切页中断,工作流则在服务器独立"
+                        "运行,可关屏,有账本和监控页。"
+                        "启动会消耗真实模型额度;调用前先用一句话向用户确认。") + ETIQUETTE,
+        "inputSchema": {"type": "object", "properties": {
+            "template": {"type": "string", "description": "模板名(pervio_templates 里的 name)"},
+            "spec_b64": {"type": "string", "description": "base64 编码的 spec JSON"},
+            "dir": {"type": "string", "description": "覆盖模板 spec.dir(仅 template 模式)"}},
+            "required": []},
+    },
+    "pervio_rerun": {
+        "fn": t_rerun,
+        "description": ("重跑一次历史运行:按 runId(pervio_list_runs 里的 wfId)取回当次的"
+                        " spec 原样重启,返回 {wfId}。注意:publish 步骤写入的是今天的日期"
+                        "——重跑是补今天的刊,不是复刻当天那期。"
+                        "启动会消耗真实模型额度;调用前先用一句话向用户确认。") + ETIQUETTE,
+        "inputSchema": {"type": "object", "properties": {
+            "runId": {"type": "string", "pattern": "^[a-z0-9]{12}$",
+                      "description": "要重跑的运行 id(pervio_list_runs 里的 wfId)"}},
+            "required": ["runId"]},
+    },
+    "pervio_schedule": {
+        "fn": t_schedule,
+        "description": ("管理定时任务(写操作):action=update 按 id 原地改 time/days/"
+                        "keepRuns/enabled/spec_b64(只动给出的字段);pause/resume 暂停/恢复;"
+                        "delete 删除;create 新建(需 spec_b64+time,days/keepRuns 可选,"
+                        "首次触发是下一个到点,不会当场跑)。id 用 pervio_schedules 里的 id。"
+                        ) + ETIQUETTE,
+        "inputSchema": {"type": "object", "properties": {
+            "action": {"type": "string",
+                       "enum": ["update", "pause", "resume", "delete", "create"],
+                       "description": "update|pause|resume|delete|create"},
+            "id": {"type": "string", "description": "schedule id(create 以外必填)"},
+            "time": {"type": "string", "description": "HH:MM(24 小时制;create 必填)"},
+            "days": {"type": "array", "items": {"type": "integer"},
+                     "description": "ISO 周几 1-7 的数组,空/缺省=每天"},
+            "keepRuns": {"type": "integer", "description": "保留最近几次运行,默认 7"},
+            "enabled": {"type": "boolean", "description": "仅 update:启用开关"},
+            "spec_b64": {"type": "string",
+                         "description": "base64 的 spec JSON(create 必填,update 可选)"}},
+            "required": ["action"]},
+    },
+    "pervio_feedback": {
+        "fn": t_feedback,
+        "description": ("记录一篇论文的反馈(写入晨报记忆,同 id 重评会覆盖旧行)。"
+                        "verdict 须是 👍/👎/少看/多看 之一。") + ETIQUETTE,
+        "inputSchema": {"type": "object", "properties": {
+            "arxiv_id": {"type": "string", "description": "新式 arXiv id,如 2607.15610"},
+            "verdict": {"type": "string", "description": "👍/👎/少看/多看 之一"},
+            "note": {"type": "string", "description": "一句话备注,可省略"}},
+            "required": ["arxiv_id", "verdict"]},
+    },
+}
+
+
+# ---------- dynamic named tools (F3): one tool per exposed template ----------
+
+def _param_type_ok(ptype, v):
+    """Value-vs-declared-type check. bool first (int subclass); integer keeps
+    _int_arg's tolerance for integral floats (some clients send 3.0)."""
+    if ptype == "boolean":
+        return isinstance(v, bool)
+    if ptype == "integer":
+        return not isinstance(v, bool) and (
+            isinstance(v, int) or (isinstance(v, float) and v == int(v)))
+    return isinstance(v, str)
+
+
+def _valid_params(decl):
+    """Validate a wrapper's params declaration; returns a normalized list or
+    raises ValueError (the whole template is then skipped, with a stderr line —
+    a broken declaration must not break the other named tools)."""
+    if decl is None:
+        return []
+    if not isinstance(decl, list):
+        raise ValueError("params must be a list")
+    out, seen = [], set()
+    for i, p in enumerate(decl):
+        if not isinstance(p, dict):
+            raise ValueError("params[%d] must be an object" % i)
+        name = p.get("name")
+        if not isinstance(name, str) or not PARAM_NAME_RE.match(name):
+            raise ValueError("params[%d] name %r is invalid" % (i, name))
+        if name == "dir":                       # collides with the ever-present dir arg
+            raise ValueError("param name 'dir' is reserved")
+        if name in seen:
+            raise ValueError("duplicate param name %r" % name)
+        seen.add(name)
+        label = p.get("label")
+        if not isinstance(label, str) or not label.strip():
+            raise ValueError("param %r needs a label" % name)
+        desc = p.get("description")
+        if desc is not None and not isinstance(desc, str):
+            raise ValueError("param %r description must be a string" % name)
+        ptype = p.get("type", "string")
+        if ptype not in PARAM_TYPES:
+            raise ValueError("param %r type must be string|integer|boolean" % name)
+        req = p.get("required", False)
+        if not isinstance(req, bool):
+            raise ValueError("param %r required must be a boolean" % name)
+        norm = {"name": name, "label": label, "description": desc or "",
+                "type": ptype, "required": req}
+        if "default" in p:
+            if not _param_type_ok(ptype, p["default"]):
+                raise ValueError("param %r default doesn't match type %s" % (name, ptype))
+            # Normalize NOW: _param_type_ok tolerates an integral float (JSON
+            # 3.0) for integer params, but the default fills into values raw —
+            # explicit values get int()-coerced, so the default must match, or
+            # the tool's default path ships a float downstream (and the schema
+            # renders "默认 3.0").
+            norm["default"] = (int(p["default"]) if ptype == "integer"
+                               else p["default"])
+        out.append(norm)
+    return out
+
+
+def _dynamic_tools():
+    """Scan ~/.pervio/templates FRESH (every tools/list and every named
+    tools/call — the chat may rewrite templates concurrently; reading at use
+    time keeps list and call consistent with the same disk state). Wrapper files
+    with "expose": true become pervio_run_<slug> tools; bad slug / bad params /
+    duplicate name skip THAT template with one stderr line; filename order,
+    capped at DYN_CAP named tools. Returns an ordered dict name -> tool."""
+    tools = {}
+    try:
+        names = sorted(fn for fn in os.listdir(TPL) if fn.endswith(".json"))
+    except OSError:
+        return tools
+    over_cap = 0
+    for fn in names:
+        try:
+            with open(os.path.join(TPL, fn), "r", errors="replace") as f:
+                raw = json.load(f)
+        except (OSError, ValueError):
+            continue                            # broken JSON: cmd_templates already surfaces it
+        if not isinstance(raw, dict) or raw.get("expose") is not True:
+            continue
+        if raw.get("kind") == "playbook":
+            # A playbook loads into a conversation; it has nothing to RUN, so
+            # expose:true on one can never mint a pervio_run_* tool.
+            sys.stderr.write("pervio-mcp: %s: kind==playbook cannot be exposed "
+                             "as a named tool — skipped\n" % fn)
+            continue
+        if not isinstance(raw.get("spec"), dict):
+            # Only a WRAPPER can expose — a bare spec has no wrapper to declare on.
+            sys.stderr.write("pervio-mcp: %s: expose needs a {name,summary,spec} "
+                             "wrapper — skipped\n" % fn)
+            continue
+        slug = raw.get("slug")
+        if not isinstance(slug, str) or not SLUG_RE.match(slug):
+            sys.stderr.write("pervio-mcp: %s: expose without a valid slug "
+                             "(^[a-z][a-z0-9_]{0,31}$) — skipped\n" % fn)
+            continue
+        name = DYN_PREFIX + slug
+        if name in TOOLS or name in tools:      # first-by-filename wins a slug clash
+            sys.stderr.write("pervio-mcp: %s: tool name %s already taken — skipped\n"
+                             % (fn, name))
+            continue
+        try:
+            params = _valid_params(raw.get("params"))
+        except ValueError as e:
+            sys.stderr.write("pervio-mcp: %s: bad params declaration (%s) — skipped\n"
+                             % (fn, e))
+            continue
+        if len(tools) >= DYN_CAP:
+            over_cap += 1
+            continue
+        props = {}
+        for p in params:
+            d = p["label"] + ((":" + p["description"]) if p["description"] else "")
+            if "default" in p:
+                d += "(默认 %s)" % json.dumps(p["default"], ensure_ascii=False)
+            props[p["name"]] = {"type": p["type"], "description": d}
+        props["dir"] = {"type": "string", "description": "覆盖模板 spec.dir(可选)"}
+        summary = raw.get("summary")
+        summary = summary if isinstance(summary, str) and summary.strip() else \
+            str(raw.get("name") or slug)
+        tools[name] = {
+            "file": fn,
+            "spec": raw["spec"],
+            "params": params,
+            "description": summary + SPEND + ETIQUETTE,
+            "inputSchema": {"type": "object", "properties": props,
+                            "required": [p["name"] for p in params if p["required"]]},
+        }
+    if over_cap:
+        sys.stderr.write("pervio-mcp: %d exposed template(s) beyond the %d-named-tool "
+                         "cap — skipped\n" % (over_cap, DYN_CAP))
+    return tools
+
+
+def _plan_dynamic(name, args):
+    """What a named template tool would run: the template re-read from disk
+    (resolve-at-call), the arguments checked against the wrapper's declaration,
+    defaults filled, parameters substituted by orchestrate itself."""
+    tool = _dynamic_tools().get(name)
+    if tool is None:
+        raise ToolError("unknown tool: %r" % name)
+    decl = {p["name"]: p for p in tool["params"]}
+    unknown = sorted(k for k in args if k != "dir" and k not in decl)
+    if unknown:
+        raise ToolError("unknown parameter(s): %s (declared: %s)"
+                        % (", ".join(unknown), ", ".join(decl) or "(none)"))
+    values = {}
+    for pname, p in decl.items():
+        if pname in args:
+            v = args[pname]
+            if not _param_type_ok(p["type"], v):
+                raise ToolError("parameter %s must be a %s" % (pname, p["type"]))
+            values[pname] = int(v) if p["type"] == "integer" else v
+        elif "default" in p:
+            values[pname] = p["default"]
+        elif p["required"]:
+            raise ToolError("missing required parameter: %s" % pname)
+    spec = tool["spec"]
+    saved_dir = spec.get("dir")
+    d = args.get("dir")
+    if d is not None:
+        if not isinstance(d, str) or not d.strip():
+            raise ToolError("dir must be a non-empty string")
+        spec = dict(spec)
+        spec["dir"] = d                         # orchestrate re-validates (no '..' etc.)
+    # Always pass the values (even {}): the leftover probe then rejects any
+    # stray {{param. in the spec instead of letting it reach a step verbatim.
+    return _final(spec, values), TEMPLATE, saved_dir
+
+
+def _call_dynamic(name, args):
+    """tools/call for a named template tool -> {wfId}."""
+    return _launch(_go(_plan_dynamic(name, args)))
+
+
+def _resolve_call(tool, args):
+    """The approval tool's question (`pervio-mcp --resolve`): what would this
+    call run? A dict for the phone's sheet — {"spec_b64", "sha"} when the call
+    carries a workflow, {} when it carries none (a pause, a delete, feedback) —
+    or a ToolError, the same refusal the call itself would meet, so the person
+    is never asked to allow what would be turned down anyway."""
+    extra = None
+    if tool == "pervio_start":
+        plan = _plan_start(args)
+    elif tool == "pervio_rerun":
+        plan = _plan_rerun(args)
+    elif tool == "pervio_schedule":
+        _action, spec, extra = _plan_schedule(args)
+        if spec is None:
+            return {}
+        plan = (spec, MODEL, None)
+    elif isinstance(tool, str) and tool.startswith(DYN_PREFIX):
+        plan = _plan_dynamic(tool, args)
+    else:
+        return {}
+    spec, origin, saved_dir = plan
+    _hold_to_ceiling(spec, origin, saved_dir)
+    return {"spec_b64": _b64_json(spec), "sha": _sha(spec, extra)}
+
+
+def _resolve_main():
+    """`pervio-mcp --resolve`: {"tool", "input"} on stdin, one JSON line out —
+    {"ok": true, ...} or {"ok": false, "error": words}."""
+    try:
+        req = json.loads(sys.stdin.read() or "null")
+        tool, args = req.get("tool"), req.get("input")
+        if args is None:
+            args = {}
+        if not isinstance(args, dict):
+            raise ToolError("arguments must be an object")
+        out = dict(_resolve_call(tool, args), ok=True)
+    except ToolError as e:
+        out = {"ok": False, "error": str(e)}
+    except Exception as e:                       # never a traceback where one JSON line is expected
+        out = {"ok": False, "error": "could not work out what this call would run: %s" % str(e)[:200]}
+    sys.stdout.write(json.dumps(out, ensure_ascii=False) + "\n")
+
+
+def _handle_call(mid, params):
+    name = params.get("name")
+    args = params.get("arguments")
+    if args is None:
+        args = {}
+    if not isinstance(args, dict):
+        # A tool-level shape error stays a tool-level isError (the call reached a
+        # real method), but it must be NAMED — letting a list through reached the
+        # tool body and surfaced a raw AttributeError as "internal error".
+        _send({"jsonrpc": "2.0", "id": mid, "result": {
+            "content": [{"type": "text", "text": "arguments must be an object"}],
+            "isError": True}})
+        return
+    if RO_MODE and name not in RO_TOOLS:
+        # Read-only mount: the gate sits BEFORE any resolution or argument
+        # validation, so a write verb dies here even with perfectly valid
+        # arguments. Known write verbs and ANY pervio_run_*-shaped name get the
+        # read-only refusal (a named tool always spends — no disk scan needed
+        # to know it's off-limits); a genuinely unknown name falls through to
+        # the unknown-tool error below, keeping policy denials distinguishable
+        # from typos. Execution only ever happens via the exact-match paths
+        # below, so nothing a client sends can route around this return.
+        if name in TOOLS or (isinstance(name, str) and name.startswith(DYN_PREFIX)):
+            _send({"jsonrpc": "2.0", "id": mid, "result": {
+                "content": [{"type": "text",
+                             "text": "read-only mount: %s unavailable" % name}],
+                "isError": True}})
+            return
+    tool = TOOLS.get(name)
+    if tool is not None:
+        fn = tool["fn"]
+    elif isinstance(name, str) and name.startswith(DYN_PREFIX):
+        fn = lambda a: _call_dynamic(name, a)   # noqa: E731 — resolve-at-call
+    else:
+        _send({"jsonrpc": "2.0", "id": mid, "result": {
+            "content": [{"type": "text", "text": "unknown tool: %r" % name}],
+            "isError": True}})
+        return
+    try:
+        data = fn(args)
+    except ToolError as e:
+        _send({"jsonrpc": "2.0", "id": mid, "result": {
+            "content": [{"type": "text", "text": str(e)}], "isError": True}})
+        return
+    except Exception as e:                       # a tool bug must never kill the server
+        _send({"jsonrpc": "2.0", "id": mid, "result": {
+            "content": [{"type": "text", "text": "internal error: %s" % str(e)[:300]}],
+            "isError": True}})
+        return
+    text = data if isinstance(data, _RawText) else json.dumps(data, ensure_ascii=False)
+    _send({"jsonrpc": "2.0", "id": mid, "result": {
+        "content": [{"type": "text", "text": text}]}})
+
+
+def _invalid(mid, why):
+    """JSON-RPC -32600. Sent with id null when the message carried no usable id
+    (the spec's answer for an unidentifiable request) so a client waiting on a
+    reply learns the shape was wrong instead of hanging."""
+    _send({"jsonrpc": "2.0", "id": mid,
+           "error": {"code": -32600, "message": "invalid request: " + why}})
+
+
+def _dispatch(msg):
+    """One decoded stdin message -> at most one response.
+
+    Every field is shape-checked BEFORE use. Syntactically valid JSON with the
+    wrong shape (a top-level array, `method: 5`, `params: []`) used to reach
+    `msg.get`/`method.startswith`/`params.get` and raise AttributeError out of
+    main(), killing the process — and a dead stdio mount takes all 11 tools out
+    of a live chat session with no error the client can show. Batches are a
+    deliberate -32600: this server answers one message per line."""
+    if not isinstance(msg, dict):
+        _invalid(None, "message must be a JSON object")
+        return
+    mid = msg.get("id")
+    if not (mid is None or isinstance(mid, (str, int, float))):
+        _invalid(None, "id must be a string, number or null")
+        return
+    method = msg.get("method")
+    if not isinstance(method, str):
+        _invalid(mid, "method must be a string")
+        return
+    if method.startswith("notifications/"):
+        return                                   # notifications get no response
+    params = msg.get("params")
+    if params is None:
+        params = {}
+    if not isinstance(params, dict):
+        # No method here takes positional params, so a list/scalar is a shape
+        # error. It used to be silently coerced to {} (falsy `[]`) or crash.
+        _invalid(mid, "params must be an object")
+        return
+    if method == "initialize":
+        pv = params.get("protocolVersion")
+        _send({"jsonrpc": "2.0", "id": mid, "result": {
+            "protocolVersion": pv if isinstance(pv, str) else "2024-11-05",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "perviotools", "version": "1.0.0"}}})
+    elif method == "tools/list":
+        # Static eleven first (their names/schemas never change), then the
+        # named template tools, re-scanned fresh on every list. Read-only
+        # mount: exactly the seven read-only tools — write verbs unlisted
+        # AND the template scan skipped entirely (named tools always
+        # spend), so list and call agree on the same shrunken surface.
+        if RO_MODE:
+            srcs = ({n: TOOLS[n] for n in RO_TOOLS},)
+        else:
+            srcs = (TOOLS, _dynamic_tools())
+        _send({"jsonrpc": "2.0", "id": mid, "result": {"tools": [
+            {"name": n, "description": t["description"], "inputSchema": t["inputSchema"]}
+            for src in srcs for n, t in src.items()]}})
+    elif method == "tools/call":
+        _handle_call(mid, params)
+    elif method == "ping":
+        # MCP spec: a ping MUST get an empty result — an error here would
+        # let a future health-checking client mark the server dead.
+        _send({"jsonrpc": "2.0", "id": mid, "result": {}})
+    else:
+        if mid is not None:
+            _send({"jsonrpc": "2.0", "id": mid, "error": {
+                "code": -32601, "message": "method not found: %s" % method}})
+
+
+def main():
+    while True:
+        line = sys.stdin.readline()
+        if line == "":                           # EOF: client gone
+            break
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except Exception:
+            continue                             # bad line never exits the process
+        try:
+            _dispatch(msg)
+        except Exception as e:
+            # Last-resort per-message boundary: NOTHING one message does may end
+            # the loop. The client still gets an answer (a silent drop would hang
+            # a caller that is waiting on this id).
+            sys.stderr.write("pervio-mcp: message dropped (%s)\n" % str(e)[:200])
+            try:
+                _send({"jsonrpc": "2.0",
+                       "id": msg.get("id") if isinstance(msg, dict) else None,
+                       "error": {"code": -32603,
+                                 "message": "internal error: %s" % str(e)[:200]}})
+            except Exception:
+                pass
+
+
+if __name__ == "__main__":
+    if sys.argv[1:2] == ["--resolve"]:
+        _resolve_main()
+    else:
+        main()

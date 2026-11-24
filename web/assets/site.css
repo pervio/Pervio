@@ -1,0 +1,175 @@
+/* Pervio site — shared system (2026-11-23).
+   Material after "Dusk" from Hallmark (github.com/Nutlope/hallmark, MIT):
+   a real photograph of land at the turn of the light, slate below it, one
+   periwinkle signal for what is done and one apricot for what waits on you.
+   Every colour and every face goes through a token declared here. */
+
+:root{
+  /* slate */
+  --color-paper:#0E1017;      /* oklch(17.5% 0.014 268) */
+  --color-paper-2:#151820;    /* oklch(21% 0.016 268) */
+  --color-paper-3:#1E212A;    /* oklch(25% 0.017 268) */
+  --color-ink:#F4F1ED;        /* oklch(96% 0.006 75) */
+  --color-ink-2:#CACED4;      /* oklch(85% 0.010 262) */
+  --color-muted:#999FA9;      /* oklch(70% 0.016 262) */
+  --color-rule:#2A2E36;       /* oklch(30% 0.016 266) */
+  --color-rule-2:#3E424C;     /* oklch(38% 0.018 266) */
+  --color-shade:#020309;      /* oklch(10% 0.022 268) */
+  /* two signals, two jobs: periwinkle is done and on; apricot is waiting on you */
+  --color-accent:#A0B0F4;     /* oklch(77% 0.10 274) */
+  --color-accent-hi:#B9C7FF;  /* oklch(84% 0.085 274) */
+  --color-accent-ink:#0F1223; /* oklch(19% 0.035 274) */
+  --color-wait:#F4BA87;       /* oklch(83% 0.095 62) */
+  --color-focus:#B9C7FF;
+  /* bone wells: the light surfaces */
+  --color-well:#F3EFEA;       /* oklch(95.5% 0.008 75) */
+  --color-well-2:#E9E4DD;     /* oklch(92% 0.010 75) */
+  --color-well-ink:#151820;
+  --color-well-muted:#565B64; /* oklch(47% 0.016 265) */
+  --color-well-rule:#D9D5CF;
+  /* smoked glass */
+  --glass:rgba(23,26,35,.58);
+  --glass-solid:#171A23;
+  --glass-blur:22px;
+  --light-04:rgba(255,253,251,.04);
+  --light-07:rgba(255,253,251,.07);
+  --light-10:rgba(255,253,251,.10);
+  --light-16:rgba(255,253,251,.16);
+  --light-35:rgba(255,253,251,.35);
+  --shade-00:rgba(2,3,9,0);
+  --shade-10:rgba(2,3,9,.10);
+  --shade-22:rgba(2,3,9,.22);
+  --shade-30:rgba(2,3,9,.30);
+  --shade-36:rgba(2,3,9,.36);
+  --shade-48:rgba(2,3,9,.48);
+  --shade-55:rgba(2,3,9,.55);
+  --shade-62:rgba(2,3,9,.62);
+  --shade-70:rgba(2,3,9,.70);
+  --paper-00:rgba(14,16,23,0);
+  --glass-hi:inset 0 1px 0 var(--light-10), inset 0 0 0 1px var(--light-07);
+  --shadow-card:0 40px 80px -32px var(--shade-70);
+
+  --font-display:"Wix Madefor Display","PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans CJK SC",ui-sans-serif,system-ui,sans-serif;
+  --font-body:"Wix Madefor Text","PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans CJK SC",ui-sans-serif,system-ui,sans-serif;
+  --font-mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+  --tracking-display:-0.022em;
+  --leading-display:1.06;
+  --leading-body:1.6;
+
+  --radius-card:18px;
+  --radius-inner:10px;
+  --radius-pill:999px;
+
+  --text-display:clamp(2.75rem, 1.2rem + 5vw, 5.25rem);   /* 44 → 84 */
+  --text-section:clamp(2rem, 1.2rem + 2.6vw, 3.25rem);    /* 32 → 52 */
+  --text-title:clamp(1.25rem, 1.1rem + .6vw, 1.5625rem);  /* 20 → 25 */
+  --text-lead:clamp(1.0625rem, 1rem + .35vw, 1.3125rem);  /* 17 → 21 */
+  --text-md:1.0625rem;                                    /* 17 */
+  --text-sm:.875rem;                                      /* 14 */
+
+  --space-xs:8px; --space-sm:12px; --space-md:16px; --space-lg:24px;
+  --space-xl:32px; --space-2xl:48px; --space-3xl:64px; --space-4xl:96px;
+  --section-gap:clamp(72px, 10vw, 144px);
+  --gutter:clamp(20px, 4.45vw, 64px);
+  --container:1440px;
+  --nav-h:72px;
+  --dur-short:.16s; --dur-mid:.3s;
+  --ease-out:cubic-bezier(.2,.7,.2,1);
+  color-scheme:dark;
+}
+:root:lang(zh){
+  --font-display:"Wix Madefor Display zh","PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans CJK SC",ui-sans-serif,system-ui,sans-serif;
+  --font-body:"Wix Madefor Text zh","PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans CJK SC",ui-sans-serif,system-ui,sans-serif;
+  --tracking-display:-0.005em;   /* Han characters set tight read cramped */
+  --leading-display:1.16;
+  --leading-body:1.75;
+}
+
+*,*::before,*::after{box-sizing:border-box}
+html{overflow-x:clip;-webkit-text-size-adjust:100%;text-size-adjust:100%;scroll-padding-top:calc(var(--nav-h) + 16px)}
+body{margin:0;overflow-x:clip;background:var(--color-paper);color:var(--color-ink-2);
+  font:400 var(--text-md)/var(--leading-body) var(--font-body);
+  -webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;text-rendering:optimizeLegibility}
+img,picture{display:block;max-width:100%}
+img{height:auto}
+h1,h2,h3,h4,p,ol,ul,figure,dl,dd{margin:0}
+ol,ul{padding:0;list-style:none}
+a{color:inherit}
+code,kbd,samp,pre{font-family:var(--font-mono);font-size:.92em}
+::selection{background:var(--color-accent);color:var(--color-accent-ink)}
+
+h1,h2,h3{font-family:var(--font-display);font-weight:500;letter-spacing:var(--tracking-display);
+  line-height:var(--leading-display);color:var(--color-ink);overflow-wrap:break-word;min-width:0;text-wrap:balance}
+h1{font-size:var(--text-display)}
+h2{font-size:var(--text-section)}
+h3{font-size:var(--text-title);line-height:1.3}
+.lead{font-size:var(--text-lead);line-height:1.55;color:var(--color-ink-2);text-wrap:pretty}
+:root:lang(zh) .lead{line-height:1.7}
+.quiet{color:var(--color-muted)}
+small,.small{font-size:var(--text-sm)}
+
+.container{width:100%;max-width:var(--container);margin-inline:auto;
+  padding-left:max(var(--gutter),env(safe-area-inset-left,0px));padding-right:max(var(--gutter),env(safe-area-inset-right,0px))}
+.section{padding-block:var(--section-gap)}
+.section--tight{padding-block:calc(var(--section-gap) * .72)}
+.head{max-width:44rem;margin-bottom:var(--space-3xl)}
+.head .lead{margin-top:var(--space-lg)}
+
+/* links in running text */
+.link{color:var(--color-ink);text-decoration:underline;text-decoration-color:var(--color-rule-2);text-underline-offset:.22em;text-decoration-thickness:1px;
+  transition:text-decoration-color var(--dur-short) var(--ease-out),color var(--dur-short) var(--ease-out)}
+.link:hover{text-decoration-color:var(--color-accent);color:var(--color-accent-hi)}
+
+/* focus: instant, never faded in */
+:focus-visible{outline:2px solid var(--color-focus);outline-offset:3px;border-radius:6px}
+.btn:focus-visible{outline-offset:3px;border-radius:var(--radius-pill)}
+
+/* the pair of controls: one periwinkle pill, one ghost beside it */
+.btn{display:inline-flex;align-items:center;justify-content:center;min-height:48px;padding:0 var(--space-lg);
+  border:0;border-radius:var(--radius-pill);background:var(--color-accent);color:var(--color-accent-ink);
+  font:600 .9375rem/1 var(--font-body);text-decoration:none;white-space:nowrap;cursor:pointer;
+  box-shadow:inset 0 1px 0 var(--light-35);
+  transition:background-color var(--dur-short) var(--ease-out),box-shadow var(--dur-short) var(--ease-out),transform var(--dur-short) var(--ease-out)}
+.btn:hover{background:var(--color-accent-hi);box-shadow:inset 0 1px 0 var(--light-35),0 0 0 4px rgba(160,176,244,.18)}
+.btn:active{transform:translateY(1px)}
+.btn--ghost{background:var(--light-07);color:var(--color-ink);box-shadow:inset 0 0 0 1px var(--light-16)}
+.btn--ghost:hover{background:var(--light-10);box-shadow:inset 0 0 0 1px var(--light-35)}
+.btn--small{min-height:40px;padding:0 18px;font-size:.875rem}
+.actions{display:flex;flex-wrap:wrap;gap:var(--space-sm)}
+
+/* smoked glass: one layer, always with its lit edge */
+.glass{background:var(--glass);-webkit-backdrop-filter:blur(var(--glass-blur)) saturate(1.35);backdrop-filter:blur(var(--glass-blur)) saturate(1.35);
+  border-radius:var(--radius-card);box-shadow:var(--glass-hi),var(--shadow-card)}
+@supports not ((-webkit-backdrop-filter:blur(1px)) or (backdrop-filter:blur(1px))){.glass{background:var(--glass-solid)}}
+
+/* ---------- nav: transparent over the photograph, slate glass once it leaves it ---------- */
+.skip{position:absolute;left:var(--gutter);top:-64px;z-index:60;padding:10px 16px;border-radius:var(--radius-inner);background:var(--color-accent);color:var(--color-accent-ink);font-weight:600;text-decoration:none}
+.skip:focus{top:12px}
+.nav{position:absolute;inset:0 0 auto 0;z-index:50;height:var(--nav-h);color:var(--color-ink);
+  transition:background-color var(--dur-mid) var(--ease-out),box-shadow var(--dur-mid) var(--ease-out)}
+.js .nav{position:fixed}
+.nav[data-stuck]{background:var(--glass);-webkit-backdrop-filter:blur(var(--glass-blur)) saturate(1.35);backdrop-filter:blur(var(--glass-blur)) saturate(1.35);box-shadow:inset 0 -1px 0 var(--light-07)}
+@supports not ((-webkit-backdrop-filter:blur(1px)) or (backdrop-filter:blur(1px))){.nav[data-stuck]{background:var(--glass-solid)}}
+.nav--solid{position:sticky;top:0;background:var(--color-paper);box-shadow:inset 0 -1px 0 var(--color-rule)}
+.js .nav--solid{position:sticky}
+.nav__in{height:100%;display:flex;align-items:center;justify-content:space-between;gap:var(--space-lg)}
+.brand{display:inline-flex;align-items:center;gap:10px;font:600 1.0625rem/1 var(--font-display);letter-spacing:-.01em;color:var(--color-ink);text-decoration:none}
+.brand img{width:28px;height:28px;border-radius:7px}
+.nav__links{display:flex;align-items:center;gap:clamp(14px,2.2vw,30px);font-size:.9375rem;font-weight:500}
+.nav__links a:not(.btn){color:var(--color-ink);text-decoration:none;opacity:.86;padding-block:8px;white-space:nowrap;
+  transition:opacity var(--dur-short) var(--ease-out)}
+.nav__links a:not(.btn):hover{opacity:1}
+@media (max-width:760px){.hide-s{display:none}}
+@media (max-width:400px){.nav__links{gap:12px}.hide-xs{display:none}}
+
+/* ---------- footer ---------- */
+.foot{padding-block:var(--space-3xl) var(--space-2xl);border-top:1px solid var(--color-rule)}
+.foot__row{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:var(--space-lg) var(--space-2xl)}
+.foot__links{display:flex;flex-wrap:wrap;gap:8px 28px;font-size:.9375rem}
+.foot__links a{color:var(--color-ink-2);text-decoration:none;padding-block:6px;transition:color var(--dur-short) var(--ease-out)}
+.foot__links a:hover{color:var(--color-ink)}
+.foot__note{margin-top:var(--space-xl);padding-top:var(--space-lg);border-top:1px solid var(--color-rule);font-size:var(--text-sm);color:var(--color-muted)}
+
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{animation:none!important;transition:none!important;scroll-behavior:auto!important}
+}

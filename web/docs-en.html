@@ -1,0 +1,621 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Pervio Guide</title>
+<meta name="description" content="The Pervio guide: setup and connecting, chat, Run mode, approvals, notifications, web preview, terminal, Duet, workflows, servers and jump hosts, FAQ, uninstall.">
+<meta name="robots" content="noindex">
+<meta name="theme-color" content="#0E1017">
+<link rel="icon" type="image/png" sizes="64x64" href="assets/icon-64.png">
+<link rel="apple-touch-icon" href="assets/icon-180.png">
+<link rel="preload" href="assets/fonts/WixMadeforDisplay-latin.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="assets/fonts/WixMadeforText-latin.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="assets/fonts.css">
+<style>
+/* The guide, in English: web/docs.html sentence for sentence (scripts/check-docs-en.py
+   holds the two to the same shape). Colours, fonts and the phone frame are the
+   home page's. No script. Contents on the left, one column of text on the right.
+   Button names are written as the app shows them, in a small .ui box. */
+:root{
+  --ground:#0E1017;
+  --bg:#151820;
+  --surface:#1E212A;
+  --line:rgba(244,241,237,.09);
+  --line-2:rgba(244,241,237,.16);
+  --ink:#F4F1ED;
+  --ink-2:#CACED4;
+  --ink-3:#999FA9;
+  --accent:#A0B0F4;
+  --accent-hi:#B9C7FF;
+  --accent-35:rgba(160,176,244,.35);
+  --accent-50:rgba(160,176,244,.5);
+  --accent-11:rgba(160,176,244,.11);
+  --well:#090B11;
+  --on-accent:#0F1223;
+  --sans:"Wix Madefor Text","PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans CJK SC",ui-sans-serif,system-ui,sans-serif;
+  --display:"Wix Madefor Display","PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans CJK SC",ui-sans-serif,system-ui,sans-serif;
+  --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+  --wrap:1160px;
+  color-scheme:dark;
+}
+*,*::before,*::after{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%;scroll-behavior:smooth}
+body{margin:0;background:var(--ground);color:var(--ink);font-family:var(--sans);font-size:16px;line-height:1.7;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+img{display:block;max-width:100%}
+a{color:inherit;text-decoration:none}
+::selection{background:var(--accent-35)}
+:focus-visible{outline:2px solid var(--accent);outline-offset:3px;border-radius:6px}
+.wrap{max-width:var(--wrap);margin-inline:auto;padding-inline:24px}
+h1,h2,h3,h4,p,figure{margin:0}
+h1,h2,h3,h4{font-family:var(--display);font-weight:600;letter-spacing:-.008em;line-height:1.25;text-wrap:balance}
+
+/* ---------- top bar (as on the home page) ---------- */
+.nav{position:sticky;top:env(safe-area-inset-top,0px);z-index:20;background:rgba(14,16,23,.72);-webkit-backdrop-filter:saturate(1.4) blur(18px);backdrop-filter:saturate(1.4) blur(18px);border-bottom:1px solid var(--line)}
+.nav .wrap{display:flex;align-items:center;gap:28px;height:60px}
+.brand{display:flex;align-items:center;gap:10px;font-weight:650;font-size:17px;letter-spacing:-.01em}
+.brand img{width:26px;height:26px;border-radius:7px}
+.nav nav{display:flex;gap:26px;margin-left:auto;font-size:14.5px;color:var(--ink-2)}
+.nav nav a:hover,.nav nav a[aria-current]{color:var(--ink)}
+.btn{display:inline-flex;align-items:center;justify-content:center;height:36px;padding:0 16px;border-radius:999px;font-size:14px;font-weight:600;white-space:nowrap;background:var(--accent);color:var(--on-accent);transition:background .15s}
+.btn:hover{background:var(--accent-hi)}
+
+/* ---------- page head ---------- */
+.head{padding-block:64px 0}
+.head h1{font-size:clamp(34px,4.4vw,48px);letter-spacing:-.026em}
+.head p{margin-top:18px;max-width:36em;font-size:18px;line-height:1.7;color:var(--ink-2)}
+
+/* ---------- contents + text ---------- */
+.doc{display:grid;grid-template-columns:200px minmax(0,1fr);gap:76px;align-items:start;padding-block:8px 104px}
+.toc{position:sticky;top:calc(84px + env(safe-area-inset-top,0px));max-height:calc(100vh - 108px);overflow-y:auto;margin-top:56px;font-size:14px;line-height:1.5}
+.toc span{display:block;margin-bottom:12px;font-family:var(--mono);font-size:12.5px;color:var(--ink-3)}
+.toc ol{margin:0;padding:0;list-style:none;border-left:1px solid var(--line)}
+.toc a{display:block;margin-left:-1px;padding:6px 0 6px 16px;border-left:1px solid transparent;color:var(--ink-2)}
+.toc a:hover{color:var(--ink);border-left-color:var(--accent)}
+article{min-width:0;max-width:760px}
+article section{margin-top:56px;padding-top:56px;border-top:1px solid var(--line);scroll-margin-top:calc(60px + env(safe-area-inset-top,0px))}
+article section:first-child{border-top:0;margin-top:0}
+article h2{font-size:30px}
+article h3{margin-top:44px;font-size:19.5px;letter-spacing:-.012em;scroll-margin-top:calc(84px + env(safe-area-inset-top,0px))}
+article p{margin-top:14px;color:var(--ink-2);line-height:1.78}
+article h2+p{margin-top:18px}
+article ul,article ol{margin:14px 0 0;padding-left:1.3em;color:var(--ink-2);line-height:1.75}
+article li{margin-top:7px}
+article li::marker{color:var(--ink-3)}
+article b{color:var(--ink);font-weight:600}
+article p a,article li a,article td a,figcaption a{color:var(--accent);overflow-wrap:anywhere}
+article p a:hover,article li a:hover,article td a:hover{text-decoration:underline;text-underline-offset:4px}
+code{font-family:var(--mono);font-size:.88em;padding:1px 6px;border:1px solid var(--line);border-radius:6px;background:var(--surface);color:var(--ink);overflow-wrap:anywhere}
+pre{margin:16px 0 0;padding:16px 18px;border:1px solid var(--line);border-radius:14px;background:var(--well);font-family:var(--mono);font-size:13.5px;line-height:1.75;color:var(--ink);overflow-x:auto}
+pre i{font-style:normal;color:var(--ink-3)}
+.ui{display:inline-block;padding:0 7px;border:1px solid var(--line-2);border-radius:7px;background:var(--surface);color:var(--ink);font-size:.9em;line-height:1.6;white-space:nowrap}
+
+/* steps */
+.steps{counter-reset:s;list-style:none;padding:0;margin-top:26px}
+.steps>li{counter-increment:s;position:relative;margin:0;padding:0 0 30px 46px}
+.steps>li::before{content:counter(s);position:absolute;left:0;top:0;display:flex;align-items:center;justify-content:center;width:28px;height:28px;border:1px solid var(--accent-50);border-radius:50%;color:var(--accent);font-family:var(--mono);font-size:13.5px}
+.steps>li::after{content:"";position:absolute;left:14px;top:36px;bottom:6px;width:1px;background:var(--line)}
+.steps>li:last-child{padding-bottom:0}
+.steps>li:last-child::after{display:none}
+.steps h4{padding-top:3px;font-size:16.5px;font-weight:650;letter-spacing:0}
+.steps p{margin-top:8px}
+
+/* tables */
+.tw{margin-top:18px;overflow-x:auto;border:1px solid var(--line);border-radius:14px;background:var(--bg)}
+table{width:100%;border-collapse:collapse;font-size:15px;line-height:1.6}
+th,td{padding:12px 16px;text-align:left;vertical-align:top;border-bottom:1px solid var(--line)}
+tr:last-child td{border-bottom:0}
+th{font-size:12.5px;font-weight:500;color:var(--ink-3);background:rgba(244,241,237,.025)}
+td{color:var(--ink-2)}
+td:first-child{color:var(--ink);font-weight:600;white-space:nowrap}
+td:first-child i{font-style:normal;font-family:var(--mono);font-weight:400;color:var(--accent);margin-right:8px}
+
+/* notes */
+.note{margin-top:18px;padding:14px 18px;border:1px dashed var(--line-2);border-radius:14px;font-size:15px;line-height:1.7;color:var(--ink-2)}
+
+/* pictures */
+figure{margin-top:24px}
+figcaption{margin-top:10px;font-size:13px;line-height:1.55;color:var(--ink-3)}
+.shot{border:1px solid var(--line);border-radius:18px;overflow:hidden;background:var(--bg)}
+.shot img{width:100%;height:auto}
+.shot.small{max-width:400px}
+.split{display:grid;grid-template-columns:minmax(0,1fr) 280px;gap:36px;align-items:start}
+.split>figure{margin-top:22px}
+/* the phone frame: every size follows from --pw (as on the home page) */
+.phone{--pw:236px;position:absolute;width:var(--pw);aspect-ratio:462.9/978.9;padding:calc(var(--pw)*.0247);border-radius:calc(var(--pw)*.1586);background:#0A0A09;
+  box-shadow:0 0 0 1px rgba(255,255,255,.13) inset,0 0 0 1px #000,0 30px 60px -24px rgba(0,0,0,.85)}
+.phone img{width:100%;height:100%;object-fit:cover;border-radius:calc(var(--pw)*.134);background:var(--bg)}
+.phone::after{content:"";position:absolute;left:50%;top:calc(var(--pw)*.055);width:calc(var(--pw)*.272);height:calc(var(--pw)*.08);transform:translateX(-50%);background:#000;border-radius:999px}
+.plate{position:relative;height:430px;border:1px solid var(--line);border-radius:22px;overflow:hidden;display:flex;justify-content:center;
+  background:radial-gradient(90% 70% at 50% 0%,var(--accent-11),transparent 70%),var(--bg)}
+.plate.top .phone{top:30px}
+.plate.bottom .phone{bottom:30px}
+
+/* ---------- footer (as on the home page) ---------- */
+footer{border-top:1px solid var(--line);color:var(--ink-3);font-size:14px}
+footer .wrap{display:flex;flex-wrap:wrap;gap:14px 28px;align-items:center;padding-block:30px calc(30px + env(safe-area-inset-bottom,0px))}
+footer nav{display:flex;flex-wrap:wrap;gap:8px 24px;margin-left:auto}
+footer a:hover{color:var(--ink)}
+
+/* ---------- narrow screens ---------- */
+@media (max-width:980px){
+  .head{padding-block:44px 0}
+  .doc{grid-template-columns:1fr;gap:0;padding-block:28px 72px}
+  .toc{position:static;max-height:none;margin-top:0;padding:18px 20px;border:1px solid var(--line);border-radius:16px;background:var(--bg)}
+  .toc ol{border-left:0;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:0 20px}
+  .toc a{margin-left:0;padding:6px 0;border-left:0}
+  article section:first-child{margin-top:44px}
+}
+@media (max-width:640px){
+  .wrap{padding-inline:20px}
+  .nav nav a.hide-s{display:none}
+  .nav .wrap{gap:16px}
+  .nav nav{gap:18px}
+  .head p{font-size:17px}
+  .toc ol{grid-template-columns:repeat(2,minmax(0,1fr))}
+  article h2{font-size:26px}
+  .split{grid-template-columns:1fr;gap:0}
+  .split>figure{max-width:320px}
+  td:first-child{white-space:normal;min-width:6.5em}
+  .keep td:first-child{white-space:nowrap}
+  th,td{padding:11px 13px}
+}
+@media (prefers-reduced-motion:reduce){html{scroll-behavior:auto}.btn{transition:none}}
+</style>
+</head>
+<body>
+
+<header class="nav">
+  <div class="wrap">
+    <a class="brand" href="en.html"><img src="assets/icon-64.png" alt="" width="26" height="26">Pervio</a>
+    <nav>
+      <a class="hide-s" href="en.html#features">Features</a>
+      <a href="docs-en.html" aria-current="page">Docs</a>
+      <a class="hide-s" href="https://github.com/pervio/Pervio">GitHub</a>
+      <a class="hide-s" href="docs.html" lang="zh-CN">中文</a>
+    </nav>
+    <a class="btn" href="https://testflight.apple.com/join/EagwZXV1">Join the beta</a>
+  </div>
+</header>
+
+<div class="wrap head">
+  <h1>Guide</h1>
+  <p>How to set it up, how each feature works, and what to check when something goes wrong. Pervio is in public beta on TestFlight. Button names are written the way the app shows them when its language is set to English.</p>
+</div>
+
+<div class="wrap doc">
+
+<aside class="toc" aria-label="Contents">
+  <span>Contents</span>
+  <ol>
+    <li><a href="#requirements">Requirements</a></li>
+    <li><a href="#install">Setup</a></li>
+    <li><a href="#home">Home</a></li>
+    <li><a href="#chat">Chat</a></li>
+    <li><a href="#run">Run mode</a></li>
+    <li><a href="#approval">Approvals and permissions</a></li>
+    <li><a href="#notify">Lock screen and notifications</a></li>
+    <li><a href="#web">Web preview</a></li>
+    <li><a href="#terminal">Terminal</a></li>
+    <li><a href="#duet">Duet</a></li>
+    <li><a href="#workflow">Workflows</a></li>
+    <li><a href="#servers">Servers</a></li>
+    <li><a href="#settings">Settings</a></li>
+    <li><a href="#faq">FAQ</a></li>
+    <li><a href="#uninstall">Uninstall</a></li>
+    <li><a href="#privacy">Privacy</a></li>
+  </ol>
+</aside>
+
+<article>
+
+<section id="requirements">
+  <h2>Requirements</h2>
+  <div class="tw"><table>
+    <tr><td>iPhone</td><td>iOS 17 or later. Install from TestFlight.</td></tr>
+    <tr><td>Computer</td><td>A Mac with Remote Login (SSH) turned on. It needs <code>python3</code> and at least one of Claude Code, Codex or Cursor, installed and logged in. For the terminal on the phone, install <code>tmux</code> as well.</td></tr>
+    <tr><td>Network</td><td>The phone has to be able to reach the computer. On the same Wi-Fi it just works. Away from home, <a href="https://tailscale.com">Tailscale</a> is the easy way.</td></tr>
+  </table></div>
+  <p>Nothing from Pervio has to be installed on the computer. The scripts it uses are bundled in the app and copied to <code>~/.pervio/bin</code> over SSH on the first connection. When the app updates, the scripts are replaced. No service keeps running on the computer; a script runs only when the phone calls it.</p>
+  <p>A Linux host works too, but macOS is what gets used every day.</p>
+</section>
+
+<section id="install">
+  <h2>Setup</h2>
+  <p>The first setup takes about fifteen minutes. The steps below are for a Mac.</p>
+  <ol class="steps">
+    <li>
+      <h4>Install the app</h4>
+      <p>Install Apple's TestFlight on the phone, then open <a href="https://testflight.apple.com/join/EagwZXV1">testflight.apple.com/join/EagwZXV1</a> and install Pervio.</p>
+    </li>
+    <li>
+      <h4>Turn on Remote Login on the Mac</h4>
+      <p>System Settings → General → Sharing → turn on Remote Login. Under “Allow access for” you can choose only yourself.</p>
+    </li>
+    <li>
+      <h4>Install an engine and log in</h4>
+      <p>Do this in the computer's own Terminal. One of the three is enough:</p>
+<pre>npm install -g @anthropic-ai/claude-code &amp;&amp; claude     <i># Claude Code</i>
+npm install -g @openai/codex &amp;&amp; codex login            <i># or Codex</i>
+curl https://cursor.com/install -fsS | bash            <i># or Cursor, then agent login</i></pre>
+      <p>Log in to Claude Code in the Mac's own Terminal, not over SSH. The reason is under <a href="#claude-login">Claude Code says it is not logged in</a> below.</p>
+    </li>
+    <li>
+      <h4>Make an SSH key for the phone</h4>
+      <p>A password works too, but a key is safer. In the computer's terminal:</p>
+<pre>ssh-keygen -t ed25519 -f ~/.ssh/pervio_phone -N ""
+cat ~/.ssh/pervio_phone.pub &gt;&gt; ~/.ssh/authorized_keys
+chmod 600 ~/.ssh/authorized_keys</pre>
+    </li>
+    <li>
+      <h4>Add the server in the app</h4>
+      <p>Servers → Add a server. Fill in the form:</p>
+      <div class="tw"><table>
+        <tr><td>Name</td><td>Anything you like.</td></tr>
+        <tr><td>Host</td><td>The computer's address: its LAN IP, or its Tailscale <code>100.x.y.z</code>.</td></tr>
+        <tr><td>Port</td><td>22 by default.</td></tr>
+        <tr><td>Username</td><td>Your login name on the computer, the one <code>whoami</code> prints in its terminal. Not the computer's name, and not your Apple ID.</td></tr>
+        <tr><td>Method</td><td>Choose Key and paste the whole output of <code>cat ~/.ssh/pervio_phone</code>, or choose Password and enter the computer's login password. Either one is stored only in the iOS Keychain.</td></tr>
+        <tr><td>Project dir on server</td><td><code>~</code> by default. It decides which of this server's conversations the phone can see. See <a href="#scope">Working directory</a>.</td></tr>
+      </table></div>
+      <p>Then tap <span class="ui">Fetch host key from server</span>, check the fingerprint and save. This step only fetches the fingerprint. It does not log in, so no password or key is sent yet. Every later connection checks this fingerprint and is refused if it does not match.</p>
+    </li>
+    <li>
+      <h4>Connect</h4>
+      <p>On the first connection the app copies its scripts to the computer, which takes a few seconds. When the home page shows a greeting, setup is done.</p>
+    </li>
+  </ol>
+
+  <h3 id="tailscale">Not on the same network</h3>
+  <p>Install Tailscale on both the computer and the phone, sign in to the same account, then change Host in the app to the computer's <code>100.x.y.z</code> address (on a Mac it is under the Tailscale icon in the menu bar, or run <code>tailscale ip -4</code> in a terminal). This way the computer's SSH never has to be exposed to the internet.</p>
+  <p>If that Tailscale account has also joined a company or school network, switch both devices to your own network.</p>
+
+  <h3 id="claude-login">Claude Code says it is not logged in</h3>
+  <p>Claude Code keeps its login in the macOS Keychain. Pervio starts <code>claude</code> over SSH, and a process started over SSH cannot read the Keychain. So this can happen: claude works fine in the terminal on the phone, but the chat says it is not logged in. There are two fixes:</p>
+  <ul>
+    <li>Run <code>claude</code> once in the Mac's own Terminal and log in when it asks.</li>
+    <li>If nobody normally logs in to the Mac's desktop, use a long-lived token. Run <code>claude setup-token</code> on the Mac, paste the string it prints into “Claude token (for SSH)” in the app's server settings, and tap <span class="ui">Save to Mac</span>. It is written only to <code>~/.pervio/credentials.env</code> on the Mac. The phone does not keep it.</li>
+  </ul>
+  <p>Codex and Cursor keep their credentials in ordinary files, so they do not have this problem.</p>
+
+  <h3 id="checkup">Cannot connect</h3>
+  <p>When the home page, the projects page, the conversation list or the workflow list cannot reach the computer, what was on the page stays where it is. A line in orange appears above it with the reason, and the page retries by itself: after 2, 4, 8 and 15 seconds, then every 30 seconds for as long as the page is open. Once it connects, the line goes away. You do not have to quit the app. Pull down if you want it to retry sooner. The page also reads again when you open it, come back to it from another page, or bring the app to the foreground.</p>
+  <p>A rejected password or key, or a host key that does not match, will not get better by waiting, so there is no automatic retry for those. The line is red, with <span class="ui">Open server settings</span> under it, and the page reads again when you come back from fixing it.</p>
+  <p>Under the orange line there is <span class="ui">Run connection checkup</span>. It checks, in order, the SSH connection, whether Claude Code is installed, whether it is logged in, <code>python3</code>, and the server scripts. For each one that fails it says how to fix it. It looks for Claude Code in the same places the app does when it starts it. The three most common results:</p>
+  <div class="tw"><table>
+    <tr><td>Connection refused</td><td>Most likely Remote Login is off on the Mac.</td></tr>
+    <tr><td>Connection timed out</td><td>The phone and the computer are not on the same network, or the computer is asleep. Check Wi-Fi or Tailscale, and make sure Host is the computer's current address.</td></tr>
+    <tr><td>Authentication failed</td><td>The user name, the password or the key is wrong. The user name is what <code>whoami</code> prints.</td></tr>
+  </table></div>
+  <p>A sleeping computer cannot be reached, and scheduled workflows miss their time too. On a Mac that stays on, search for “sleep” in System Settings and turn on “Prevent automatic sleeping when the display is off”.</p>
+</section>
+
+<section id="home">
+  <h2>Home</h2>
+  <div class="split">
+    <div>
+      <div class="tw keep"><table>
+        <tr><td><i>1</i>Input box</td><td>Type something and press return to start a new conversation right away.</td></tr>
+        <tr><td><i>2</i>New chat</td><td>Opens the chat page first. Long-press to pick a directory first.</td></tr>
+        <tr><td><i>3</i>Build</td><td>Start from scratch or revise an existing template. You describe what you want, and the agent writes the template and checks it itself.</td></tr>
+        <tr><td><i>4</i>Publications</td><td>What the workflows you subscribe to have delivered. Templates you have never used do not appear here.</td></tr>
+        <tr><td><i>5</i>N running</td><td>Background tasks that are running. Tap to see their progress.</td></tr>
+      </table></div>
+      <p>“Recent” below lists your latest conversations. Tap one to carry on. Swipe a row right to pin it, left to delete it. Pins are stored on the computer, so they survive a new phone or a reinstall. A pinned conversation cannot be deleted until you unpin it.</p>
+      <p>The bottom row shows the server you are connected to. Tap “Servers” to add, edit or switch.</p>
+    </div>
+    <figure>
+      <div class="shot"><img loading="lazy" src="assets/docs/home-page-annotated-en.png" width="780" height="1360" alt="The home page with five numbered parts: the input box, New chat, Build, a publication card, and the running tasks"></div>
+    </figure>
+  </div>
+</section>
+
+<section id="chat">
+  <h2>Chat</h2>
+  <div class="split">
+    <div>
+      <p>Pervio reads the session records that Claude Code, Codex and Cursor keep themselves. A conversation you started in the computer's terminal or editor can be continued on the phone, and one started on the phone is there when you are back at the computer.</p>
+      <p>Replies stream in. The agent reads files, runs commands and edits code, and each step is one row in the conversation. Open a row for the details: an Edit shows the change before and after, a Bash shows the full command.</p>
+      <p>A path to a file on the computer in a reply can be tapped. Images, PDFs and text files are fetched from the computer and opened in the system preview. Files over 25 MB are not fetched, and the app tells you so.</p>
+      <p>LaTeX written by the model is rendered as math. What cannot be rendered is shown as written.</p>
+    </div>
+    <figure>
+      <div class="plate top"><div class="phone"><img loading="lazy" src="assets/shots/chat-en.png" width="720" height="1564" alt="The chat page: a badge with the engine and model at the top, one row per tool call, and the reply below"></div></div>
+    </figure>
+  </div>
+
+  <h3>Engine, model, provider</h3>
+  <p>The badge at the top of the chat page shows the current engine, model and provider. Tap it to change them. The engine is fixed once the first message is sent, so changing it means starting a new conversation. The model and provider can be changed at any time. <span class="ui">More settings…</span> in the menu has everything: model, effort, permissions, directory.</p>
+  <p>The model list comes from your computer and is not built into the app. Claude's list is read from the <code>claude</code> program installed there, Codex's from Codex's own model cache, and Cursor's is the list on your account. After a command-line tool on the computer is updated, reconnect once and the new models are in the list.</p>
+  <p>In a Claude Code conversation you can also type <code>/model model-name</code> to switch, and the conversation keeps using that model from then on.</p>
+  <p>For adding third-party providers, see <a href="#providers">Providers</a>.</p>
+
+  <h3>Attaching things to a message</h3>
+  <p>The <span class="ui">＋</span> to the left of the input box:</p>
+  <div class="tw"><table>
+    <tr><td>Photo</td><td>A picture from the photo library.</td></tr>
+    <tr><td>File</td><td>A file from the phone's Files app.</td></tr>
+    <tr><td>Server file…</td><td>Browse the computer's folders and attach a file. Or tap <span class="ui">Hand this directory to the chat</span> to give the agent the whole folder.</td></tr>
+    <tr><td>Context…</td><td>Attach an earlier conversation as background.</td></tr>
+    <tr><td>Web preview</td><td>Open a page on the computer. See <a href="#web">Web preview</a>.</td></tr>
+    <tr><td>Duet…</td><td>Give this conversation a partner. See <a href="#duet">Duet</a>.</td></tr>
+  </table></div>
+  <p>A folder handed to a conversation is not packed up or uploaded. Only its path is handed over. From then on the agent can read and write in that folder in this conversation. The folder shows above the input box. Long-press it and choose “Stop using this folder in this conversation” to take it back.</p>
+  <p>With two or more servers added, the <span class="ui">Server file…</span> and <span class="ui">Context…</span> pages get a <span class="ui">From</span> row at the top, where you can switch to another one (a second entry for the same computer does not count). A file picked on the other computer is read by the phone first and then sent to the computer this conversation is on, as an attachment. A file can be up to 8 MB. Larger ones are marked in the list and cannot be picked. Above the input box you can see whether it is connecting, reading or sending, and how far along it is, and the ✕ next to it stops it. Stay in Pervio until it finishes. If it is interrupted, you get a message saying so. A folder on the other computer cannot be handed to the conversation.</p>
+  <p>In the file browser, a row that is a link shows where it really points. If a name you pick on the other computer is a link to a file outside its own folder, the phone shows you the real location first and reads it only after you tap <span class="ui">Bring it</span>.</p>
+  <p>When what you pick on the other computer is a conversation, its transcript is brought over. The part of a long conversation that does not fit in the transcript comes along as a separate full record, and the transcript says at the top where that is. The full record is also limited to 8 MB. Beyond that the later part is kept, with a note on what was left out. Instruction and memory files ticked along with it come over as their first 60 KB of text, marked at the top with the computer and file they came from. Everything brought over is a copy made at that moment. It is kept in this computer's upload folder and cleaned up after about 7 days.</p>
+
+  <h3>Restate, branch</h3>
+  <p>Long-press one of your own messages and choose <span class="ui">Restate from here</span>. A new conversation is made with everything before that message, the app switches to it, and your original words are put back in the input box to edit and send again.</p>
+  <p>Under the last reply of each turn there is <span class="ui">Branch in new chat</span>. It copies everything up to that turn into a new conversation and switches to it.</p>
+  <p>Neither touches the original conversation, which stays in the list. Cursor conversations do not have these two.</p>
+
+  <h3>Rename</h3>
+  <p>Tap the badge at the top and choose <span class="ui">Rename conversation</span>. Leave the name empty to go back to the default title.</p>
+</section>
+
+<section id="run">
+  <h2>Run mode</h2>
+  <div class="split">
+    <div>
+      <p>The button on the left above the input box says Chat or Run. Tap it to switch. The choice is remembered per server.</p>
+      <div class="tw"><table>
+        <tr><td>Chat</td><td>The turn is tied to the app's connection. If you leave the app or lose the connection, the turn stops.</td></tr>
+        <tr><td>Run</td><td>The task is a background process on the computer. Locking the phone, switching apps or going offline does not affect it. When you open the app again, it reads on from where it left off.</td></tr>
+      </table></div>
+      <p>In Run mode:</p>
+      <ul>
+        <li>You can keep sending messages while the task is running. The message goes into the running turn and is marked “Added to this turn”. Claude Code and Codex support this. Codex takes the message only after it finishes the step it is on, and until then the message is marked “Delivered — after the current step”.</li>
+        <li>Sub-agents the agent sends out, and commands it puts in the background (a full test run, say), are summed up in one line above the input box: how many sub-agents, how many background commands, how long they have been running. Tap the line for the list: each sub-agent's type, time, tokens used, number of tool calls and what it is doing now. A command a sub-agent started is listed under it, and one that has finished shows its result. When all of them have ended, one result line is left at the end of the conversation, and tapping it opens the same list. It is still there when you leave the conversation and come back, until you send your next message (for half a day at most). You can keep chatting while the tasks run, and the same process answers you.</li>
+        <li>Sub-agents of Claude Code, Codex and Cursor all appear in this line. A Codex sub-agent is labelled with the model it uses. Cursor does not report tokens or tool calls, only the time and the result. In Chat mode the line is there too while a turn is still going.</li>
+        <li>With Claude Code in Run mode, each running task in the list has a stop button on the right. After you confirm, only that one is stopped, along with any background commands a sub-agent started itself. The conversation and the other tasks are not affected.</li>
+        <li>Progress shows in the Dynamic Island and on the lock screen, and a push arrives when the reply is finished. See <a href="#notify">Lock screen and notifications</a>.</li>
+        <li>“N running” on the home page lists every task that is still running.</li>
+      </ul>
+      <p>The output of background tasks is written to <code>~/.pervio/runs/</code> on the computer.</p>
+    </div>
+    <figure>
+      <div class="plate bottom"><div class="phone"><img loading="lazy" src="assets/shots/running-en.png" width="720" height="1564" alt="A task still running in Run mode: a message added midway, a line above the input box saying one command is running in the background, and the Run and Terminal buttons above it"></div></div>
+    </figure>
+  </div>
+</section>
+
+<section id="approval">
+  <h2>Approvals and permissions</h2>
+  <div class="split">
+    <div>
+      <p>At a permission level that asks, the agent stops when it wants to edit a file or run a command. The phone shows what it is about to run, and you tap Allow or Deny. Denying does not end the task. The agent is told it was denied and carries on from there.</p>
+      <p>When you are not in the app, a notification on the lock screen tells you it is waiting.</p>
+      <p>The level is chosen under <span class="ui">More settings…</span> in the badge menu. The names differ between the two engines.</p>
+    </div>
+    <figure>
+      <div class="plate bottom"><div class="phone"><img loading="lazy" src="assets/shots/approval-en.png" width="720" height="1564" alt="The approval sheet: the agent wants to run git push origin release, with Allow and Deny below"></div></div>
+    </figure>
+  </div>
+
+  <h3>Claude Code</h3>
+  <div class="tw"><table>
+    <tr><td>Auto</td><td>Claude Code decides which level to use for the task.</td></tr>
+    <tr><td>Ask before edits</td><td>Asks you before every file edit and every command.</td></tr>
+    <tr><td>Edit automatically</td><td>File edits are applied without asking.</td></tr>
+    <tr><td>Plan</td><td>Read-only. It reads the code and gives a plan first, and starts only after you agree.</td></tr>
+    <tr><td>Bypass</td><td>Asks nothing. Use it only on a machine you trust.</td></tr>
+  </table></div>
+
+  <h3>Codex</h3>
+  <div class="tw"><table>
+    <tr><td>Full access</td><td>No sandbox, never asks. This is the default in Codex's own app, and the default here.</td></tr>
+    <tr><td>Approve for me</td><td>Confined to the project directory. Anything beyond it is decided by Codex's own reviewer.</td></tr>
+    <tr><td>Ask for approval</td><td>Confined to the project directory. Anything beyond it waits for your Allow or Deny on the phone. It asks only in Chat mode. In Run mode nobody is there to answer, so it does not ask.</td></tr>
+    <tr><td>Read-only</td><td>Reads and plans only. It cannot edit files or run commands.</td></tr>
+  </table></div>
+</section>
+
+<section id="notify">
+  <h2>Lock screen and notifications</h2>
+  <figure>
+    <div class="shot small"><img loading="lazy" src="assets/snap-island-expanded-en.png" width="784" height="300" alt="The Dynamic Island, expanded: four of six steps done, with the current action below"></div>
+    <figcaption>A background task in the Dynamic Island: how many steps are done and what it is doing now.</figcaption>
+  </figure>
+  <p>While a background task is running, the Dynamic Island and the lock screen show its progress. A workflow shows which step it is on, and a conversation shows the current action (which file it is reading, which command it is running).</p>
+  <p>These are pushed to the lock screen:</p>
+  <ul>
+    <li>A background turn finishes or fails. The title is the project name and the outcome, and the body is the first few dozen characters of the task.</li>
+    <li>The agent is waiting for your approval.</li>
+    <li>A workflow finishes or fails, or a publication you subscribe to is delivered.</li>
+    <li>A Duet's Watch task has an outcome: passed, needs you, or not passed after three rounds.</li>
+  </ul>
+  <p>Notifications need no setup. They are the only thing in the product that goes through a Pervio server. The computer hands the notification's title and body to the relay at <code>push.pervio.dev</code>, which signs it and passes it to Apple. The relay does not keep the content. If you would rather not go through it, run this on the computer:</p>
+<pre>mkdir -p ~/.pervio/push &amp;&amp; echo off &gt; ~/.pervio/push/gateway</pre>
+  <p>With it off, you still get local alerts while the app is open.</p>
+</section>
+
+<section id="web">
+  <h2>Web preview</h2>
+  <p>A page that listens only on the computer's <code>localhost</code>, such as a dev server or a docs site, cannot be opened in Safari on the phone. Web preview opens it on the phone through the SSH connection, with no port opened to the outside.</p>
+  <ul>
+    <li><span class="ui">＋</span> → <span class="ui">Web preview</span> lists the ports the computer is listening on, each with the program behind it. Tap a row to open it, or type a port number yourself. Rows marked “Mac only” are bound to localhost alone.</li>
+    <li>A link like <code>http://localhost:3000</code> in a reply opens in the preview when you tap it.</li>
+    <li>The preview has <span class="ui">Screenshot to chat</span>. A screenshot of the current page goes into the input box, and you type what is wrong with it.</li>
+    <li>Links in the page to other ports on the computer stay in the preview. Links to the outside web can be opened with <span class="ui">Open in Safari</span>.</li>
+  </ul>
+  <p>A line on the preview page shows the state of the tunnel. The tunnel closes when the app goes to the background and reconnects by itself when you come back.</p>
+  <p>If you are told the computer does not allow port forwarding, its sshd has <code>AllowTcpForwarding</code> turned off, and it has to be turned on there.</p>
+</section>
+
+<section id="terminal">
+  <h2>Terminal</h2>
+  <p><span class="ui">Terminal</span>, on the right above the input box, opens a shell on the computer in this conversation's project directory.</p>
+  <ul>
+    <li>It is tmux underneath. If the connection drops, what is running inside keeps running, and opening it again brings back the same screen.</li>
+    <li>A row above the keyboard has the keys a phone keyboard lacks: Esc, Tab, the arrow keys, Ctrl combinations and common symbols. Full-screen programs like vim work.</li>
+    <li>It uses its own set of tmux sessions, so it does not mix with the tmux you run on the computer yourself.</li>
+  </ul>
+  <p>tmux has to be installed on the computer (on a Mac, <code>brew install tmux</code>). If it is missing, you are told when you open the terminal.</p>
+</section>
+
+<section id="duet">
+  <h2>Duet</h2>
+  <p>A Duet pairs two conversations, usually on two different models. In a conversation's <span class="ui">＋</span>, choose <span class="ui">Duet…</span> and give it a partner: a new conversation on another engine, or one you already have. Then choose how the two work together.</p>
+  <p>The Duet's state is kept on the computer, and the computer drives each round, so it runs to the end even with the phone locked.</p>
+
+  <h3>Brainstorm</h3>
+  <p>You say something, and the primary and the partner both answer it at the same time, with the two answers shown side by side. The primary then sums up, first where they disagree and then a conclusion, in a box of its own titled “Round N conclusion”. <span class="ui">Hand to the primary</span> in that box takes you to the primary's conversation to have it act on the conclusion.</p>
+  <p>Both sides are read-only by default. To let one of them make changes, change it in that member's settings.</p>
+
+  <h3>Watch</h3>
+  <p>You give the primary a task and it does it. The watcher, on another model, looks at the result, runs the tests and gives feedback. The feedback goes back to the primary, which works on it again. This goes on for up to three rounds. The last line of each of the watcher's replies has to be one of three verdicts:</p>
+  <div class="tw"><table>
+    <tr><td>Pass</td><td>The task ends, and the watcher's summary is pushed to you.</td></tr>
+    <tr><td>Go on</td><td>The feedback goes back to the primary for another round. If the third round still says go on, the task stops there and you get a push. You can then choose <span class="ui">3 more rounds</span>.</td></tr>
+    <tr><td>Needs you</td><td>It writes down what you have to decide, and the loop pauses. You answer in the input box, and both sides carry on with your decision.</td></tr>
+  </table></div>
+  <p>You cannot add a message while the loop is running. There is only <span class="ui">Stop</span>. To change your mind, stop it and send again. The watcher works in the same directory as the primary. It only checks and does not change anything.</p>
+  <p>If the primary's permission is Ask before edits, it is changed to Edit automatically when the task starts, because a loop in the background cannot show an approval sheet.</p>
+
+  <h3>Two windows</h3>
+  <p>Two conversations side by side, each going its own way. You can talk to one or ask both at once. Nothing passes between them by itself. Only when you tap <span class="ui">Partner 1 critiques Partner 2</span> (or the other way round) is the other side's last reply handed over for comment, and whatever you typed in the input box goes along as a note.</p>
+</section>
+
+<section id="workflow">
+  <h2>Workflows</h2>
+  <p>A workflow is a pipeline of several steps that can run on a schedule. It runs on the computer, and what it hands you is something finished that you can read, not a chat log. Several templates are included. Two of them, a daily paper digest and a GitHub trending digest, are publications that come out every day. Every step of those two uses Claude Code, so for now they cannot run with only Codex or Cursor installed. The market greys them out and says why.</p>
+
+  <h3>Subscribe</h3>
+  <p>In the market, tap <span class="ui">Subscribe</span> on a template. Subscribing only registers it and does not run it right away. At the time you set, the computer runs an issue by itself, and the row says when the first one will arrive. If you do not want to wait, tap <span class="ui">Run an issue now</span>.</p>
+  <figure>
+    <div class="shot small"><img loading="lazy" src="assets/docs/market-row-subscribed-annotated-en.png" width="780" height="300" alt="A subscribed row in the market: Subscribed on the left, Run an issue now on the right"></div>
+  </figure>
+  <p>The schedule relies on one launchd job on the Mac (one cron line on Linux) that checks every five minutes whether anything is due. The job exists only if you have scheduled something.</p>
+
+  <h3>Reading an issue</h3>
+  <div class="split">
+    <div>
+      <p>Tap “Read” on the publication card on the home page. Each issue of the paper digest has three tiers: must-read, skim and glance.</p>
+      <ul>
+        <li>Long-press a paper to rate it. Your ratings affect what the next few issues pick.</li>
+        <li>Figures can be tapped to enlarge. Earlier issues are all kept.</li>
+        <li>You can read a large-screen version in the computer's browser. For that, the computer starts a reading page on <code>127.0.0.1</code>, which exits by itself when idle.</li>
+      </ul>
+    </div>
+    <figure>
+      <div class="shot"><img loading="lazy" src="assets/docs/reader.png" width="780" height="1400" alt="An issue of the paper digest, which is written in Chinese: three papers in the must-read tier, each with a title, a finding and how to use it"></div>
+    </figure>
+  </div>
+
+  <h3>Building your own</h3>
+  <p>Tap <span class="ui">Build</span> on the home page, choose to start from scratch or revise an existing template, and describe what you want in a sentence. The agent writes the template and checks it once itself.</p>
+  <p>The fork button next to the input box in a conversation opens the workflow panel. With the switch at the top turned on, the agent in this conversation can list and run your workflows and look up their results. With it off, it is an ordinary conversation.</p>
+  <figure>
+    <div class="shot small"><img loading="lazy" src="assets/docs/chat-composer-annotated-en.png" width="780" height="760" alt="The workflow panel in a conversation: 1 is the fork button, 2 is the switch, 3 is Start from scratch and the existing templates"></div>
+  </figure>
+  <p>With the switch on, if the agent wants to create or change a subscription for you, a confirmation sheet comes up first: what to subscribe to, at what time, on which days, how many issues to keep. It takes effect only when you tap Allow. Subscribing yourself in the market does not bring up the sheet.</p>
+  <p>When the agent starts a workflow from a conversation, the sheet lists what the workflow will actually do: each step's permission, its directory, and every command line it will run on the computer. If the phone cannot read it or cannot show all of it, Allow cannot be tapped.</p>
+  <p>A workflow it starts cannot have more permission than the conversation. At the Plan level it cannot start one. If any step needs a higher level than the conversation is on, it cannot start either. Switch levels, or start it yourself from the workflows page. At a level that does not ask you (Auto), a workflow it wrote itself cannot contain command lines or reach outside the conversation's directory. Templates you saved are not held to those two limits.</p>
+</section>
+
+<section id="servers">
+  <h2>Servers</h2>
+  <p>You can save several servers, each with its own credentials and directory. Add, edit and delete them under “Servers” at the bottom of the home page. One of them is the Home server, and the home page shows what is on it.</p>
+  <p>When the app connects to a server, it looks at which engines are installed. If the default engine is missing and another is installed, it uses the installed one.</p>
+
+  <h3 id="scope">Working directory</h3>
+  <p>The directory you enter when adding a server (Project dir) sets what the phone sees of that server. The conversation list, search, background tasks and the directory picker for a new chat all stay inside this directory and its subfolders. Enter <code>~</code> to see the whole computer, <code>~/a</code> to see only a.</p>
+  <p>Attaching files to a conversation is not limited by this. The same computer can be added more than once, each entry with its own directory.</p>
+
+  <h3>Jump hosts</h3>
+  <p>For a server that can only be reached through other machines, add hops under “Route” in the server settings. There can be several. Every hop needs a pinned host key and is not used without one. A hop can use credentials different from the target's.</p>
+  <figure>
+    <div class="shot small"><img loading="lazy" src="assets/docs/route-editor-en.png" width="780" height="400" alt="Route: Hop 1 and Hop 2, each with its host key pinned, Hop 2 with its own credential"></div>
+  </figure>
+
+  <h3 id="providers">Providers</h3>
+  <p>Claude Code and Codex can use third-party model endpoints. Tap “Add provider…” in the chat settings or the server settings:</p>
+  <ul>
+    <li>Pick one of the common ones: GLM, Kimi, MiniMax, DeepSeek, Qwen, OpenRouter. Where a provider has regions, also pick China or international. The address and model names are filled in for you, and you only paste the API key.</li>
+    <li>On saving, the key is used once to ask the provider for its model list.</li>
+    <li>The key is written to <code>~/.pervio/providers/</code> on the computer. The phone does not keep it.</li>
+    <li>Providers already set up the official way in <code>~/.claude/settings.json</code> or <code>~/.codex/config.toml</code> show up by themselves.</li>
+  </ul>
+  <p>Once added, switch between them from the badge menu at the top of any conversation. Cursor can only use its own account.</p>
+</section>
+
+<section id="settings">
+  <h2>Settings</h2>
+  <div class="tw"><table>
+    <tr><td>App language</td><td>Chinese or English. The interface, the prompts the app writes for the model and the push notifications all switch, right away. The content of a workflow template stays in the language it was written in.</td></tr>
+    <tr><td>Text size</td><td>Scales all text in the app, and the terminal's font size follows. It can also follow the system setting.</td></tr>
+    <tr><td>Storage</td><td>Figures from the paper digest are cached on the phone. Those past 500 MB in total, or not looked at for 90 days, are cleaned up at launch. You can also clear them by hand.</td></tr>
+    <tr><td>Privacy Policy</td><td>Opens the <a href="privacy.html#en">privacy policy</a> in the browser.</td></tr>
+  </table></div>
+</section>
+
+<section id="faq">
+  <h2>FAQ</h2>
+
+  <h3>A message is refused because the conversation is running elsewhere</h3>
+  <p>Codex allows only one client to write to a conversation at a time. If the conversation is still open in a terminal, in VS Code or on another phone, a message from this phone is refused and <span class="ui">Take over</span> appears. After you confirm, the other side is disconnected and the message is sent again by itself. No history is lost.</p>
+
+  <h3>No push notifications</h3>
+  <ul>
+    <li>Check in iOS Settings that notifications are allowed for Pervio.</li>
+    <li>The phone has to have connected to this computer once. It hands its push token to the computer when it connects.</li>
+    <li>Run <code>~/.pervio/bin/pervio-push check</code> on the computer. It says what is missing.</li>
+    <li>A version you compiled from source does not get pushes from Pervio's relay. See “Build from source” in the repository README.</li>
+  </ul>
+
+  <h3>No reply in a conversation</h3>
+  <p>First check in the computer's own terminal that the engine works and is logged in (<code>claude</code>, <code>codex</code> or <code>agent</code>). If Claude Code works in the terminal but Pervio says it is not logged in, see <a href="#claude-login">above</a>.</p>
+
+  <h3>Do I have to set it up again after changing networks?</h3>
+  <p>Not with Tailscale, because the address stays the same. With a LAN IP, the computer's address may change when you switch Wi-Fi. Change Host in the server settings.</p>
+
+  <h3>The computer restarted</h3>
+  <p>Just reconnect in the app. Background tasks and terminal sessions that were running before the restart do not come back. Scheduled workflows continue only after you log in on the computer.</p>
+
+  <h3>Whose servers does my data go through?</h3>
+  <p>Conversations, files and tasks travel only between the phone and your own computer, over SSH. Only the title and body of push notifications go through Pervio's relay, and that can be turned off. There is no account and no analytics. Details are in <a href="privacy.html#en">Privacy</a>.</p>
+</section>
+
+<section id="uninstall">
+  <h2>Uninstall</h2>
+  <p>Delete the app on the phone. On a Mac, run this in a terminal:</p>
+<pre>launchctl bootout gui/$(id -u)/com.pervio.schedule 2&gt;/dev/null   <i># only if you scheduled a workflow</i>
+rm -f ~/Library/LaunchAgents/com.pervio.schedule.plist
+tmux -L pervio kill-server 2&gt;/dev/null                           <i># terminal sessions still open</i>
+rm -rf ~/.pervio</pre>
+  <p>On Linux, run these three lines:</p>
+<pre>crontab -l | grep -v '# pervio-schedule' | crontab -             <i># only if you scheduled a workflow</i>
+tmux -L pervio kill-server 2&gt;/dev/null                           <i># terminal sessions still open</i>
+rm -rf ~/.pervio</pre>
+  <p>Claude Code, Codex, Cursor and their conversation records are yours and are not affected.</p>
+</section>
+
+<section id="privacy">
+  <h2>Privacy</h2>
+  <ul>
+    <li>Conversations, files and tasks travel only between your phone and your computer, inside SSH, and never through any Pervio server. The app has no account, no analytics and no crash reporting.</li>
+    <li>SSH keys and passwords are stored in the iOS Keychain. Provider API keys are stored on the computer.</li>
+    <li>The title and body of push notifications go through Pervio's relay. The relay does not keep them, and it can be turned off.</li>
+  </ul>
+  <p>The full text is in the <a href="privacy.html#en">privacy policy</a>. The code is on <a href="https://github.com/pervio/Pervio">GitHub</a> under the MIT license.</p>
+</section>
+
+</article>
+</div>
+
+<footer>
+  <div class="wrap">
+    <span>Pervio, MIT license</span>
+    <nav>
+      <a href="en.html">Home</a>
+      <a href="privacy.html#en">Privacy</a>
+      <a href="support.html">Support</a>
+      <a href="https://github.com/pervio/Pervio">GitHub</a>
+      <a href="docs.html" lang="zh-CN">中文</a>
+    </nav>
+  </div>
+</footer>
+
+</body>
+</html>

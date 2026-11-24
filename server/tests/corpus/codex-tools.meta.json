@@ -1,0 +1,45 @@
+{
+  "scenario": "codex-tools",
+  "backend": "codex",
+  "model": "gpt-5.4-mini",
+  "capturedUTC": "2026-08-07T08:58:08Z",
+  "cliVersion": "codex-cli 0.146.1",
+  "command": "server/bin/pervio-chat --text --backend codex --dir /home/pervio/work --prompt-b64 <base64 of the prompt below> --sandbox workspace-write --model gpt-5.4-mini --effort low",
+  "prompt": "Do exactly two things and then stop:\n1. Create a file named note.txt in the current directory containing exactly the line: corpus\n2. Run `cat note.txt`.\nThen reply with the single word: done",
+  "exitCode": 0,
+  "events": 9,
+  "seconds": 19.8,
+  "usage": {
+    "inputTokens": 37277,
+    "cachedInputTokens": 29824,
+    "outputTokens": 147,
+    "reasoningOutputTokens": 30,
+    "costUSD": null
+  },
+  "sessionIdRedactedTo": "00000000-0000-4000-8000-000000000001",
+  "covers": [
+    "item.started/item.completed command_execution",
+    "item.completed file_change"
+  ],
+  "twin": "claude-tools",
+  "noTwinBecause": null,
+  "free": false,
+  "redactions": [
+    "workdir (plain, realpath, and '-'-encoded) -> /home/pervio/work",
+    "$HOME -> /home/pervio, username -> pervio",
+    "hostname -> pervio-host",
+    "IANA timezone -> Etc/UTC",
+    "UUIDs -> 00000000-0000-4000-8000-0000000000NN (consistent within a file)",
+    "req_… -> req_000…NN",
+    "bulk vendor/environment values -> '<redacted: …>' markers (keys and types preserved; see 'scrubbedPaths')"
+  ],
+  "scrubbedPaths": [
+    "payload.base_instructions.text",
+    "payload.content.text",
+    "payload.state.environments.timezone",
+    "payload.state.host_skills.body",
+    "payload.timezone"
+  ],
+  "regenerate": "python3 server/tests/capture_corpus.py --only codex-tools",
+  "note": "REAL agent output. Everything except the values listed under 'redactions' is byte-for-byte what the CLI emitted."
+}

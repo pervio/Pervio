@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+"""pervio-ports — the TCP services listening on this Mac, for the phone's web
+preview (2026-11-06): which ports a dev server, a docs site, a dashboard is
+on, with the process behind each and when it started, so the phone can offer
+"open 3000 · node" instead of asking for a number.
+
+    pervio-ports list        → JSON [{port, bind, process, pid, since}], newest first
+
+Reads `lsof -nP -iTCP -sTCP:LISTEN -F pcn` (machine-readable fields: pid,
+command, name "127.0.0.1:3000" / "*:3000" / "[::1]:3000"). One row per port
+(a server bound on several addresses is one service), loopback-only binds
+marked so the phone can say "only this Mac can see it". sshd's own port is
+left out — the phone is already on it. Nothing is written anywhere."""
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+
+
+def _lsof():
+    exe = shutil.which("lsof") or "/usr/sbin/lsof"
+    try:
+        p = subprocess.run([exe, "-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pcn"],
+                           capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return p.stdout
+
+
+def _started(pid):
+    """Epoch seconds the process started, 0 when ps cannot say."""
+    try:
+        out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=5).stdout.strip()
+        if not out:
+            return 0
+        return int(time.mktime(time.strptime(out, "%a %b %d %H:%M:%S %Y")))
+    except (OSError, ValueError, subprocess.SubprocessError, OverflowError):
+        return 0
+
+
+def parse(lsof_text):
+    """[{port, bind, process, pid}] from lsof -F pcn output; the caller adds
+    `since`. Loopback wins over wildcard for the same port's `bind`."""
+    rows = {}
+    pid, cmd = None, ""
+    for line in lsof_text.splitlines():
+        if not line:
+            continue
+        tag, val = line[0], line[1:]
+        if tag == "p":
+            pid, cmd = (int(val) if val.isdigit() else None), ""
+        elif tag == "c":
+            cmd = val
+        elif tag == "n" and pid is not None:
+            host, _, port = val.rpartition(":")
+            if not port.isdigit():
+                continue
+            port = int(port)
+            host = host.strip("[]")
+            loop = host in ("127.0.0.1", "::1", "localhost")
+            bind = "loopback" if loop else "all"
+            cur = rows.get(port)
+            if cur is None:
+                rows[port] = {"port": port, "bind": bind, "process": cmd, "pid": pid}
+            elif cur["bind"] == "all" and loop:
+                cur["bind"] = "loopback"
+    return [r for p, r in sorted(rows.items())]
+
+
+def cmd_list():
+    rows = parse(_lsof())
+    rows = [r for r in rows if r["process"] not in ("sshd", "sshd-session")]
+    since = {}
+    for r in rows:
+        if r["pid"] not in since:
+            since[r["pid"]] = _started(r["pid"])
+        r["since"] = since[r["pid"]]
+    rows.sort(key=lambda r: (-r["since"], r["port"]))
+    sys.stdout.write(json.dumps(rows) + "\n")
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] not in ("list",):
+        sys.stderr.write("usage: pervio-ports list\n")
+        sys.exit(2)
+    cmd_list()
+
+
+if __name__ == "__main__":
+    main()

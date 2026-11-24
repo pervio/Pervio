@@ -1,0 +1,51 @@
+name: CI
+
+# Two cheap gates so an outside PR can't rot the trunk:
+#   server — the entire no-cost regression suite (hermetic shims, zero model calls)
+#   ios    — the app compiles (simulator build, no signing, no tests)
+# Paid layers (--e2e / --live) stay manual by design.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  server:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Server regression suites
+        run: bash server/tests/run_all.sh
+
+  ios-build:
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install xcodegen
+        run: brew install xcodegen
+      - name: Generate project
+        working-directory: ios
+        run: xcodegen generate
+      - name: Build (simulator, unsigned)
+        working-directory: ios
+        # pipefail: without it the step's result is `tail`'s, and a failed build
+        # shows green. The compiler's own error lines are printed after the
+        # tail: the last twenty lines of a failed build name the file and
+        # never the reason (2026-11-23, a red build nobody could read).
+        shell: bash
+        run: |
+          set -o pipefail
+          xcodebuild -version
+          rc=0
+          xcodebuild -project Pervio.xcodeproj -scheme Pervio \
+            -destination 'generic/platform=iOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO build > build.log 2>&1 || rc=$?
+          tail -20 build.log
+          grep -nE '(error|fatal error): ' build.log | sort -u -t: -k2 | head -60 || true
+          exit "$rc"

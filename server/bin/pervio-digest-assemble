@@ -1,0 +1,1482 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""pervio-digest-assemble — the deterministic (token-free) half of the layered
+morning-digest workflow. One binary, five subcommands, each of which is a
+COMMAND step in the digest spec and reads the run's own state via
+$PERVIO_WF_DIR (pervio-orchestrate hands every command step that env var):
+
+    pick        candidates 前 K 行(深读名单,不是必读名单;NO_CANDIDATES 原样放行)
+    materials   read fanout 逐子输出 + 抓取清单 → 逐篇材料 JSON 数组(给 decompose fanout, split=json)
+    recheck     decompose 逐子 entry + 同篇材料 + 程序测量 → 核查材料数组(给 verify fanout)
+    reviseitems 核查未过条目的打回重写材料:上一版 entry + fix 清单 + 材料(给 revise fanout)
+    recheck2    重写后条目的复核材料,与 recheck 同构、逐项对位(给 verify2 fanout)
+    entries     过了核查门(round1 pass 或重写出有效 entry)的 entry 数组(给 trends)
+    issue       拼版:成品晨报到 stdout(publish 步),counts.json 落在 run 目录
+
+为什么存在:fan-out 步的 ledger 聚合输出每个子项截断在 4096 字符、还带
+"[N] OK/FAIL" 机头,三种 split 都切不动它——所以逐项配对不走 ledger 聚合,
+走 dispatch/fanout/<step>/<i>/out.jsonl(run_child 只删 worktree,完整
+out.jsonl 留在原地,目录名 <i> 就是 split 顺序)。materials 数组的顺序是
+唯一的次序源;decompose 第 i 个子项拿的就是 materials[i],verify 第 k 个
+子项拿的就是 recheck[k]。recheck 与 issue 用同一个纯函数从同一批不再变化
+的文件重推这个映射,配对不靠解析任何模型产出的聚合文本。每一步的配对再用
+条目自带的 arXiv id 对表一次:对不上就整篇弃掉并说明(fail-closed)。
+
+VERIFY GATE(硬编码,这个工具的存在理由):issue 拼 round1 pass==true 的条目,
+以及核查未过但重写产出了有效 entry 的条目(有界:只重写一次)。复核(verify2)
+自 2026-08-20 起只留意见不毙人(意见进 counts.json 的 review_notes)——历史上
+被它毙掉的每篇 ledger_bad 均为 0,死因清一色文风。仍然出局的只有结构性坏死:
+拆解产出无效、重写子项没跑成或产出不是 JSON、配对失守、深读卡缺失——这些没有
+可发布的 entry,进期末「本期未过核查」逐条点名(带原因),并以一行住进扫过。
+spec 里没有 revise 步时自动退化为单轮门(child 目录不存在即判定)。
+
+三层出版(2026-08-20 定的口径:必读+速读+扫过 = 标题行「扫了 N 篇」,每篇论文
+恰好有一个家):
+  必读   过核查的全部(★>=3.5 深读且过审),全文块,按初筛评分序——不再切
+         前三;从前的「值得看」并回这里(2026-08-20,用户裁定)
+  速读   初筛 ★2.5-3.4,引言级速读卡(上限 MID_MAX,溢出的落回扫过)
+  扫过   兜底层:上面两层没收走的每一篇——★<2.5 的、速读窗溢出的、没进深读
+         名单的、以及深读了但没过核查的(带「未过核查」标记,标题用它重写后
+         的题目——被毙的论文至少留下题目,08-11 空刊教训的楼板)。评分行照抄
+         初筛评语,按 ★ 降序,不设上限;初筛输出解析不出评分行就只剩未过核查
+         行,并在统计行写明「解析不出」而不是「今天没有」
+统计行报三层的数与合计,并报初筛分片覆盖(成功片/总片);合计与标题行
+对不上时在统计行如实注明两个数。
+
+排版本体承自验收过的 assemble.py:程序保证的版式(今日一句永不截断句中、
+链接只在 meta 行、判断词逐字程序插入、统计行用独立实现反数复核,对不上
+退出码 3 不出报)。步骤 id(fetch/candidates/pick/read/decompose/recheck/
+verify/trends)是本工具与晨报 spec 的共同契约,写死在 STEP_* 常量里。
+"""
+
+import argparse
+import datetime
+import json
+import os
+import re
+import sys
+
+# ---- spec contract: the digest workflow's step ids --------------------------
+STEP_FETCH = "fetch"
+STEP_CANDIDATES = "candidates"
+STEP_PICK = "pick"
+STEP_READ = "read"
+STEP_DECOMPOSE = "decompose"
+STEP_VERIFY = "verify"
+STEP_REVISE = "revise"          # 打回重写(核查未过的条目,一轮,有界)
+STEP_VERIFY2 = "verify2"        # 重写后的复核;意见留档,不再出局(2026-08-20)
+STEP_TRENDS = "trends"
+STEP_SCORE = "score"
+STEP_MIDPICK = "midpick"   # 第二档的选文(★2.5–3.4)
+STEP_MIDREAD = "midread"   # 第二档:引言级速读
+STEP_TASTE = "taste"       # 口味整合(2026-08-22 起为普通步 + optional)
+CAND_MIN = 3.5             # 必读候选的初筛门槛(原 candidates 步内嵌的 3.5)
+
+PICK_TOP = 3            # 必读篇数:candidates 按初筛分排好序,取前 K
+NO_CAND = "NO_CANDIDATES"
+NO_TRENDS = "NO_TRENDS"
+
+VERDICTS = ("可以试", "读原文", "观望")
+ARTIFACTS = ("正式开源", "匿名评审镜像", "只承诺没链接", "无")
+LINKABLE_ARTIFACTS = ("正式开源", "匿名评审镜像")
+TEXT_FIELDS = ("id", "title", "meta_number", "stuck", "move", "evidence")
+PARAS = (("问题", "stuck"), ("怎么解决的", "move"), ("数字", "evidence"))
+
+# 汉字口径(写死):CJK 统一表意文字基本区 U+4E00–U+9FFF,仅此一段。
+HAN = re.compile(r"[一-鿿]")
+CONTENT_CHAR = re.compile(r"[0-9A-Za-z一-鿿]")
+MIN_OVERLAP = 10
+QUOTE_MAX_HANZI = 40
+QUOTE_MIN_HANZI = 8     # 短于这个的半句读不出意思,不如退到下一档
+MD_LINK = re.compile(r"\[([^\]]*)\]\([^)]*\)")
+BARE_URL = re.compile(r"https?://\S+")
+# 趋势条目是模型写的,编号可能是半角 "1)" 也可能是全角 "1）"「１.」——数字和
+# 分隔符都要半角+全角成对,否则整条 "1）……" 带着编号原样印进「趋势」节。
+# 分隔符字面全角字符只在 [] 里,不做 \u 转义那一套(这是数据类不是句子切点)。
+LIST_PREFIX = re.compile("^\\s*(?:[\\d０-９]+\\s*[.．。、)）\\]]|[-*•])\\s*")
+EN_TAIL = re.compile(r"(?:^|(?<=[^!-~]))[!-~]+(?:\s+[!-~]+){7,}\s*$")
+# 中文标点写成 \u 转义,不写字面。理由是这一行自己的历史:SENT_SPLIT 原本是
+# [。；!?;!?] 那样半角全角都有的类,某次编辑把全角 ;!? 归一成了半角,于是类里
+# 剩下三对重复的半角标点,而模型写的中文正文全是全角 ,;: —— 句子从此永远切不开,
+# 今日一句天天掉到「标题——判断词」兜底,一行红都没有(仓库自己的行文是半角,
+# 所有夹具也就都是半角)。同一次归一还吃掉了 ARXIV_PREFIX 的全角冒号,于是
+# 「arXiv:2608.xxxxx」这种写法整篇按配对失守丢掉。正则里不放字面全角字符,
+# \u 转义谁也归一不掉。
+SENT_SPLIT = re.compile("(?<=[\u3002;!?\uff1b\uff01\uff1f])")
+CLAUSE_SPLIT = re.compile("(?<=[,\uff0c\u3001;\uff1b:\uff1a])")   # 今日一句的次级切点
+ARXIV_PREFIX = re.compile("(?i)^\\s*arxiv\\s*[:\uff1a]\\s*")
+ARXIV_ID = re.compile(r"arXiv:(\d{4}\.\d{4,5})")
+NUMBERED = re.compile(r"^\s*\d+[.)]\s*")        # the orchestrator's split anchor
+REPORT_DATE = re.compile(r"REPORT_DATE:\s*(\d{4}-\d{2}-\d{2})")
+CODE_FENCE = re.compile(r"(?s)^```[a-zA-Z]*\s*|\s*```$")
+
+TRICK_WORDS = ("对照组", "抵消", "门控", "分流", "缓存", "先猜后验")
+CAUSAL_WORDS = ("正好", "所以", "因此", "于是", "因为", "从而", "才")
+
+
+def die(msg, code=2):
+    sys.stderr.write("pervio-digest-assemble: %s\n" % msg)
+    sys.exit(code)
+
+
+# ---------------------------------------------------------------- wf readers
+
+def wf_dir():
+    d = os.environ.get("PERVIO_WF_DIR", "")
+    if not d or not os.path.isdir(d):
+        die("PERVIO_WF_DIR is not set or not a directory (this tool runs as a "
+            "command step inside a pervio-orchestrate digest run)")
+    return d
+
+
+def step_meta(wf, sid):
+    """The ledger's whole record for one step (fanout stats etc.); {} if absent
+    or unreadable — the footer's shard segment degrades to nothing, never dies."""
+    try:
+        with open(os.path.join(wf, "ledger.json"), errors="replace") as f:
+            led = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    for st in led.get("steps", []):
+        if st.get("id") == sid:
+            return st
+    return {}
+
+
+def step_output(wf, sid):
+    """A step's final output text, from the run's ledger."""
+    try:
+        with open(os.path.join(wf, "ledger.json"), errors="replace") as f:
+            led = json.load(f)
+    except (OSError, ValueError) as e:
+        die("ledger.json unreadable: %s" % e)
+    for s in led.get("steps", []):
+        if s.get("id") == sid:
+            return s.get("output", "") or ""
+    return ""
+
+
+def child_text(wf, sid, i):
+    """Fan-out child i's final message, from its full on-disk stream (NOT the
+    4096-truncated ledger aggregate). Parses both backends' stream-json, same
+    shapes as _pervio_lib.child_result. Returns "" when missing/failed."""
+    path = os.path.join(wf, "dispatch", "fanout", sid, str(i), "out.jsonl")
+    text, is_err = "", False
+    try:
+        with open(path, errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except ValueError:
+                    continue
+                t = o.get("type")
+                if t == "result":                                   # claude
+                    text = o.get("result") or text
+                    is_err = bool(o.get("is_error"))
+                elif t == "item.completed" and (o.get("item") or {}).get("type") == "agent_message":
+                    text = (o["item"].get("text") or text)          # codex
+                elif t in ("turn.failed", "error"):
+                    is_err = True
+    except OSError:
+        return ""
+    return "" if is_err else text
+
+
+def assistant_texts(wf, sid, i):
+    """Every assistant text block in a fan-out child's stream, in order. The
+    salvage substrate: a plan-perm child sometimes ends its turn with an empty
+    result (or a wrap-up line) while the real answer sits mid-stream."""
+    path = os.path.join(wf, "dispatch", "fanout", sid, str(i), "out.jsonl")
+    out = []
+    try:
+        with open(path, errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except ValueError:
+                    continue
+                if o.get("type") == "assistant":
+                    for blk in ((o.get("message") or {}).get("content") or []):
+                        t = blk.get("text") if isinstance(blk, dict) else None
+                        if t and t.strip():
+                            out.append(t.strip())
+    except OSError:
+        pass
+    return out
+
+
+def salvage_card(wf, i, pid):
+    """A read child that wrote its card mid-turn and closed with a wrap-up line
+    ('卡片已输出…') still HAS the card in its stream: the last assistant text
+    block carrying this paper's id. Deterministic salvage, id check intact —
+    a stream with no id-bearing block still drops the paper (fail-closed)."""
+    best = ""
+    for t in assistant_texts(wf, STEP_READ, i):
+        if pid in t and len(t) > 80:
+            best = t
+    return best
+
+
+def child_entry(wf, sid, i, pid):
+    """Parsed + id-matched + validated entry JSON from a decompose/revise
+    child: the final message first, then (salvage) the assistant blocks last-
+    to-first. Returns (entry, "") or (None, reason) — fail-closed, the id
+    check is what makes salvage safe."""
+    cands = []
+    raw = child_text(wf, sid, i)
+    if (raw or "").strip():
+        cands.append(raw)
+    cands.extend(reversed(assistant_texts(wf, sid, i)))
+    reason = "子项没跑成或产出不是 JSON"
+    for t in cands:
+        e = parse_model_json(t)
+        if e is None:
+            continue
+        if norm_id(e.get("id")) != pid:
+            reason = "entry.id 与材料编号对不上(配对失守)"
+            continue
+        problems = []
+        validate(e, "arXiv:%s" % pid, problems)
+        if problems:
+            reason = "产出无效:" + problems[0]
+            continue
+        return e, ""
+    return None, reason
+
+
+def numbered_items(text):
+    """The orchestrator's `numbered` split, re-implemented byte-compatibly:
+    split BEFORE each ^\\s*\\d+[.)] line, drop non-numbered chunks, strip the
+    number. Item order here IS the fan-out child index order."""
+    items = []
+    for part in re.split(r"(?m)^(?=\s*\d+[.)])", text or ""):
+        part = part.strip()
+        if re.match(r"^\d+[.)]", part):
+            items.append(NUMBERED.sub("", part).strip())
+    return items
+
+
+def repair_bare_quotes(s):
+    """Escape the unescaped English double quotes a model left INSIDE a JSON
+    string value. Character scan; while in a string, a `"` is the real closer
+    only if the next non-space character is one of , : } ] or the text ends —
+    anything else means the model was quoting a term and forgot the backslash.
+    Returns the repaired text (possibly identical). Best-effort by construction:
+    a bare quote that happens to sit right before a comma is indistinguishable
+    from a closer, which is why the caller only ever uses this AFTER strict
+    parsing failed, and still validates whatever comes out."""
+    out, in_str, i, n = [], False, 0, len(s)
+    while i < n:
+        c = s[i]
+        if not in_str:
+            out.append(c)
+            in_str = (c == '"')
+            i += 1
+        elif c == "\\":                    # already-escaped pair travels as-is
+            out.append(s[i:i + 2])
+            i += 2
+        elif c == '"':
+            j = i + 1
+            while j < n and s[j] in " \t\r\n":
+                j += 1
+            if j >= n or s[j] in ",:}]":
+                out.append(c)
+                in_str = False
+            else:
+                out.append('\\"')
+            i += 1
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def _json_object(text):
+    try:
+        v = json.loads(text)
+    except ValueError:
+        return None
+    return v if isinstance(v, dict) else None
+
+
+def parse_model_json(text):
+    """A model's 'only output a JSON object' reply, tolerantly: strip fences,
+    else take the outermost {...} span. Returns dict or None.
+
+    LAST RESORT (2026-08-11): the day's highest-scoring paper was thrown away
+    because its decompose child wrote an unescaped English double quote inside a
+    string value. Both prompts now forbid it — and this repairs it once anyway,
+    because a prompt is a request and a parser is a guarantee. Only after strict
+    parsing has failed, only once, and it says on stderr when it fired; text that
+    still won't parse is still rejected."""
+    s = CODE_FENCE.sub("", (text or "").strip()).strip()
+    m = re.search(r"(?s)\{.*\}", s)
+    span = m.group(0) if m else None
+    for cand in (s, span):
+        if cand is not None:
+            v = _json_object(cand)
+            if v is not None:
+                return v
+    for cand in (s, span):
+        if cand is None:
+            continue
+        fixed = repair_bare_quotes(cand)
+        if fixed == cand:
+            continue
+        v = _json_object(fixed)
+        if v is not None:
+            sys.stderr.write("[parse] 严格 JSON 解析失败,补上字符串值里的裸英文"
+                             "双引号后解析成功(整篇因此保住)\n")
+            return v
+    return None
+
+
+def fetch_block(fetch_out, arxiv_id):
+    """This paper's raw entry in the fetch listing, verbatim: the '- P… ·'
+    block (header line + indented body, the id sits on the body's arXiv line)
+    whose body carries this arXiv id. Shard headers (^N)) end a block."""
+    blocks, cur = [], []
+    for line in (fetch_out or "").splitlines():
+        if re.match(r"^- P\d+ · ", line):
+            if cur:
+                blocks.append("\n".join(cur).rstrip())
+            cur = [line]
+        elif cur:
+            if re.match(r"^\s*\d+[.)]\s", line):      # next shard header
+                blocks.append("\n".join(cur).rstrip())
+                cur = []
+            else:
+                cur.append(line)
+    if cur:
+        blocks.append("\n".join(cur).rstrip())
+    for b in blocks:
+        if ("arXiv:%s" % arxiv_id) in b:
+            return b
+    return ""
+
+
+def norm_id(s):
+    return ARXIV_PREFIX.sub("", str(s or "").strip())
+
+
+# ------------------------------------------------------- the pairing function
+
+def score_records(wf):
+    """初筛的结构化产物:json/score.json(引擎按 outputSchema 校验后的各分片
+    数组,2026-08-22 起)拍平,同一编号取最高分。老运行(文本行世界)回退到
+    正则抠 aggregate。返回 (best: id->{id,stars,reason,hit}, rows: 总行数)。"""
+    best, rows = {}, 0
+    try:
+        with open(os.path.join(wf, "json", "score.json"), encoding="utf-8") as f:
+            arrs = json.load(f)
+        for arr in (arrs if isinstance(arrs, list) else []):
+            for r in (arr if isinstance(arr, list) else []):
+                if not isinstance(r, dict):
+                    continue
+                pid = norm_id(str(r.get("id", "")))
+                try:
+                    v = float(r.get("stars"))
+                except (TypeError, ValueError):
+                    continue
+                if not pid:
+                    continue
+                rows += 1
+                if pid not in best or v > best[pid]["stars"]:
+                    best[pid] = {"id": pid, "stars": v,
+                                 "reason": str(r.get("reason", "")).strip(),
+                                 "hit": str(r.get("hit", "")).strip()}
+        return best, rows
+    except (OSError, ValueError):
+        best, rows = {}, 0
+    for m in re.finditer(r"arXiv:(\d+\.\d+) \| ★([\d.]+) \| [^|\n]* \| ([^|\n]+)",
+                         step_output(wf, STEP_SCORE)):
+        try:
+            v = float(m.group(2))
+        except ValueError:
+            continue
+        rows += 1
+        pid = m.group(1)
+        if pid not in best or v > best[pid]["stars"]:
+            best[pid] = {"id": pid, "stars": v,
+                         "reason": m.group(3).strip(), "hit": ""}
+    return best, rows
+
+
+def list_items_ids(text):
+    """选文名单 → (按序的 id 列表, quiet)。两种形态:JSON 数组(2026-08-22 起,
+    元素是 {id,…} 对象或哨兵字符串)优先;老的编号行世界回退 numbered_items。
+    列表次序就是 fan-out 子项目录名的次序——配对协议的地基,两个世界同一条规矩。
+    解析不出编号的位置以 None 占位(占位不占错:次序不能被跳过的行搞歪)。"""
+    t = CODE_FENCE.sub("", (text or "").strip()).strip()
+    if t.startswith("["):
+        try:
+            arr = json.loads(t)
+        except ValueError:
+            arr = None
+        if isinstance(arr, list):
+            if not arr or all(isinstance(x, str) and NO_CAND in x for x in arr):
+                return [], True
+            ids = []
+            for x in arr:
+                if isinstance(x, dict):
+                    ids.append(norm_id(str(x.get("id", ""))) or None)
+                else:
+                    m = ARXIV_ID.search(str(x))
+                    ids.append(m.group(1) if m else None)
+            return ids, False
+    items = numbered_items(text)
+    if not items or all(NO_CAND in it for it in items):
+        return [], True
+    out = []
+    for it in items:
+        m = ARXIV_ID.search(it)
+        out.append(m.group(1) if m else None)
+    return out, False
+
+
+def collect_pairs(wf):
+    """The ONE pairing function recheck and issue both use. Returns
+    (papers, dropped, quiet): papers = [{idx,id,card,fetch}] in pick order
+    (idx = read child index), dropped = [(id_or_label, reason)],
+    quiet = True when the day is a NO_CANDIDATES day."""
+    pick_out = step_output(wf, STEP_PICK)
+    fetch_out = step_output(wf, STEP_FETCH)
+    ids, quiet = list_items_ids(pick_out)
+    if quiet:
+        return [], [], True
+    papers, dropped = [], []
+    for i, pid in enumerate(ids):
+        if not pid:
+            dropped.append(("必读第 %d 条" % (i + 1), "名单行里没有 arXiv 编号"))
+            continue
+        card = (child_text(wf, STEP_READ, i) or "").strip()
+        if card == NO_CAND:
+            dropped.append((pid, "深读失败(无卡片)"))
+            continue
+        if not card or pid not in card:
+            # final message isn't the card (wrap-up line) — salvage from stream
+            card = salvage_card(wf, i, pid)
+        if not card:
+            dropped.append((pid, "深读失败(无卡片)"))
+            continue
+        if pid not in card:
+            dropped.append((pid, "深读卡与名单编号对不上(配对失守)"))
+            continue
+        fb = fetch_block(fetch_out, pid)
+        if not fb:
+            dropped.append((pid, "抓取清单里找不到原始条目"))
+            continue
+        papers.append({"idx": i, "id": pid, "card": card, "fetch": fb})
+    return papers, dropped, False
+
+
+def collect_entries(wf):
+    """papers + decompose children → (valid, rejected, quiet).
+    valid = [{paper, entry}] in materials order (decompose child j ↔ papers[j],
+    because the materials array papers built is decompose's split source);
+    rejected = [(id, reason)] inherited from dropped papers plus decompose
+    failures. Pure function of on-disk state — recheck/entries/issue all agree."""
+    papers, dropped, quiet = collect_pairs(wf)
+    if quiet:
+        return [], [], True
+    valid, rejected = [], list(dropped)
+    for j, p in enumerate(papers):
+        entry, why = child_entry(wf, STEP_DECOMPOSE, j, p["id"])
+        if entry is None:
+            rejected.append((p["id"], "拆解" + why, None))
+            continue
+        valid.append({"paper": p, "entry": entry})
+    return valid, rejected, False
+
+
+def _verdict(wf, sid, k):
+    raw = child_text(wf, sid, k)
+    return parse_model_json(raw) if (raw or "").strip() else None
+
+
+def _nfix(verdict):
+    fixes = verdict.get("fixes")
+    return len(fixes) if isinstance(fixes, list) else 0
+
+
+def collect_round1(wf):
+    """valid entries + verify children → (passing, failed, rejected, quiet).
+    verify child k ↔ valid[k] (the recheck array built from valid IS verify's
+    split source). failed = [(v, verdict)] — pass=false WITH a parseable
+    verdict, i.e. the ones a bounded revision round can still save."""
+    valid, rejected, quiet = collect_entries(wf)
+    if quiet:
+        return [], [], [], True
+    passing, failed = [], []
+    for k, v in enumerate(valid):
+        verdict = _verdict(wf, STEP_VERIFY, k)
+        if verdict is None:
+            rejected.append((v["paper"]["id"], "核查子项没跑成或产出不是 JSON", v["entry"]))
+            continue
+        if verdict.get("pass") is True:
+            passing.append(v)
+        else:
+            failed.append((v, verdict))
+    return passing, failed, rejected, False
+
+
+def collect_gated(wf):
+    """THE VERIFY GATE: an entry is in iff its round-1 verdict is pass==true,
+    or it was revised into a VALID entry (revise child r ↔ failed[r], same
+    re-derived index pairing as round 1).
+
+    复核(verify2)自 2026-08-20 起不再有一票否决权 —— 用户裁定。数据说话:
+    08-11 至 08-20 每一篇被复核毙掉的文章 ledger_bad 都是 0(每个数字都有
+    逐字原文出处),死因清一色是文风类(专名串误判为散文搬运、给「三」这种
+    结构数字要台账条目)。事实层有 round-1 核查 + 台账逐条对账兜着;重写一轮
+    修掉真问题后,残余的文风意见不值一篇论文的命。verify2 仍在 spec 里跑,
+    它的意见进 counts.json 的 review_notes 留档(谁想看吹毛求疵尽管看),
+    但不再拦发布。
+
+    仍然 fail-closed 的(这些不是文风,是结构):拆解产出无效、重写子项没跑
+    成或产出不是 JSON、配对失守 —— 没有可发布的 entry,才叫毙。Runs whose
+    spec has no revise steps degrade to the round-1-only gate."""
+    passing, failed, rejected, quiet = collect_round1(wf)
+    if quiet:
+        return [], [], True, []
+    out = list(passing)
+    review_notes = []
+    has_revise = os.path.isdir(os.path.join(wf, "dispatch", "fanout", STEP_REVISE))
+    for r, (v, verdict) in enumerate(failed):
+        pid = v["paper"]["id"]
+        why1 = "核查未过(%d 条 fix)" % _nfix(verdict)
+        if not has_revise:
+            rejected.append((pid, why1, v["entry"]))
+            continue
+        entry2, why2 = child_entry(wf, STEP_REVISE, r, pid)
+        if entry2 is None:
+            rejected.append((pid, why1 + ",重写" + why2, v["entry"]))
+            continue
+        # verify2(复核二轮)2026-08-22 裁撤(用户裁定):自 08-20 去武装后它
+        # 每天雇 15 个旗舰子代理,产出只进没人读的 review_notes——纯成本。
+        # review_notes 的字段形状保留(恒空),counts.json 的读者无感。
+        out.append({"paper": v["paper"], "entry": entry2})
+    out.sort(key=lambda v: v["paper"]["idx"])   # issue order = pick (score) order
+    return out, rejected, False, review_notes
+
+
+# ------------------------------------------------------ 第二档:引言级速读
+# 深读那一条链上,每一步都有下一步替它把关(拆解→核查→重写→复核),所以配对
+# 失守只丢一篇。速读没有下游:midread 的子项就是出刊内容本身。于是这里的规矩
+# 是「单篇 fail-closed,整节 fail-open」——一篇解析不出就跳过那一篇(它照旧能
+# 从「扫过」拿回初筛评语,读者不会彻底看不见它),整步没输出就整节省略,绝不
+# 让第二档的失败拖垮已经花了 opus 流水线的必读三篇。
+
+def mid_entry(wf, i, pid):
+    """midread 子项 i 的速读卡:先读最终消息,再(兜底)倒着读流里的 assistant
+    文本块——和 child_entry 同一套打捞法,同一道 id 对表闸门。返回
+    (entry, "") 或 (None, reason)。"""
+    cands = []
+    raw = child_text(wf, STEP_MIDREAD, i)
+    if (raw or "").strip():
+        cands.append(raw)
+    cands.extend(reversed(assistant_texts(wf, STEP_MIDREAD, i)))
+    if any((t or "").strip() == NO_CAND for t in cands):
+        return None, "速读子项回了 " + NO_CAND
+    reason = "子项没跑成或产出不是 JSON"
+    for t in cands:
+        e = parse_model_json(t)
+        if e is None:
+            continue
+        if norm_id(e.get("id")) != pid:
+            reason = "速读卡编号与名单对不上(配对失守)"
+            continue
+        title, summary = e.get("title"), e.get("summary")
+        if not (isinstance(title, str) and title.strip()
+                and isinstance(summary, str) and summary.strip()):
+            reason = "速读卡缺 title 或 summary"
+            continue
+        # source 只认这两个字面值。写别的(或没写)一律按 abstract 记:宁可
+        # 多挂一个「仅摘要」标记,也不能让一张只看了摘要的卡冒充读过正文。
+        src = e["source"] if e.get("source") in MID_SOURCES else "abstract"
+        return {"id": pid, "title": title, "summary": summary, "source": src}, ""
+    return None, reason
+
+
+def collect_midread(wf):
+    """midpick 名单 ↔ midread fan-out 子项,按 numbered 序重推配对(与
+    collect_pairs 同一条规矩:名单的次序就是子项目录名)。返回可渲染的速读卡
+    列表;NO_CANDIDATES 日、midpick 没跑、一篇也解析不出 → 空列表(整节省略)。"""
+    ids, quiet = list_items_ids(step_output(wf, STEP_MIDPICK))
+    if quiet:
+        return []
+    out = []
+    for i, pid in enumerate(ids):
+        if not pid:
+            sys.stderr.write("[issue] 速读弃:名单第 %d 条里没有 arXiv 编号\n" % (i + 1))
+            continue
+        e, why = mid_entry(wf, i, pid)
+        if e is None:
+            sys.stderr.write("[issue] 速读弃:%s(%s)\n" % (pid, why))
+            continue
+        out.append(e)
+    return out
+
+
+# ------------------------------------------------------------- render layer
+# (承自验收过的 assemble.py;版式与自检逐行保留)
+
+def hanzi_count(s):
+    return len(HAN.findall(s))
+
+
+def clean_text(s, stats):
+    s = " ".join(str(s).split())
+    n_star = s.count("★")
+    if n_star:
+        stats["stars_removed"] += n_star
+        s = s.replace("★", "")
+    n_link = len(MD_LINK.findall(s)) + len(BARE_URL.findall(s))
+    if n_link:
+        stats["links_stripped"] += n_link
+        s = MD_LINK.sub(r"\1", s)
+        s = BARE_URL.sub("", s)
+        s = " ".join(s.split())
+    m = EN_TAIL.search(s)
+    if m and hanzi_count(s[: m.start()]) > 0:
+        stats["en_tails_removed"] += 1
+        s = s[: m.start()].rstrip()
+    return s.strip()
+
+
+def clause_prefix(sent, limit):
+    """The longest run of WHOLE clauses at the head of `sent` that fits in
+    `limit` 汉字, trailing clause punctuation trimmed. Splits only after
+    , 、 ; : — so it can shorten a sentence without ever cutting inside a
+    word — and returns "" when even the first clause blows the budget."""
+    take = []
+    for part in CLAUSE_SPLIT.split(sent):
+        if not part.strip():
+            continue
+        if hanzi_count("".join(take) + part) > limit:
+            break
+        take.append(part)
+    head = "".join(take).strip().strip(",，、;；:：").strip()
+    # 括号里切一刀比超长更糟(真事故:「在两类场景(协作编程小组」)。
+    # 括号没配平就整只回退到上一个配平的前缀;退无可退返回 ""(走兜底)。
+    while head and (head.count("(") + head.count("(")
+                    > head.count(")") + head.count(")")):
+        cut = max(head.rfind("("), head.rfind("("))
+        head = head[:cut].strip().strip(",，、;；:：").strip()
+    return head
+
+
+def pick_quote(move_text, title, verdict):
+    """今日一句, in three descending tiers, all VERBATIM from the first
+    must-read's move (the program never writes a sentence):
+      1. a whole sentence within the 40-汉字 budget — trick word first, then
+         causal word, then reading order;
+      2. failing that, the longest whole-clause head of the best-ranked
+         sentence (a 90-汉字 single-sentence move is common and must not cost
+         the reader the line);
+      3. only then 「标题——判断词」 — which repeats the ### title verbatim two
+         lines below it, and on 2026-08-11 (one must-read) that is exactly what
+         shipped. It is the last resort, not the second.
+    """
+    sents = [x.strip() for x in SENT_SPLIT.split(move_text) if x.strip()]
+    ranked, seen = [], set()
+    for s in ([s for s in sents if any(w in s for w in TRICK_WORDS)]
+              + [s for s in sents if any(w in s for w in CAUSAL_WORDS)]
+              + sents):
+        if s not in seen:
+            seen.add(s)
+            ranked.append(s)
+    for s in ranked:
+        if hanzi_count(s) <= QUOTE_MAX_HANZI:
+            return s
+    for s in ranked:
+        head = clause_prefix(s, QUOTE_MAX_HANZI)
+        if hanzi_count(head) >= QUOTE_MIN_HANZI:
+            return head
+    return "%s——%s" % (title, verdict)
+
+
+def normalize_for_overlap(s):
+    chars, idx = [], []
+    for i, ch in enumerate(s):
+        if CONTENT_CHAR.match(ch):
+            chars.append(ch.lower())
+            idx.append(i)
+    return "".join(chars), idx
+
+
+def overlap_fragments(para_text, card_text):
+    a, amap = normalize_for_overlap(para_text)
+    b, _ = normalize_for_overlap(card_text)
+    n, m = len(a), len(b)
+    spans = set()
+    prev = [0] * (m + 1)
+    for i in range(1, n + 1):
+        cur = [0] * (m + 1)
+        ai = a[i - 1]
+        for j in range(1, m + 1):
+            if ai == b[j - 1]:
+                length = prev[j - 1] + 1
+                cur[j] = length
+                if length >= MIN_OVERLAP and (i == n or j == m or a[i] != b[j]):
+                    spans.add((i - length, i))
+        prev = cur
+    keep = []
+    for s0, s1 in sorted(spans, key=lambda t: (t[0], t[0] - t[1])):
+        if any(k0 <= s0 and s1 <= k1 for k0, k1 in keep):
+            continue
+        keep.append((s0, s1))
+    return [{"text": para_text[amap[s0]:amap[s1 - 1] + 1], "chars": s1 - s0}
+            for s0, s1 in sorted(keep)]
+
+
+MID_LO, MID_HI = 2.5, 3.5   # 第二档(引言级速读)的分数区间
+MID_MAX = 8                 # 第二档一期最多几篇
+MID_SOURCES = ("intro", "abstract")   # 速读卡的信息来源,只认这两个字面值
+
+
+def recount_body(doc):
+    """独立复算统计行:从排好版的成品逐行反数,口径同统计行注释。"""
+    total = 0
+    for line in doc.split("\n"):
+        if line.startswith("**"):
+            close = line.find("**", 2)
+            text = line[close + 2:] if close != -1 else line
+        else:
+            m = re.match(r"\d+\. ", line)
+            if not m:
+                continue
+            text = line[m.end():]
+        total += sum(1 for ch in text if 0x4E00 <= ord(ch) <= 0x9FFF)
+    return total
+
+
+def validate(entry, label, problems):
+    if not isinstance(entry, dict):
+        problems.append("%s: entry 不是 JSON 对象" % label)
+        return
+    for k in TEXT_FIELDS:
+        v = entry.get(k)
+        if not isinstance(v, str) or not v.strip():
+            problems.append("%s: 字段 %s 缺失或为空" % (label, k))
+    act = entry.get("act")
+    if not isinstance(act, dict) or not isinstance(act.get("line"), str) or not act.get("line", "").strip():
+        problems.append("%s: act 必须是 {verdict, line} 且 line 非空" % label)
+    elif act.get("verdict") not in VERDICTS:
+        problems.append("%s: act.verdict 必须逐字取自 %s,现在是 %r"
+                        % (label, "|".join(VERDICTS), act.get("verdict")))
+    if entry.get("artifact") not in ARTIFACTS:
+        problems.append("%s: artifact 必须逐字取自 %s,现在是 %r"
+                        % (label, "|".join(ARTIFACTS), entry.get("artifact")))
+    if not isinstance(entry.get("artifact_url", ""), str):
+        problems.append("%s: artifact_url 必须是字符串(可为空)" % label)
+    ledger = entry.get("ledger")
+    if (not isinstance(ledger, list) or not ledger
+            or not all(isinstance(x, dict)
+                       and isinstance(x.get("claim"), str) and x.get("claim", "").strip()
+                       and isinstance(x.get("source"), str) and x.get("source", "").strip()
+                       for x in ledger)):
+        problems.append("%s: ledger 必须是非空 [{claim, source}] 列表且逐条非空" % label)
+
+
+def render_block(entry, stats, figs_map=None):
+    title = clean_text(entry["title"], stats)
+    arxiv_id = norm_id(entry["id"])
+    meta_number = clean_text(entry["meta_number"], stats)
+    artifact = entry["artifact"]
+    url = (entry.get("artifact_url") or "").strip()
+    if artifact in LINKABLE_ARTIFACTS and url:
+        artifact_str = "[%s](%s)" % (artifact, url)
+    else:
+        artifact_str = artifact
+
+    paras = {}
+    # 三段各带名牌:裸的「无」谁也猜不到是代码状态——没有前缀区分,
+    # 读的人不明白它指的是什么。
+    # 方法图(2026-08-24):由 figs 步程序化抽取(零模型),这里按 id 领取。
+    # 渲染成独立的 markdown 图片行嵌进卡片;域名硬白名单 arxiv.org。行首是
+    # "!",两套汉字计数器(** 与编号行)天然跳过;"](" 计入 links_in_block,
+    # 链接自检自动对账。没有就整块不出现——和「开源:未见」同一个哲学,
+    # 但连「未见」都不写。
+    fig = (figs_map or {}).get(arxiv_id) or {}
+    fig_url = (fig.get("figure_url") or "").strip()
+    lines = ["### %s" % title,
+             "[arXiv:%s](https://arxiv.org/abs/%s) · 看点:%s · 代码:%s"
+             % (arxiv_id, arxiv_id, meta_number, artifact_str),
+             ""]
+    for zh, key in PARAS:
+        text = clean_text(entry[key], stats)
+        paras[key] = text
+        lines.append("**%s** %s" % (zh, text))
+        lines.append("")
+        if key == "move":
+            # 流程行(2026-08-24):一行文字数据流,辅读的结构线不是正文段——
+            # 故意不加粗:recount_body 只认 ** 与编号行,两套汉字计数器都
+            # 天然跳过它,统计口径(写死勿改)不受牵连。
+            flow = clean_text(entry.get("flow") or "", stats).strip()
+            if flow and flow != "无":
+                lines.append("流程:%s" % flow)
+                lines.append("")
+            if fig_url.startswith("https://arxiv.org/"):
+                lines.append("![方法图%s](%s)"
+                             % ((":" + fig["caption"]) if fig.get("caption") else "", fig_url))
+                lines.append("")
+    act_line = clean_text(entry["act"]["line"], stats)
+    verdict = entry["act"]["verdict"]      # 判断词由程序逐字插入
+    paras["act_line"] = act_line
+    lines.append("**要不要动手** %s:%s" % (verdict, act_line))
+
+    block = "\n".join(lines)
+    info = {
+        "id": entry["id"],
+        "verdict": verdict,
+        "para_hanzi": {k: hanzi_count(v) for k, v in paras.items()},
+        "links_in_block": block.count("]("),
+        "title_hanzi": hanzi_count(title),
+    }
+    info["para_total"] = sum(info["para_hanzi"].values())
+    info["body_hanzi"] = info["para_total"] + hanzi_count(verdict)
+    paras["meta_number"] = meta_number     # meta 行不进正文口径,只做 overlap
+    return block, info, paras
+
+
+def render_trends(raw, stats):
+    items = []
+    for line in (raw or "").splitlines():
+        line = " ".join(line.split())
+        if not line or line == NO_TRENDS:
+            continue
+        line = LIST_PREFIX.sub("", line)
+        line = clean_text(line, stats)
+        line = line.strip(" ·-")
+        if line:
+            items.append(line)
+    numbered = ["%d. %s" % (i, t) for i, t in enumerate(items, 1)]
+    return numbered, items
+
+
+# ---------------------------------------------------------------- subcommands
+
+def material_text(p):
+    return ("这一篇的深读卡:\n\n%s\n\n这一篇在抓取清单里的原始条目:\n\n%s"
+            % (p["card"], p["fetch"]))
+
+
+FIG_TIMEOUT = 15          # 单篇抓取上限(秒);抓不到就是没有,绝不拦刊
+FIG_CACHE = os.path.join(os.path.expanduser("~"), ".pervio", "papers", "figures")
+FIG_MAX_BYTES = 3 * 1024 * 1024   # 单图上限;论文图偶有巨兽,超限只留 URL 直连
+FIG_IMG = re.compile(r'<figure[^>]*>.*?<img[^>]+src="([^"]+)"', re.S)
+FIG_CAP = re.compile(r'<figcaption[^>]*>(.*?)</figcaption>', re.S)
+
+
+def _entry_fig_nos(wf):
+    """{论文id: 深读员指认的方法图编号}。编号由真读过论文的深读员在卡片里
+    给出(方案乙,2026-08-27)、拆解步照抄进 entry.fig_no——模型只出一个
+    数字的判断,图本身仍由程序在页面里定位、HEAD 实证。老运行没有该字段,
+    返回空表,一切退回启发式。"""
+    out = {}
+    try:
+        valid, _rej, quiet = collect_entries(wf)
+        if quiet:
+            return out
+        for v in valid:
+            n = str(v["entry"].get("fig_no") or "").strip()
+            if n.isdigit():
+                out[v["paper"]["id"]] = int(n)
+    except Exception:
+        return {}
+    return out
+
+
+def _choose_figure(cands, fig_no):
+    """从候选 (url, caption) 里裁定要哪张:有编号先按图注「Figure N」对号;
+    对不上按序取第 N 张;没编号取第一张。Table 图注的候选一律不算(它们也
+    住在 <figure> 里,但表格截图从来不是方法图)。"""
+    figs = [(u, c) for u, c in cands if not (c or "").lower().startswith("table")]
+    if not figs:
+        return None
+    if fig_no:
+        pat = re.compile(r"^figure\s*%d\b" % fig_no, re.I)
+        for u, c in figs:
+            if pat.match((c or "").strip()):
+                return (u, c)
+        if 1 <= fig_no <= len(figs):
+            return figs[fig_no - 1]
+    return figs[0]
+
+
+def _fig_shrink(path):
+    """手机秒开的关键(2026-08-27):原图动辄半兆,SSH 上还要 base64 再涨三成。
+    macOS 自带 sips:先把最长边压到 1200(手机渲染高不过 260pt,足够);仍超
+    250KB 的 PNG 转 JPEG q75(方法图是示意图,肉眼无损)。任何一步失败都保留
+    现状——压缩是加速,不配当障碍。Linux 上无 sips,原样跳过。"""
+    import shutil as _sh
+    import subprocess as _sp
+    if not _sh.which("sips"):
+        return
+    try:
+        _sp.run(["sips", "-Z", "1200", path], capture_output=True, timeout=30)
+        if os.path.getsize(path) > 250 * 1024 and path.lower().endswith(".png"):
+            jpg = os.path.splitext(path)[0] + ".jpg"
+            r = _sp.run(["sips", "-s", "format", "jpeg", "-s", "formatOptions", "75",
+                         path, "--out", jpg], capture_output=True, timeout=30)
+            if r.returncode == 0 and os.path.getsize(jpg) < os.path.getsize(path):
+                os.remove(path)
+            else:
+                try:
+                    os.remove(jpg)
+                except OSError:
+                    pass
+    except Exception:
+        pass
+
+
+def figs_candidates(page, html):
+    """纯解析半边(网络无关,套件可测):从一篇 arXiv HTML 里按序列出方法图
+    候选 (url, caption)。规则:<figure> 里的位图 <img>;滤 data: 与站点装饰;
+    相对地址按浏览器规则以页面 URL(或 <base> 标签)解析——手工加斜杠会把
+    论文号拼两遍,上过当;域名白名单 arxiv.org。存在性不在这里裁定,由调用方
+    HEAD 验证。"""
+    import urllib.parse
+    base = page
+    bm = re.search(r'<base[^>]+href="([^"]+)"', html)
+    if bm:
+        base = urllib.parse.urljoin(page, bm.group(1))
+    out = []
+    for m in FIG_IMG.finditer(html):
+        src = m.group(1)
+        if src.startswith("data:") or "/static/" in src:
+            continue
+        url = urllib.parse.urljoin(base, src)
+        if not url.startswith("https://arxiv.org/"):
+            continue
+        cap = ""
+        cm = FIG_CAP.search(html, m.start())
+        if cm:
+            cap = re.sub(r"<[^>]+>", "", cm.group(1))
+            # 图注要完整给读者(2026-08-28:60 字剪到没头没尾,被用户抓包)。
+            # 200 字够任何正经图注;方括号圆括号换成全角——图注是要进
+            # ![alt](url) 的 alt 槽的,一个半角 ] 就能把整行图片语法打回原形。
+            cap = " ".join(cap.split())[:200]
+            cap = (cap.replace("[", "\u3014").replace("]", "\u3015")
+                      .replace("(", "\uff08").replace(")", "\uff09"))
+        out.append((url, cap))
+    return out
+
+
+def cmd_figs(wf, args):
+    """方法图的确定性抽取(2026-08-24):对每篇必读的 arXiv HTML 页抓原始
+    网页,程序抽第一张真图(<figure> 里的位图 <img>,滤掉站点装饰与
+    data: 内联),零模型参与——图要么逐字来自页面,要么没有。名单从 stdin
+    读(pick 的 JSON 数组,引擎的数据道);输出 JSON 数组
+    [{id, figure_url, caption}],单篇失败静默跳过,整步永远 exit 0:
+    方法图是锦上添花,不配拦刊。"""
+    import urllib.parse
+    import urllib.request
+    try:
+        picks = json.loads(sys.stdin.read() or "[]")
+    except ValueError:
+        picks = []
+    out = []
+    fig_nos = _entry_fig_nos(wf)
+    for r in picks if isinstance(picks, list) else []:
+        if not isinstance(r, dict):
+            continue
+        pid = norm_id(str(r.get("id", "")))
+        if not pid:
+            continue
+        page = "https://arxiv.org/html/%sv1" % pid
+        try:
+            req = urllib.request.Request(page, headers={"User-Agent": "pervio-digest/1.0"})
+            with urllib.request.urlopen(req, timeout=FIG_TIMEOUT) as f:
+                html = f.read(2 * 1024 * 1024).decode("utf-8", "replace")
+        except Exception:
+            continue
+        chosen = _choose_figure(figs_candidates(page, html), fig_nos.get(pid))
+        for url, cap in ([chosen] if chosen else []):
+            # 存在性由服务器裁定,不靠拼接猜:HEAD 非 200 一律不要。
+            try:
+                hreq = urllib.request.Request(url, method="HEAD",
+                                              headers={"User-Agent": "pervio-digest/1.0"})
+                with urllib.request.urlopen(hreq, timeout=FIG_TIMEOUT) as hf:
+                    if hf.status != 200:
+                        continue
+            except Exception:
+                continue
+            # 落本地缓存(2026-08-27,用户裁定"直接 ssh 传递"):手机直连
+            # arxiv 在国内慢到转圈,Mac 抓取快——出刊时把图下载到
+            # ~/.pervio/papers/figures/<id>.<ext>,app 经 SSH 秒取并本地缓存。
+            # 下载失败只损失快路(markdown 里的 arxiv 直连 URL 仍是兜底)。
+            try:
+                os.makedirs(FIG_CACHE, exist_ok=True)
+                ext = os.path.splitext(url)[1].lower()
+                if ext not in (".png", ".jpg", ".jpeg", ".gif", ".webp"):
+                    ext = ".png"
+                dst = os.path.join(FIG_CACHE, pid + ext)
+                greq = urllib.request.Request(url, headers={"User-Agent": "pervio-digest/1.0"})
+                with urllib.request.urlopen(greq, timeout=FIG_TIMEOUT) as gf:
+                    data = gf.read(FIG_MAX_BYTES + 1)
+                if 0 < len(data) <= FIG_MAX_BYTES:
+                    with open(dst + ".tmp", "wb") as df:
+                        df.write(data)
+                    os.replace(dst + ".tmp", dst)
+                    _fig_shrink(dst)
+            except Exception:
+                pass
+            out.append({"id": pid, "figure_url": url, "caption": cap})
+            break
+    sys.stdout.write(json.dumps(out, ensure_ascii=False) + "\n")
+    return 0
+
+
+def cmd_pick(wf, args):
+    """必读名单:初筛 ★≥CAND_MIN 按分数取前 N(原 candidates 步的门槛并了进来,
+    那步的"用正则抠评委作文"随 2026-08-22 的 JSON 车道整个退休)。输出 JSON
+    数组(read 步 fan-out 的 split:json 源);空日输出 ["NO_CANDIDATES"] 哨兵,
+    让 0 号子项走 NO_CANDIDATES 应答而不是让 fan-out 空转失败。"""
+    best, _ = score_records(wf)
+    kept = sorted((r for r in best.values() if r["stars"] >= CAND_MIN),
+                  key=lambda r: (-r["stars"], r["id"]))[:args.top]
+    if not kept:
+        sys.stdout.write(json.dumps([NO_CAND]) + "\n")
+        return 0
+    sys.stdout.write(json.dumps(
+        [{"id": r["id"], "stars": r["stars"],
+          "url": "https://arxiv.org/html/%sv1" % r["id"]} for r in kept],
+        ensure_ascii=False) + "\n")
+    return 0
+
+
+def cmd_midpick(wf, args):
+    """第二档的选文:初筛 ★MID_LO–MID_HI 的论文,给 midread 步 fan-out。
+
+    这一档存在的理由:★≥3.5 走深读+核查的重流程,★<MID_LO 只有初筛一句评语,
+    中间这批(有点意思但不值得一整套)以前直接掉进「扫过」,读者只看得到打分员
+    的速记。现在给它们一次便宜的引言级阅读。"""
+    best, _ = score_records(wf)
+    mid = sorted((r for r in best.values() if MID_LO <= r["stars"] < MID_HI),
+                 key=lambda r: (-r["stars"], r["id"]))[:args.top]
+    if not mid:
+        sys.stdout.write(json.dumps([NO_CAND]) + "\n")
+        return 0
+    sys.stdout.write(json.dumps(
+        [{"id": r["id"], "stars": r["stars"],
+          "url": "https://arxiv.org/html/%sv1" % r["id"]} for r in mid],
+        ensure_ascii=False) + "\n")
+    return 0
+
+
+def cmd_materials(wf, args):
+    papers, dropped, quiet = collect_pairs(wf)
+    for pid, why in dropped:
+        sys.stderr.write("[materials] 弃:%s(%s)\n" % (pid, why))
+    if quiet or not papers:
+        sys.stdout.write(json.dumps([NO_CAND]) + "\n")
+        return 0
+    sys.stdout.write(json.dumps([material_text(p) for p in papers],
+                                ensure_ascii=False) + "\n")
+    return 0
+
+
+def measured_block(entry, card):
+    """〈程序测量〉给核查员:四段汉字数 + 与深读卡的 ≥10 字连续相同片段,
+    由程序量好(与 issue 拼版口径同源),核查员照抄判断,不自己数。"""
+    stats = {"stars_removed": 0, "links_stripped": 0, "en_tails_removed": 0}
+    fields = [("meta_number", clean_text(entry["meta_number"], stats)),
+              ("stuck", clean_text(entry["stuck"], stats)),
+              ("move", clean_text(entry["move"], stats)),
+              ("evidence", clean_text(entry["evidence"], stats)),
+              ("act_line", clean_text(entry["act"]["line"], stats))]
+    counts = {k: hanzi_count(t) for k, t in fields}
+    lines = ["〈程序测量(尺寸和搬运已由程序量好,你不用数)〉",
+             "四段汉字数:stuck %d / move %d / evidence %d / act_line %d"
+             "(目标附近 80/100/80/45),total %d"
+             % (counts["stuck"], counts["move"], counts["evidence"],
+                counts["act_line"], sum(v for k, v in counts.items()
+                                        if k != "meta_number"))]
+    frags = []
+    for k, t in fields:
+        for fr in overlap_fragments(t, card):
+            # 只列散文为主的片段:汉字 < 8 的命中几乎全是专名/数字/公式
+            # (GPT-5.5 + Claude Code、SU 公式……),规则本来就许保留,
+            # 列出来只会诱使核查员机械记 fix。
+            if hanzi_count(fr["text"]) >= 8:
+                frags.append("- %s:「%s」(归一 %d 字)" % (k, fr["text"], fr["chars"]))
+    if frags:
+        lines.append("与深读卡连续相同的散文片段(专名/数字/公式为主的已剔除):")
+        lines.extend(frags)
+    else:
+        lines.append("与深读卡连续相同的散文片段:无(专名/数字/公式为主的已剔除)")
+    return "\n".join(lines)
+
+
+def cmd_recheck(wf, args):
+    valid, rejected, quiet = collect_entries(wf)
+    for r in rejected:
+        sys.stderr.write("[recheck] 未进核查:%s(%s)\n" % (r[0], r[1]))
+    if quiet or not valid:
+        sys.stdout.write(json.dumps([NO_CAND]) + "\n")
+        return 0
+    items = []
+    for v in valid:
+        items.append("待核对的 JSON(拆解产出):\n\n%s\n\n%s\n\n%s"
+                     % (json.dumps(v["entry"], ensure_ascii=False, indent=2),
+                        material_text(v["paper"]),
+                        measured_block(v["entry"], v["paper"]["card"])))
+    sys.stdout.write(json.dumps(items, ensure_ascii=False) + "\n")
+    return 0
+
+
+def cmd_reviseitems(wf, args):
+    """One item per round-1-failed entry: its last version, the verifier's fix
+    list (verbatim), the material, and the program measurements — everything a
+    revision child needs to comply without re-deep-reading anything."""
+    _, failed, _, quiet = collect_round1(wf)
+    if quiet or not failed:
+        sys.stdout.write(json.dumps([NO_CAND]) + "\n")
+        return 0
+    items = []
+    for v, verdict in failed:
+        fixes = verdict.get("fixes") if isinstance(verdict.get("fixes"), list) else []
+        items.append("上一版拆解 JSON:\n\n%s\n\n核查员的 fix 清单(逐条照办):\n\n%s\n\n%s\n\n%s"
+                     % (json.dumps(v["entry"], ensure_ascii=False, indent=2),
+                        "\n".join("- %s" % f for f in fixes) or "- (核查员没给出可执行的 fix)",
+                        material_text(v["paper"]),
+                        measured_block(v["entry"], v["paper"]["card"])))
+    sys.stdout.write(json.dumps(items, ensure_ascii=False) + "\n")
+    return 0
+
+
+def cmd_recheck2(wf, args):
+    """Verify round 2: recheck-shaped items for the REVISED entries. STRICTLY
+    one item per failed[r] — an invalid revision gets the NO_CANDIDATES
+    sentinel (its child echoes it back, cheap) — so verify2 child r always
+    pairs with failed[r]; a skip here would shift every index after it."""
+    _, failed, _, quiet = collect_round1(wf)
+    if quiet or not failed:
+        sys.stdout.write(json.dumps([NO_CAND]) + "\n")
+        return 0
+    items = []
+    for r, (v, verdict) in enumerate(failed):
+        entry2, _why = child_entry(wf, STEP_REVISE, r, v["paper"]["id"])
+        if entry2 is None:
+            items.append(NO_CAND)
+            continue
+        items.append("待核对的 JSON(拆解产出):\n\n%s\n\n%s\n\n%s"
+                     % (json.dumps(entry2, ensure_ascii=False, indent=2),
+                        material_text(v["paper"]),
+                        measured_block(entry2, v["paper"]["card"])))
+    sys.stdout.write(json.dumps(items, ensure_ascii=False) + "\n")
+    return 0
+
+
+def cmd_entries(wf, args):
+    passing, rejected, quiet, _notes = collect_gated(wf)
+    for r in rejected:
+        sys.stderr.write("[entries] 未过核查:%s(%s)\n" % (r[0], r[1]))
+    sys.stdout.write(json.dumps([v["entry"] for v in passing],
+                                ensure_ascii=False, indent=2) + "\n")
+    return 0
+
+
+def cmd_issue(wf, args):
+    passing, rejected, quiet, review_notes = collect_gated(wf)
+    fetch_out = step_output(wf, STEP_FETCH)
+    m = REPORT_DATE.search(fetch_out or "")
+    date = args.date or (m.group(1) if m else datetime.date.today().isoformat())
+    trends_raw = step_output(wf, STEP_TRENDS)
+
+    stats = {"stars_removed": 0, "links_stripped": 0, "en_tails_removed": 0}
+    # 第二档先收——今日一句要看它。深读名单空的日子(没有一篇够 ★3.5)第二档
+    # 照样能捞到 ★2.5–3.4 的几篇,那一期底下印着速读卡,标题行却写「今天没有值得
+    # 读的」,自相矛盾(2026-08-14 真出过这一期)。渲染仍在下面原位。
+    mid = collect_midread(wf)
+    if passing:
+        first = passing[0]["entry"]
+        first_move = clean_text(first["move"], stats)
+        first_title = " ".join(str(first["title"]).split())
+        quote = pick_quote(first_move, first_title, first["act"]["verdict"])
+    elif mid:
+        quote = "今天没有必读——%d 篇速读级的,五分钟翻完" % len(mid)
+    elif quiet:
+        quote = "今天没有值得读的——休息一天也是判断"
+    else:
+        quote = "今天的候选没有一篇过得了核查——宁缺毋滥"
+
+    # 标题行带总数:读者第一眼要知道这一期是从多大的池子里挑出来的。
+    # fetch 步自己在首行报「… last 3d · N new …」,直接读它,数不出来就不写
+    # (宁可少一行,也不写一个编的数)。
+    m_new = re.search(r"(\d+)\s+new", fetch_out or "")
+    scanned = (" · 扫了 %s 篇" % m_new.group(1)) if m_new else ""
+    # 方法图领取处:figs 步(程序抽取)的产出;步不存在/失败/产出坏 → 空表,
+    # 全刊无图照常出——锦上添花不拦刊。
+    figs_map = {}
+    try:
+        for f in json.loads(step_output(wf, "figs") or "[]"):
+            if isinstance(f, dict) and f.get("id"):
+                figs_map[norm_id(str(f["id"]))] = f
+    except (ValueError, TypeError):
+        figs_map = {}
+    out_lines = ["# 论文晨报 %s%s" % (date, scanned),
+                 "> 今日一句:%s" % quote,
+                 ""]
+    blocks_info = []
+    overlap_entries = []
+    # 必读 = 过核查的全部,按初筛评分序全文出卡(2026-08-20 起不再切前三,
+    # 「值得看」并回必读——同样深读、同样过审,只因排名不同就降为三行条,
+    # 读者读出来的是两种可信度,而它们没有)。
+    for v in passing:
+        block, info, paras = render_block(v["entry"], stats, figs_map)
+        blocks_info.append(info)
+        out_lines.append(block)
+        out_lines.append("")
+        overlap_entries.append({
+            "id": v["entry"]["id"],
+            "fragments": {key: overlap_fragments(paras[key], v["paper"]["card"])
+                          for key in ("meta_number", "stuck", "move", "evidence", "act_line")},
+        })
+    if not passing:
+        # 同一条规矩:第二档有货就不许说「没有值得读的」——说清今天有的是什么。
+        if mid:
+            out_lines.append(("今天没有过核查的必读," if rejected else "今天没有必读,")
+                             + "下面 %d 篇速读是今天全部的收获。" % len(mid))
+        else:
+            out_lines.append("今天没有过核查的必读。" if rejected else "今天没有值得读的。")
+        out_lines.append("")
+    # 速读(第二档):初筛 ★2.5–3.4 的,一次引言级阅读换两行——标题行(与值得看
+    # 同形,链接自检按同一条规则数它)+ 一段 2–3 句的速读。没读到正文、只看了
+    # 摘要的,行尾挂一个不打眼的「·仅摘要」:读者据此知道这两行的底子有多厚。
+    # (mid 已在今日一句之前收好——那一句要先知道第二档有没有货。)
+    if mid:
+        out_lines.append("## 速读")
+        out_lines.append("")
+        for e in mid:
+            mark = " ·仅摘要" if e["source"] == "abstract" else ""
+            out_lines.append("- [arXiv:%s](https://arxiv.org/abs/%s) %s%s"
+                             % (e["id"], e["id"], clean_text(e["title"], stats), mark))
+            out_lines.append("  %s" % clean_text(e["summary"], stats))
+        out_lines.append("")
+
+    # 趋势一节已按用户要求撤掉(2026-08-14):它每天在拼三篇不相干的论文,
+    # 读者要的是每篇讲清楚,不是硬凑一条线。trends 步仍在跑(它的产物进
+    # counts.json 备查),但不再进成品;要恢复就把下面两行换回渲染。
+    trend_lines, trend_items = render_trends(trends_raw, stats)
+    trend_lines, trend_items = [], []
+
+    # 扫过:兜底层——上面两层没收走的每一篇都在这里(2026-08-20 口径:
+    # 必读+速读+扫过 = 抬头扫描总数,每篇论文恰好一个家)。三类住户:
+    #   · 深读了但没过核查的:排最前,标题用它重写后的题目 + 「未过核查」
+    #     标记(被毙的论文至少留下题目——08-11 空刊教训的楼板,G1 钉着);
+    #   · 评分行里没被必读/速读收走的:照抄初筛评语,按 ★ 降序,不设上限
+    #     (★<2.5、速读窗溢出、没进深读名单的 ★3.5+,全在这里);
+    #   · 初筛输出解析不出评分行时,只剩未过核查行,统计行写明「解析不出」
+    #     ——绝不让读者把「没解析出来」读成「今天没有」。
+    # 已渲染成速读卡的从评分行剔掉:同一编号不许在相邻两节出现两次;速读
+    # 子项没跑成的那篇会掉回这里拿回它的初筛评语,不至于整期看不见。
+    mid_ids = {e["id"] for e in mid}
+    published_ids = {v["entry"]["id"] for v in passing}
+    rejected_titles = {}
+    for r in rejected:
+        t = ""
+        if len(r) > 2 and isinstance(r[2], dict):
+            t = " ".join(str(r[2].get("title", "")).split())
+        rejected_titles[r[0]] = t
+    best_scores, rows = score_records(wf)
+    score_rows = [(pid, r["stars"], clean_text(r["reason"], stats))
+                  for pid, r in best_scores.items()
+                  if pid not in published_ids and pid not in mid_ids
+                  and pid not in rejected_titles]
+    score_rows.sort(key=lambda t: (-t[1], t[0]))
+    skim_note = "" if rows else "(初筛输出没解析出评分行)"
+    skim_count = len(rejected_titles) + len(score_rows)
+    if skim_count:
+        out_lines.append("## 扫过(初筛评语)")
+        out_lines.append("")
+        for pid in sorted(rejected_titles):
+            title = rejected_titles[pid] or "(题目缺失)"
+            out_lines.append("- [arXiv:%s](https://arxiv.org/abs/%s) %s ·未过核查"
+                             % (pid, pid, title))
+        for pid, star, cmt in score_rows:
+            out_lines.append("- [arXiv:%s](https://arxiv.org/abs/%s) `★%g` %s"
+                             % (pid, pid, star, cmt))
+        out_lines.append("")
+
+    # 期末「本期未过核查」一行:verify 门拒掉的每一篇都点名带原因。
+    if rejected:
+        out_lines.append("本期未过核查:"
+                         + ";".join("arXiv:%s(%s)" % (r[0], r[1]) for r in rejected))
+    # 统计行口径(写死,勿改):只数正文散文段里的 CJK 统一表意文字
+    # (基本区 U+4E00–U+9FFF)。散文段 = 每篇的四段(「今天怎么办」含程序
+    # 插入的判断词)+ 趋势条目。不算:大标题、篇名、meta 行、今日一句、
+    # 未过核查行、统计行本身、标点、数字、英文。
+    trends_hanzi = sum(hanzi_count(t) for t in trend_items)
+    body_hanzi = sum(b["body_hanzi"] for b in blocks_info) + trends_hanzi
+    total = len(passing) + len(mid) + skim_count
+    # 合计与标题行「扫了 N 篇」对账:对不上就在统计行如实注明两个数,绝不悄悄
+    # 少列——三层加和等于标题行总数是 2026-08-20 与用户约定的口径。注记不猜
+    # 方向(上过一次「-3 篇未入列」的当);紧邻的分片覆盖段让读者自己看出原因。
+    if m_new and rows and total != int(m_new.group(1)):
+        skim_note += "(标题行扫描 %d 篇 · 三层收到 %d 篇)" % (int(m_new.group(1)), total)
+    # 初筛分片覆盖:直接读账本里 score 步的 fanout 统计(引擎写的,不是模型说
+    # 的)。老账本/夹具没有该字段时整段省略,历史成品照旧。
+    sm = step_meta(wf, "score")
+    shard_seg = (" · 初筛 %d/%d 片" % (int(sm.get("fanoutOk", 0)), int(sm["fanoutTotal"]))
+                 if sm.get("fanoutTotal") else "")
+    out_lines.append("—— 本期必读 %d 篇 · 速读 %d 篇 · 扫过 %d 篇%s · 合计 %d 篇%s · 正文 %d 汉字(程序测量)"
+                     % (len(passing), len(mid), skim_count, skim_note, total,
+                        shard_seg, body_hanzi))
+    doc = "\n".join(out_lines) + "\n"
+
+    # 出厂自检:坏了宁可不出报(退出码 3 ⇒ 步骤失败 ⇒ 不 publish)
+    fatal = []
+    doc_lines = doc.split("\n")
+    if not doc_lines[1].startswith("> 今日一句:"):
+        fatal.append("第 2 行不是字面 '> 今日一句:'")
+    if "★" in re.sub(r"`[^`\n]*`", "", doc):
+        fatal.append("产物里出现了裸 ★(反引号徽章之外)")
+    brief_links = sum(1 for ln in doc_lines
+                      if ln.startswith("- [arXiv:") and "](https://arxiv.org/abs/" in ln)
+    expected_links = sum(b["links_in_block"] for b in blocks_info) + brief_links
+    if doc.count("](") != expected_links:
+        fatal.append("meta 行以外出现了链接")
+    recount = recount_body(doc)
+    if recount != body_hanzi:
+        fatal.append("正文汉字数复算不一致:排版口径 %d,成品反数 %d" % (body_hanzi, recount))
+    if fatal:
+        for msg in fatal:
+            sys.stderr.write("[issue] 自检失败: %s\n" % msg)
+        return 3
+
+    counts = {
+        "date": date,
+        "today_line_hanzi": hanzi_count(quote),
+        "blocks": blocks_info,
+        "rejected": [{"id": r[0], "why": r[1]} for r in rejected],
+        # 复核(verify2)的残余意见:2026-08-20 起只留档不拦发(文风类不值一篇
+        # 论文的命;事实层由 round-1 核查 + 台账对账兜底,ledger_bad 全程为零)。
+        "review_notes": review_notes,
+        # 分层账:blocks 只记必读,值得看/扫过在它之外——counts.json 不写这一条,
+        # 读它的人就会把「今天 3 篇」当成今天的全部。
+        "tiers": {"must": len(passing), "mid": len(mid), "skim": skim_count,
+                  "rejected": len(rejected), "total": total,
+                  "skim_note": skim_note},
+        "trends": {"items": len(trend_items),
+                   "hanzi": trends_hanzi,
+                   "links": sum(l.count("](") for l in trend_lines)},
+        "body_hanzi_total": body_hanzi,
+        "body_hanzi_recount": recount,
+        "body_hanzi_caliber": ("四段散文(含程序插入的判断词)+趋势条目里的 "
+                               "CJK 统一表意文字 U+4E00–U+9FFF;"
+                               "标题/meta 行/今日一句/未过核查行/统计行/标点/数字/英文不算"),
+        "overlap": {
+            "min_len": MIN_OVERLAP,
+            "note": ("每篇每段(meta_number 行 + 四段散文)与该篇深读卡标点空格归一"
+                     "(只留汉字字母数字,字母小写)后连续相同 >= min_len 字符的"
+                     "极大片段;text 是正文原文,chars 是归一字数。程序测量,给核查员用。"),
+            "entries": overlap_entries,
+        },
+        "sanitizer": stats,
+    }
+    try:
+        with open(os.path.join(wf, "counts.json"), "w", encoding="utf-8") as f:
+            json.dump(counts, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+    except OSError as e:                       # counts 是核查员副产物,不拦出报
+        sys.stderr.write("[issue] counts.json 写不了: %s\n" % e)
+    sys.stdout.write(doc)
+    return 0
+
+
+def cmd_tasteapply(wf, args):
+    """管线开头的画像落笔:读 taste 子项(fanout 之 0 号)的产出,交给
+    pervio-feedback profile 写进 memory.md 的「口味画像」区。
+
+    永远 exit 0 —— 这一步的失败只允许有一种后果:沿用昨天的画像照常出刊
+    (docs/taste.md,2026-08-21 用户裁定)。四条退路,每条都打印原因:
+      子项没产出 / 回了 NO_CHANGE / 产出不是合格清单(feedback 验证拒收)
+      / feedback 本身跑不了 —— 全部落到「沿用昨日画像」。"""
+    import base64
+    import subprocess
+    raw = (step_output(wf, STEP_TASTE) or "").strip()
+    if not raw:                              # 老 spec:fanout 之 0 号子项
+        raw = (child_text(wf, STEP_TASTE, 0) or "").strip()
+    raw = CODE_FENCE.sub("", raw).strip()
+    if not raw:
+        sys.stdout.write("taste 子项无产出,沿用昨日画像\n")
+        return 0
+    if raw == "NO_CHANGE":
+        sys.stdout.write("无新打分,画像不变\n")
+        return 0
+    # taste v2.1: the keeper answers a JSON string array (its outputSchema —
+    # the engine already validated and, if needed, corrected it). [] = nothing
+    # new. Converted to the bullet lines `profile` accepts, so the bullets-only
+    # trust boundary at the writer stays exactly where it was. The legacy
+    # bullet-text shape still falls through unchanged (older spec, hand runs).
+    try:
+        arr = json.loads(raw)
+    except ValueError:
+        arr = None
+    if isinstance(arr, list):
+        rules = []
+        for r in arr:
+            if not isinstance(r, str) or not r.strip():
+                continue
+            r = r.strip()
+            rules.append(r[2:].strip() if r.startswith("- ") else r)
+        if not rules:
+            sys.stdout.write("无新打分,画像不变\n")
+            return 0
+        raw = "\n".join("- " + r for r in rules)
+    fb = os.path.join(os.path.dirname(os.path.realpath(__file__)), "pervio-feedback")
+    cmd = [sys.executable, fb, "profile",
+           "--b64", base64.b64encode(raw.encode("utf-8")).decode()]
+    if getattr(args, "file", None):
+        cmd += ["--file", args.file]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as e:
+        sys.stdout.write("画像写入器跑不了(%s),沿用昨日画像\n" % str(e)[:80])
+        return 0
+    if r.returncode != 0:
+        sys.stdout.write("画像产出被验证拒收(%s),沿用昨日画像\n"
+                         % (r.stderr or "").strip()[:120])
+        return 0
+    sys.stdout.write("画像已更新:%s\n" % (r.stdout or "").strip()[:80])
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        description="晨报流水线的确定性半边:配对、verify 门、拼版(读 $PERVIO_WF_DIR)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("midpick", help="初筛 2.5–3.4 分的名单(第二档速读)")
+    p.add_argument("--top", type=int, default=MID_MAX)
+    p = sub.add_parser("pick", help="candidates 前 K 行(深读名单)")
+    p.add_argument("--top", type=int, default=PICK_TOP)
+    sub.add_parser("materials", help="逐篇材料 JSON 数组(给 decompose)")
+    sub.add_parser("recheck", help="逐篇核查材料 JSON 数组(给 verify)")
+    sub.add_parser("reviseitems", help="核查未过条目的打回重写材料(给 revise)")
+    sub.add_parser("recheck2", help="重写后条目的复核材料(给 verify2)")
+    sub.add_parser("entries", help="过了核查门的 entry JSON 数组(给 trends)")
+    p = sub.add_parser("issue", help="拼版成品到 stdout;counts.json 落 run 目录")
+    p.add_argument("--date", default=None)
+    p = sub.add_parser("figs", help="从必读论文的 arXiv HTML 程序化抽方法图(stdin 读 pick 的 JSON)")
+    p = sub.add_parser("tasteapply", help="把 taste 子项的画像写进 memory.md(失败不拦出刊)")
+    p.add_argument("--file", default=None)   # 测试注入 memory.md 路径;生产走默认
+    args = ap.parse_args(argv)
+    wf = wf_dir()
+    return {"pick": cmd_pick, "midpick": cmd_midpick, "materials": cmd_materials, "recheck": cmd_recheck,
+            "reviseitems": cmd_reviseitems, "recheck2": cmd_recheck2,
+            "entries": cmd_entries, "issue": cmd_issue,
+            "figs": cmd_figs,
+            "tasteapply": cmd_tasteapply}[args.cmd](wf, args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,4002 @@
+#!/usr/bin/env python3
+"""pervio-orchestrate — run a small multi-step agent workflow, detached.
+
+P2 (linear workflows). A workflow is an ordered list of steps; each step runs one
+agent turn via pervio-chat (Claude or Codex), and a later step can reference an
+earlier step's output with `{{stepId.output}}` in its prompt. The whole run is
+DETACHED (its own session, like pervio-run) so it survives the phone disconnecting,
+and its state lives in a plain-JSON ledger the phone polls. No daemon: the runner
+process exits when the workflow finishes.
+
+Spec (JSON), passed base64 to `start`:
+  {
+    "name": "thing",
+    "dir": "/abs/project/dir",            # default working dir for steps
+    "setup": "npm ci",                    # optional: provision each fresh worktree
+    "steps": [
+      {"id":"plan","backend":"claude","perm":"plan","prompt":"…"},
+      {"id":"impl","backend":"codex","sandbox":"workspace-write",
+       "prompt":"Implement this plan:\n{{plan.output}}"}
+    ]
+  }
+
+Worktree isolation (P3): when the workflow dir is a git repo and the DAG contains
+two or more WRITE steps that can run concurrently (neither reaches the other via
+dependsOn ∪ {{id.output}} refs), every in-repo step runs in its own git worktree
+branched from an integration branch (pervio/wf-<wfId>/integration; step branches
+pervio/wf-<wfId>/steps/<id> — same-depth siblings, refs D/F-safe). The orchestrator
+commits each write step's changes, gates them on `verify`, then serially merges
+into the integration branch (a conflict fails the LOSING step with the file list;
+its branch is kept). If every step succeeds and the user's checkout still sits on
+the same branch+commit as at start, the integration branch is fast-forwarded back;
+otherwise the branch is left and ledger.git says so. Fresh worktrees contain only
+COMMITTED state (no node_modules/.env) — the optional top-level `setup` command
+runs in each worktree before its agent turn. Read steps (plan / read-only sandbox,
+no verify) run --detach'd; if one writes anyway its work is rescue-committed and
+the step fails (fail-closed classification: anything else counts as a writer).
+Workflows without concurrent writers run EXACTLY as before (no git ops, no new
+ledger fields). Deleting a run prunes its worktrees and deletes its branches.
+
+Layout, one dir per workflow run:
+  ~/.pervio/wf/<wfId>/
+    spec.json        # the submitted spec
+    ledger.json      # {wfId,name,dir,status,startedAt,steps:[{id,backend,status,
+                     #  output,error,bytes}]}  — the phone reads this
+    <stepId>.jsonl   # that step's raw stream-json (pervio-chat output)
+    status           # "running" -> "exited:<code>"
+    pgid
+
+Command steps: a step with a `command` runs that shell line (bash -lc, in the step
+dir) INSTEAD of an agent turn — its stdout becomes the step's output. Deterministic
+and token-free; the data layer of scheduled digests. {{id.output}} refs are NOT
+substituted into a command (upstream agent text into a shell line is an injection
+vector) — a command is a fixed string, same trust level as `verify`. Output is read
+incrementally into a BOUNDED buffer: CMD_MAX_OUTPUT bytes are kept, the rest is
+drained (so a big-but-finite command still finishes and reports its own exit code)
+up to CMD_MAX_DRAIN, past which the command is a firehose — its process group is
+killed and the step fails saying so, instead of the runner buffering it all in RAM.
+
+Publish: a step with `publish: true` (or `publish: "<dir>"`) is the workflow's
+publication — the moment that STEP succeeds (not the whole run), its final output
+is archived as today's issue, <dir>/<YYYY-MM-DD>.md (default dir
+~/.pervio/archives/<slug-of-name>/), written atomically; a same-day rerun
+overwrites. Empty output publishes nothing (a quiet day must not become a blank
+issue), and a write failure never fails an otherwise-good step (runner.err says
+why). The ledger step records publishedTo; `archives list` folds publish dirs in
+beside the legacy display.archiveDir compat layer. At most one step per spec.
+
+Schedules: `schedule` fires a saved spec on a daily clock with no daemon. The OS
+scheduler (macOS LaunchAgent / Linux crontab, registered once by `schedule add`)
+invokes `schedule tick` every 5 minutes; tick is the brain: at-most-once per due
+period (catch-up after sleep/reboot fires the most recent missed period only —
+the state re-read, the launch and the period claim all happen inside the schedule's
+own lock, the one every phone verb takes, so a pause can never be raced by a start),
+an overlap guard that checks the previous run's LIVENESS (pgid, not just ledger
+text — a reboot mid-run must not wedge the schedule), 3 start attempts per period,
+and pruning of old runs past keepRuns (via the normal delete, so conversations
+sweep too). State: ~/.pervio/schedules/<id>/{spec.json,schedule.json}. The hook
+exists only while >=1 enabled schedule exists (zero wakeups otherwise). Tests
+inject time via PERVIO_TICK_NOW, skip OS registration via PERVIO_SCHED_HOOK=skip,
+and pick the hook flavour via PERVIO_SCHED_HOOK_KIND=darwin|cron (CI runs on Linux).
+
+Params (F2): `start --params-b64 <b64(JSON object name->value)>` mechanically
+substitutes {{param.<name>}} placeholders — into each step's `prompt` and the
+top-level spec `dir` ONLY, never into `command`/`verify`/anything else (a param
+value in a shell line is an injection vector). Values must be str/int/bool. Any
+{{param. left ANYWHERE in the spec after substitution (a placeholder in a
+command, an undeclared name, a value smuggling a new placeholder in) rejects the
+whole start: params only substitute into prompts and dir. Substitution runs
+BEFORE _validate_spec, so a substituted dir goes through the same _dir_ok
+'..'-traversal check as a literal one. This layer is mechanical on purpose —
+required/default/type declarations live in the template WRAPPER and are enforced
+by pervio-mcp (which holds the wrapper); a direct CLI caller owns its values.
+
+Commands:
+  pervio-orchestrate start  --spec-b64 B64 [--params-b64 B64] [--resume-from WFID] [--device ID --origin ENTRY]
+  pervio-orchestrate teststep --wf WFID --step ID [--item N] [--spec-b64 B64]
+  pervio-orchestrate status --wf WFID
+  pervio-orchestrate tail   --wf WFID          # stream ledger.json snapshots
+  pervio-orchestrate list
+  pervio-orchestrate spec   --wf WFID
+  pervio-orchestrate delete --wf WFID
+  pervio-orchestrate run    --wf WFID          # internal: the detached runner
+  pervio-orchestrate schedule {add|update|list|remove|enable|disable|fire|tick|install|uninstall}
+"""
+import base64
+import concurrent.futures
+import datetime
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+import uuid
+
+MAX_PARALLEL = int(os.environ.get("PERVIO_MAX_PARALLEL", "4") or "4")   # cap concurrent agent turns
+CHILD_TIMEOUT = float(os.environ.get("PERVIO_CHILD_TIMEOUT", "180") or "180")
+CMD_TIMEOUT = float(os.environ.get("PERVIO_CMD_TIMEOUT", "600") or "600")   # command steps
+# Cap a command step's captured stdout: it goes into ledger.json (rewritten whole
+# on every save) and is streamed to the phone, so an unbounded `cat huge` must not
+# bloat state or the tail. THE CONTRACT (2026-09-02): this is a DATA cap, and
+# hitting it is an event, not a shrug — the capture gets CMD_TRUNC_MARK appended,
+# and any mechanical consumer (fanout.over) REFUSES a marked source instead of
+# quietly working a partial list. 4 MiB because the old 256 KiB carried a stale
+# assumption ("far more than any digest needs" — true at 80 fetched papers,
+# false the day the fetch cap went to 500: 19 shards, 433 KB, 7 shards silently
+# never dispatched, 92 papers lost).
+CMD_MAX_OUTPUT = int(os.environ.get("PERVIO_CMD_MAX_OUTPUT", str(4 * 1024 * 1024)) or str(4 * 1024 * 1024))
+# The marker a truncated capture ends with. Written in ONE place, checked by the
+# fanout guard — grep for it before inventing a second spelling.
+CMD_TRUNC_MARK = "…[truncated"
+# Past the kept cap the pipe is still DRAINED (a big-but-finite command must still
+# finish and report its own exit code) — but only this far. Beyond it the command is
+# a firehose (`yes`, a runaway loop, a tail -f): its process group is killed and the
+# step fails saying so, instead of the runner buffering gigabytes for the whole
+# CMD_TIMEOUT and then reporting an empty output.
+#
+# The ceiling is 256 MiB, not 8 MiB: draining costs no memory (the keep-buffer is
+# already bounded by CMD_MAX_OUTPUT), so the only thing this limit buys is not
+# spending CMD_TIMEOUT reading from something that will never stop. An 8 MiB
+# ceiling bought that at the price of KILLING legitimate finite commands — a
+# `git log -p` on a fat repo, a data dump — which used to succeed with a truncated
+# capture. A firehose still trips this in seconds; a real command never does.
+CMD_MAX_DRAIN = int(os.environ.get("PERVIO_CMD_MAX_DRAIN", str(256 * 1024 * 1024))
+                    or str(256 * 1024 * 1024))
+# stderr is only ever quoted as a 300-char tail; keep a small rolling window of it.
+CMD_ERR_TAIL = 8192
+# Top-level agent turns and user-authored setup/verify shells used to be un-timed
+# subprocess.call — a hang (or `verify: sleep 999999`) stranded the runner thread,
+# left the run 'running' forever, and >6h later tricked the scheduler into an
+# overlapping start. Bound all three like command steps do. Agent turns get a
+# generous ceiling (a real review/digest turn is legitimately long); setup/verify
+# reuse the command-step budget since they're the same bash -lc shape.
+AGENT_TIMEOUT = float(os.environ.get("PERVIO_AGENT_TIMEOUT", "1800") or "1800")
+SETUP_TIMEOUT = float(os.environ.get("PERVIO_SETUP_TIMEOUT", str(CMD_TIMEOUT)) or str(CMD_TIMEOUT))
+VERIFY_TIMEOUT = float(os.environ.get("PERVIO_VERIFY_TIMEOUT", str(CMD_TIMEOUT)) or str(CMD_TIMEOUT))
+# Hard ceiling on a fan-out step's item count. A spec (or an upstream agent that
+# generates one) could otherwise set fanout.max arbitrarily high; children run
+# maxParallel-at-a-time but the TOTAL is unbounded and doesn't hit the P4 dispatch
+# budget. 200 is far above any real template (deep-audit uses 8).
+FANOUT_MAX_CAP = int(os.environ.get("PERVIO_FANOUT_MAX_CAP", "200") or "200")
+
+# Set per-run by cmd_run to <rd>/live. Agent/command/fan-out children each run in
+# their OWN session (so a per-child timeout can killpg just that child's subtree
+# without taking down the runner) — which also means killing the RUNNER's pgid does
+# NOT reap them. Each in-flight child registers its pgid here so _delete_run can
+# reap the ones still alive, with the same reused-pid safety token _wf_alive uses.
+_LIVE_DIR = None
+
+os.umask(0o077)   # workflow state may contain prompts/outputs — owner-only
+
+HOME = os.path.expanduser("~")
+WF = os.path.join(HOME, ".pervio", "wf")
+SCHED = os.path.join(HOME, ".pervio", "schedules")
+SELF = os.path.realpath(__file__)
+SELF_DIR = os.path.dirname(SELF)
+CHAT = os.path.join(SELF_DIR, "pervio-chat")
+PUSH = os.path.join(SELF_DIR, "pervio-push")
+
+
+def _push_notify(title, body, thread="", device=""):
+    """Fire a lock-screen push at the phone, fire-and-forget. This is a courtesy
+    ping (a publish landed, a run failed, an approval is waiting) — it must NEVER
+    delay or fail the workflow, so it is fully detached, output-swallowed, and
+    every error here (including pervio-push not existing) is caught and dropped.
+    pervio-push itself silently no-ops when the APNs key/token aren't set up yet,
+    so this stays quiet until the user provisions the key. See docs/apns.md."""
+    if not (title or body):
+        return
+    try:
+        subprocess.Popen(
+            [sys.executable, PUSH, "send", "--title", title, "--body", body]
+            + (["--thread", thread] if thread else [])
+            # Whoever started the workflow is the one told about it (the phone's
+            # push device id, recorded at start); without one every phone on
+            # this Mac was buzzed (谁发的推给谁 for workflows too, 2026-10-18).
+            + (["--device", device] if device else []),
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True)
+    except (OSError, ValueError):
+        pass
+
+sys.path.insert(0, SELF_DIR)
+from _pervio_lib import clamp_tier, run_child, DispatchError, push_lang, resolve_model, models_menu   # noqa: E402
+
+
+# The words of every push this script sends, in the phone's language. Pure
+# functions on the pervio-run `_push_text` model: a body you can assert in a test
+# without running a workflow. `lang=None` reads the synced preference
+# (~/.pervio/push/lang, written by the app beside its APNs token) at PUSH time;
+# tests pass it explicitly. zh strings are the shipped ones, byte-for-byte.
+
+def _push_copy_published(date_str, lang=None):
+    return date_str + (" delivered" if (lang or push_lang()) == "en" else " 已送达")
+
+
+def _push_copy_failed(failed, lang=None):
+    step = sorted(failed)[0]
+    if (lang or push_lang()) == "en":
+        return "Failed: " + step + ((" (%d steps)" % len(failed)) if len(failed) > 1 else "")
+    return "失败:" + step + ((" 等 %d 步" % len(failed)) if len(failed) > 1 else "")
+
+
+def _push_copy_done(n, lang=None):
+    return ("All %d steps finished" % n) if (lang or push_lang()) == "en" else ("%d 步全部完成" % n)
+
+VALID_ID = re.compile(r"^[A-Za-z0-9_-]+$")
+REF_RE = re.compile(r"\{\{\s*([A-Za-z0-9_-]+)\.output\s*\}\}")
+# The structured lane (WF-1): {{id.json}} is a step's PARSED value — canonical
+# JSON, machine-shaped, no FAIL markers or progress headers. Only steps that
+# actually have one (fanout, or an agent step with outputSchema) may be
+# referenced this way; _validate_spec enforces it at the door.
+JSON_REF_RE = re.compile(r"\{\{\s*([A-Za-z0-9_-]+)\.json\s*\}\}")
+ANY_REF_RE = re.compile(r"\{\{\s*([A-Za-z0-9_-]+)\.(output|json)\s*\}\}")
+# Appended to the ORIGINAL prompt for the one corrective re-run when a step's
+# output flunks its outputSchema. One retry, never a loop: a model that can't
+# fix its format on a direct complaint won't fix it on the tenth.
+SCHEMA_FIX_NOTE = ("\n\n[格式纠错] 你上一次的输出不符合约定的 JSON 契约:%s\n"
+                   "上次输出开头:%s\n"
+                   "重新输出:只输出符合契约的 JSON,不要解释,不要代码栅栏。")
+# "item": {{item}} is the fan-out per-item placeholder. "param": a step named
+# param would make {{param.output}} ambiguous between "that step's output" and
+# the F2 parameter namespace {{param.<name>}} — reserve it outright.
+RESERVED_IDS = frozenset({"item", "param"})
+# F2 template parameters: {{param.<name>}}, name ^[a-z][a-z0-9_]{0,23}$ (matches
+# the wrapper declaration grammar pervio-mcp validates). The LEFTOVER probe is
+# deliberately looser (any "{{param." prefix): a malformed name that the
+# substitution regex can never satisfy must reject the start, not ride through.
+PARAM_NAME = re.compile(r"^[a-z][a-z0-9_]{0,23}$")
+PARAM_RE = re.compile(r"\{\{\s*param\.([a-z][a-z0-9_]{0,23})\s*\}\}")
+PARAM_LEFTOVER = re.compile(r"\{\{\s*param\.")
+# Failure strings worth ONE automatic retry: infrastructure weather (a dropped
+# connection, an overloaded API, a wall-clock timeout), not the agent being wrong.
+# A 6am schedule has nobody watching to tap "run again" — one retry absorbs the
+# blip; a second failure is reported as-is (never a retry loop). Top-level
+# claude/codex steps only: command steps are deterministic (same input, same
+# failure) and fan-out children have their own tolerance knobs.
+TRANSIENT_RE = re.compile(r"timed out|timeout|connection closed|api error"
+                          r"|overloaded|529|econnreset", re.I)
+
+
+def _prompt_refs(prompt):
+    """The {{id.output}} / {{id.json}} refs in a text — a step's data inputs
+    (flow edges), distinct from dependsOn (timing). Order-preserving,
+    de-duplicated. BOTH kinds are edges: a consumer of a step's parsed value
+    races its producer exactly as hard as a consumer of its text."""
+    out = []
+    for m in ANY_REF_RE.finditer(prompt or ""):
+        if m.group(1) not in out:
+            out.append(m.group(1))
+    return out
+
+
+# ---------- structured outputs (WF-1) ----------
+
+def _json_text(v):
+    """A structured value as prompt/stdin text — ONE canonical spelling
+    everywhere, so a downstream `cat -` sees exactly what a prompt sees."""
+    return json.dumps(v, ensure_ascii=False)
+
+
+def _parse_structured(text):
+    """Best-effort JSON out of real LLM output: strip a surrounding code fence,
+    then parse; failing that, parse the outermost [...] or {...} span (models
+    love a 'Sure! Here you go:' preamble). Returns (value, "") or (None, err).
+    A bare JSON scalar only counts when the whole reply is that scalar —
+    fishing a number out of prose would 'succeed' on anything."""
+    s = re.sub(r"(?s)^```[a-zA-Z]*\s*|\s*```$", "", (text or "").strip()).strip()
+    try:
+        return json.loads(s), ""
+    except ValueError:
+        m = re.search(r"(?s)(\[.*\]|\{.*\})", s)
+        if m:
+            try:
+                return json.loads(m.group(1)), ""
+            except ValueError:
+                pass
+        return None, "not valid JSON"
+
+
+def _schema_check(schema, value, path="$"):
+    """Validate against the SUPPORTED SUBSET of JSON Schema — stdlib only, no
+    dependency: type (object/array/string/number/integer/boolean/null),
+    properties + required (unknown keys pass), items, enum, minItems/maxItems,
+    minLength/maxLength. Returns "" when valid, else the FIRST complaint with
+    its path — one precise sentence beats a wall, both for the corrective
+    retry prompt and for the ledger error."""
+    if not isinstance(schema, dict):
+        return ""                    # an empty/absent schema constrains nothing
+    t = schema.get("type")
+    if t is not None:
+        checks = {"object": lambda v: isinstance(v, dict),
+                  "array": lambda v: isinstance(v, list),
+                  "string": lambda v: isinstance(v, str),
+                  "number": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
+                  "integer": lambda v: isinstance(v, int) and not isinstance(v, bool),
+                  "boolean": lambda v: isinstance(v, bool),
+                  "null": lambda v: v is None}
+        fn = checks.get(t)
+        if fn and not fn(value):
+            return "%s: expected %s, got %s" % (path, t, type(value).__name__)
+    if "enum" in schema and value not in schema["enum"]:
+        return "%s: %r is not one of %s" % (path, value, schema["enum"])
+    if isinstance(value, str):
+        if "minLength" in schema and len(value) < schema["minLength"]:
+            return "%s: shorter than minLength %s" % (path, schema["minLength"])
+        if "maxLength" in schema and len(value) > schema["maxLength"]:
+            return "%s: longer than maxLength %s" % (path, schema["maxLength"])
+    if isinstance(value, list):
+        if "minItems" in schema and len(value) < schema["minItems"]:
+            return "%s: fewer than minItems %s" % (path, schema["minItems"])
+        if "maxItems" in schema and len(value) > schema["maxItems"]:
+            return "%s: more than maxItems %s" % (path, schema["maxItems"])
+        items = schema.get("items")
+        if isinstance(items, dict):
+            for i, v in enumerate(value):
+                bad = _schema_check(items, v, "%s[%d]" % (path, i))
+                if bad:
+                    return bad
+    if isinstance(value, dict):
+        for k in (schema.get("required") or []):
+            if k not in value:
+                return "%s: missing required key %r" % (path, k)
+        props = schema.get("properties")
+        if isinstance(props, dict):
+            for k, sub in props.items():
+                if k in value:
+                    bad = _schema_check(sub, value[k], "%s.%s" % (path, k))
+                    if bad:
+                        return bad
+    return ""
+
+
+def _parse_and_validate(schema, text):
+    """(parsed value, "") when the text parses AND conforms; (None, complaint)
+    otherwise. The complaint is what the corrective retry quotes back."""
+    val, err = _parse_structured(text)
+    if err:
+        return None, err
+    bad = _schema_check(schema, val)
+    return (None, bad) if bad else (val, "")
+
+
+def _write_json_artifact(rd, sid, value):
+    """A step's parsed value at <rd>/json/<sid>.json — the file teststep and
+    resume read back, and the thing {{sid.json}} serializes. Atomic like every
+    other run-state write."""
+    jd = os.path.join(rd, "json")
+    os.makedirs(jd, mode=0o700, exist_ok=True)
+    _write_atomic(os.path.join(jd, "%s.json" % sid), value)
+
+
+def _resolve_refs(text, snap, snap_json, keep_ids=(), repoint=None):
+    """Substitute {{id.output}} (text, optionally worktree-repointed) and
+    {{id.json}} (canonical JSON of the parsed value) in one pass. keep_ids
+    are left VERBATIM — the fan-out item placeholder ({{item.output}} names a
+    field of the item, not a step) must survive to the per-item pass."""
+    def sub(m):
+        pid, kind = m.group(1), m.group(2)
+        if pid in keep_ids:
+            return m.group(0)
+        if kind == "json":
+            v = snap_json.get(pid)
+            return _json_text(v) if v is not None else ""
+        t = snap.get(pid, "")
+        return repoint(pid, t) if repoint else t
+    return ANY_REF_RE.sub(sub, text or "")
+
+
+# ---------- worktree isolation helpers ----------
+
+# Hook-free identity for every git op the orchestrator itself performs: repo hooks
+# (husky…) expect the node_modules a fresh worktree doesn't have, gpg signing hangs
+# headless, and an unset user.name fails commits outright.
+GIT_CFG = ["-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false",
+           "-c", "user.name=pervio-orchestrate", "-c", "user.email=pervio@localhost"]
+
+
+def _git(cwd, *args, new_session=False, timeout=None):
+    """Run git -C cwd with the hook-free config. Returns (rc, stdout, stderr).
+    Local git ops are fast and left un-timed; pass timeout for a NETWORK op (a
+    submodule fetch can hang on a stalled remote and, with #4's identity check, wedge
+    the run's schedule until reboot). On timeout git is SIGKILLed and rc 124 is
+    returned — enough to fail the step and let the schedule recover; a stray fetch
+    grandchild may briefly linger, but the network op it's on is what was stuck."""
+    try:
+        p = subprocess.run(["git"] + GIT_CFG + ["-C", cwd] + list(args),
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                           start_new_session=new_session, timeout=timeout)
+        return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
+    except subprocess.TimeoutExpired:
+        return 124, "", "git timed out (>%ss)" % int(timeout)
+    except OSError as e:
+        return 127, "", str(e)
+
+
+class _LandingLock(object):
+    """One workflow at a time puts its result back on a repository's branch.
+
+    Two workflows that finish together on the same repository used to do it at
+    the same moment: both saw the checkout where they had left it, both ran
+    `git merge --ff-only`, and git — which does not make "rewrite the index and
+    the files, then move the branch" one step — let one win the branch and the
+    other win the index. The person was left with a staged rename they never
+    made and stray untracked files (the suite's S7 caught it about one run in
+    four). Holding this lock across "is the checkout still where we started?"
+    and the merge makes the second workflow see that the first has moved the
+    branch, and keep its results on its own branch instead.
+
+    A flock on a file in the repository's own git directory, so it follows the
+    repository, binds every process whatever its HOME, costs the working tree
+    nothing, and is let go by the kernel if the holder dies. `held` is False
+    when another workflow kept it for the whole wait — then nothing is merged;
+    when the file cannot be opened at all the merge runs as it always did."""
+
+    def __init__(self, top, wait=60.0):
+        self.top, self.wait, self.f, self.held = top, wait, None, True
+
+    def __enter__(self):
+        import fcntl
+        rc, common, _ = _git(self.top, "rev-parse", "--git-common-dir")
+        if rc != 0 or not common:
+            return self
+        if not os.path.isabs(common):
+            common = os.path.join(self.top, common)
+        try:
+            self.f = open(os.path.join(common, "pervio-landing"), "a")
+        except OSError:
+            return self
+        deadline = time.time() + self.wait
+        while True:
+            try:
+                fcntl.flock(self.f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except OSError:
+                if time.time() >= deadline:
+                    self.held = False
+                    return self
+                time.sleep(0.05)
+
+    def __exit__(self, *exc):
+        if self.f is not None:
+            try:
+                import fcntl
+                fcntl.flock(self.f, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            self.f.close()
+        return False
+
+
+def _is_reader(s):
+    """Fail-CLOSED write classification: only plan / read-only sandbox with no
+    verify gate count as readers; anything else (default/auto/acceptEdits/bypass,
+    missing or typo'd codex sandbox, any verify — it runs unsandboxed) is a writer."""
+    # A fan-out step runs no agent turn of its OWN — its children write only in
+    # ephemeral worktrees (discarded), never the main repo — so it's a reader, and
+    # must never trigger P3 main-repo isolation for itself.
+    if s.get("fanout"):
+        return True
+    if s.get("verify"):
+        return False
+    if s.get("backend", "claude") == "codex":
+        return s.get("sandbox") == "read-only"
+    return s.get("perm") == "plan"
+
+
+def _step_refs(s):
+    """All refs a step consumes: from its prompt, its fanout.over source (the
+    fan-out step's real input, not carried in the prompt) AND its stdin
+    template (a command step's real input, same story)."""
+    refs = list(_prompt_refs(s.get("prompt", "")))
+    fo = s.get("fanout")
+    srcs = [fo.get("over", "")] if isinstance(fo, dict) else []
+    if isinstance(s.get("stdin"), str):
+        srcs.append(s["stdin"])
+    for src in srcs:
+        for r in _prompt_refs(src):
+            if r not in refs:
+                refs.append(r)
+    return refs
+
+
+def _dep_edges(steps):
+    """stepId -> set of ids it waits on: dependsOn ∪ {{id.output}} refs (to real
+    ids). Refs are ordering edges — the phone already draws them as such, and a
+    consumer racing its producer would otherwise substitute ""."""
+    ids = {s["id"] for s in steps}
+    return {s["id"]: ({d for d in (s.get("dependsOn") or []) if d in ids}
+                      | {r for r in _step_refs(s) if r in ids})
+            for s in steps}
+
+
+def _ancestors(dep):
+    """Transitive closure of _dep_edges (cycle-tolerant)."""
+    anc = {}
+
+    def walk(x, seen):
+        if x in anc:
+            return anc[x]
+        out = set()
+        for d in dep.get(x, ()):
+            if d in seen:
+                continue
+            out.add(d)
+            out |= walk(d, seen | {d})
+        anc[x] = out
+        return out
+
+    for x in dep:
+        walk(x, {x})
+    return anc
+
+
+def _plan_isolation(spec, steps):
+    """Decide isolation up front. Returns None for SHARED (exact legacy behavior:
+    not a git repo, unborn HEAD, or no two write steps can run concurrently), else
+    {top, base, dep, in_repo: id->bool, prefix: id->subdir-under-top}."""
+    droot = os.path.realpath(_expand_dir(spec.get("dir", "~")))
+    rc, top, _ = _git(droot, "rev-parse", "--show-toplevel")
+    if rc != 0 or not top:
+        return None
+    rc, base, _ = _git(droot, "rev-parse", "HEAD")
+    if rc != 0 or not base:
+        return None
+    top = os.path.realpath(top)
+    in_repo, prefix = {}, {}
+    for s in steps:
+        sdir = os.path.realpath(_expand_dir(s.get("dir", spec.get("dir", "~"))))
+        inside = sdir == top or sdir.startswith(top + os.sep)
+        in_repo[s["id"]] = inside
+        if inside:
+            prefix[s["id"]] = os.path.relpath(sdir, top)
+    writers = [s["id"] for s in steps if in_repo[s["id"]] and not _is_reader(s)]
+    if len(writers) < 2:
+        return None
+    dep = _dep_edges(steps)
+    anc = _ancestors(dep)
+    if not any(a not in anc.get(b, ()) and b not in anc.get(a, ())
+               for i, a in enumerate(writers) for b in writers[i + 1:]):
+        return None
+    return {"top": top, "base": base, "dep": dep, "in_repo": in_repo, "prefix": prefix}
+
+
+# ---------- dynamic fan-out (P4-next): one child agent turn per list item ----------
+
+def _fanout_split(strategy, text):
+    """Split an upstream list into per-item units. Robust against real LLM output
+    (preamble/sign-off lines, markdown fences). Returns a list of item strings."""
+    text = text or ""
+    if strategy == "lines":
+        return [l for l in text.splitlines() if l.strip()]
+    if strategy == "json":
+        s = re.sub(r"(?s)^```[a-zA-Z]*\s*|\s*```$", "", text.strip()).strip()   # strip fences
+        try:
+            v = json.loads(s)
+        except ValueError:
+            m = re.search(r"(?s)\[.*\]", s)                                       # bracket fallback
+            v = json.loads(m.group(0)) if m else None
+        if not isinstance(v, list):
+            raise ValueError("json split did not yield a list")
+        return [x if isinstance(x, str) else json.dumps(x, ensure_ascii=False) for x in v]
+    # default: numbered — split BEFORE each "N." / "N)" line; drop any preamble /
+    # sign-off chunk that doesn't itself start with a number, and strip the number.
+    items = []
+    for part in re.split(r"(?m)^(?=\s*\d+[.)])", text):
+        part = part.strip()
+        if re.match(r"^\d+[.)]", part):
+            items.append(re.sub(r"^\s*\d+[.)]\s*", "", part).strip())
+    return items
+
+
+def _run_fanout(s, prompt_tmpl, snap, snap_json, led, lock, save, wf, sid, backend,
+                default_dir):
+    """Execute a fan-out step: split the upstream list (or take a structured
+    array verbatim), run ONE child agent turn per item (reusing the P4
+    ephemeral-worktree child core, but UNGATED — we cap N here, not via the
+    dispatch budget/width ledger), collect. Returns (ok, output, err, jarr):
+    jarr is the step's structured value — the ok children's parsed values
+    (with outputSchema) or their texts (without), in item order. The step is
+    done if >=1 child succeeds (>= minSuccessRate); its output is the joined
+    per-item results with a live "N/M done" summary the phone shows verbatim."""
+    fo = s["fanout"]
+    repo_top = os.path.realpath(_expand_dir(s.get("dir", default_dir)))
+    rc, top, _ = _git(repo_top, "rev-parse", "--show-toplevel")
+    if rc != 0 or not top:
+        # Not a git repo — fan out anyway: run_child's no-repo mode runs each
+        # child contained in a throwaway scratch dir instead of a worktree (no
+        # branches to audit in this mode; delete's sweep already tolerates it).
+        top = None
+    else:
+        top = os.path.realpath(top)
+
+    over = fo.get("over", "") or ""
+    mj = JSON_REF_RE.search(over)
+    if mj:
+        # Structured source: the producer's parsed array IS the item list —
+        # no split heuristics, no numbered-list contract to keep a model honest to.
+        src_v = snap_json.get(mj.group(1))
+        if not isinstance(src_v, list):
+            return False, "", ("fanout source %r has no structured array "
+                               "(producer failed or produced a non-array)" % over), None
+        items = list(src_v)
+    else:
+        m = REF_RE.search(over)
+        src = snap.get(m.group(1), "") if m else ""
+        if not src.strip():
+            return False, "", "fanout source %r is empty or not done" % over, None
+        # A truncated capture is a PARTIAL list. Fanning out over it silently
+        # drops every item past the cut (2026-09-01: 7 of the digest's 19 score
+        # shards, 92 papers) — refuse loudly instead; raising the cap or
+        # shrinking the producer is the caller's call.
+        if CMD_TRUNC_MARK in src[-64:]:
+            return False, "", ("fanout source %r is TRUNCATED (producer output "
+                               "exceeded PERVIO_CMD_MAX_OUTPUT=%d) — refusing to "
+                               "fan out over a partial list" % (over, CMD_MAX_OUTPUT)), None
+        try:
+            items = _fanout_split(fo.get("split", "numbered"), src)
+        except (ValueError, TypeError) as e:
+            return False, "", "fanout split failed: %s" % e, None
+    if not items:
+        led["fanoutTotal"] = 0
+        return False, "", "fanout produced 0 items", None
+
+    total_found = len(items)
+    max_items = int(fo.get("max", 50) or 50)
+    truncated = max(0, total_found - max_items)
+    items = items[:max_items]
+    n = len(items)
+    led["fanoutTotal"] = n
+    if truncated:
+        led["fanoutTruncated"] = truncated
+
+    # {{item}} carries the whole item (objects as canonical JSON); {{item.key}}
+    # reaches into an OBJECT item's fields so a prompt can say {{item.title}}
+    # instead of teaching the model to re-parse the blob it was handed.
+    items_text = [x if isinstance(x, str) else _json_text(x) for x in items]
+    as_var = fo.get("as", "item")
+    item_re = re.compile(r"\{\{\s*" + re.escape(as_var) + r"\s*\}\}")
+    key_re = re.compile(r"\{\{\s*" + re.escape(as_var) + r"\.([A-Za-z0-9_-]+)\s*\}\}")
+    child_schema = s.get("outputSchema")
+    child_model = resolve_model(s.get("model"))
+    # children run at the step's own tier, clamped (never bypass/danger).
+    requested = s.get("sandbox", "read-only") if backend == "codex" else s.get("perm", "plan")
+    try:
+        eff = clamp_tier(backend, requested, backend, requested)
+    except DispatchError as de:
+        return False, "", "fanout tier: %s" % de.detail, None
+    child_env = {
+        "PERVIO_WF_ID": wf, "PERVIO_STEP_ID": sid,
+        "PERVIO_REPO_TOP": top or "",   # empty ⇒ a grandchild dispatch fails closed
+        "PERVIO_PARENT_BACKEND": backend, "PERVIO_PARENT_TIER": eff,
+        "PERVIO_DISPATCH_DEPTH": "0",
+    }
+    base = os.path.join(WF, wf, "dispatch", "fanout", sid)
+    results = [None] * n                     # (ok, text, err) per item
+    parallel = max(1, min(int(fo.get("maxParallel", 4) or 4), MAX_PARALLEL))
+    # Per-child wall clock: a spec may raise it for deep-read jobs (fanout.timeoutSec),
+    # clamped to [60, 900] — the floor stops a typo'd "5" from insta-killing every
+    # child, the ceiling bounds a stuck N×∞ pile-up. The PERVIO_CHILD_TIMEOUT env
+    # default is operator-owned and stays unclamped.
+    try:
+        child_timeout = float(fo.get("timeoutSec") or 0)
+    except (TypeError, ValueError):
+        child_timeout = 0.0
+    child_timeout = min(max(child_timeout, 60.0), 900.0) if child_timeout > 0 else CHILD_TIMEOUT
+    led["fanoutTimeout"] = int(child_timeout)
+
+    def one(i):
+        def key_sub(mm):
+            x = items[i]
+            if isinstance(x, dict):
+                vv = x.get(mm.group(1))
+                if vv is None:
+                    return ""
+                return vv if isinstance(vv, str) else _json_text(vv)
+            return ""                          # {{item.key}} on a non-object item
+        item_prompt = key_re.sub(key_sub, prompt_tmpl)
+        item_prompt = item_re.sub(lambda _m: items_text[i], item_prompt)
+        b64 = base64.b64encode(item_prompt.encode("utf-8")).decode("ascii")
+        cdir = os.path.join(base, str(i))
+        branch = None if top is None else "pervio/wf-%s/dispatch/fanout/%s/%d" % (wf, sid, i)
+        try:
+            ok, text, cost, err = run_child(
+                b64, backend, eff, top, cdir, branch, 0, child_timeout, CHAT,
+                child_model, s.get("effort"), None, bool(s.get("allowNetwork")),
+                extra_env=child_env, on_spawn=_live_register, on_reap=_live_unregister)
+            if not ok or child_schema is None:
+                return (ok, text, err, text if ok else None)
+            val, verr = _parse_and_validate(child_schema, text)
+            if not verr:
+                return (True, text, "", val)
+            # One corrective re-run, in a SIBLING dir (a worktree can't be
+            # re-added in place); the final answer is then moved onto the
+            # canonical out.jsonl so downstream child_text readers keep their
+            # one path, with attempt 1 archived beside it for autopsies.
+            fix_b64 = base64.b64encode(
+                (item_prompt + SCHEMA_FIX_NOTE % (verr, (text or "")[:1500]))
+                .encode("utf-8")).decode("ascii")
+            ok2, text2, cost2, err2 = run_child(
+                fix_b64, backend, eff, top, cdir + "-r2",
+                (branch + "-r2") if branch else None, 0, child_timeout, CHAT,
+                child_model, s.get("effort"), None, bool(s.get("allowNetwork")),
+                extra_env=child_env, on_spawn=_live_register, on_reap=_live_unregister)
+            try:
+                os.replace(os.path.join(cdir, "out.jsonl"),
+                           os.path.join(cdir, "out.jsonl.badjson1"))
+                os.replace(os.path.join(cdir + "-r2", "out.jsonl"),
+                           os.path.join(cdir, "out.jsonl"))
+            except OSError:
+                pass
+            if ok2:
+                val, verr = _parse_and_validate(child_schema, text2)
+                if not verr:
+                    return (True, text2, "", val)
+                return (False, text2, "输出不符合契约(schema): %s" % verr, None)
+            return (False, "", "输出不符合契约(schema): %s; 纠错重试也失败: %s"
+                    % (verr, err2), None)
+        except DispatchError as de:
+            return (False, "", de.code, None)
+        except Exception as e:                # a child must never crash the whole fan-out
+            return (False, "", str(e)[:120], None)
+
+    def render(done_count, fail_count):
+        parts = []
+        for i, r in enumerate(results):
+            if r is None:
+                continue
+            ok, text, err = r[0], r[1], r[2]
+            head = "[%d] %s" % (i + 1, "OK" if ok else ("FAIL: " + (err or "")))
+            body = (text or "")[:4096]
+            if text and len(text) > 4096:
+                body += "\n…[truncated]"
+            parts.append(head + "\n" + body)
+        summary = "%d/%d done (%d failed)" % (done_count, n, fail_count)
+        if truncated:
+            summary += " · %d dropped by max" % truncated
+        return summary + "\n\n" + "\n---\n".join(parts)
+
+    done_count = fail_count = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as ex:
+        futs = {ex.submit(one, i): i for i in range(n)}
+        for f in concurrent.futures.as_completed(futs):
+            i = futs[f]
+            results[i] = f.result()
+            done_count += 1
+            if not results[i][0]:
+                fail_count += 1
+            with lock:                        # live progress the phone shows verbatim
+                led["fanoutOk"] = done_count - fail_count   # live counts too, so the
+                led["fanoutFail"] = fail_count              # step row's chip can tick up
+                led["output"] = render(done_count, fail_count)
+                save()
+
+    n_ok = sum(1 for r in results if r and r[0])
+    led["fanoutOk"] = n_ok
+    led["fanoutFail"] = n - n_ok
+    min_rate = float(fo.get("minSuccessRate", 0.0) or 0.0)
+    # tolerateAllFail: a scheduled pipeline can prefer a DEGRADED downstream step
+    # (which sees the FAIL lines and redoes the work itself) over a skipped one —
+    # with it, the step is done no matter how many children failed, and it
+    # overrides minSuccessRate (the two knobs contradict; tolerance wins).
+    ok = bool(fo.get("tolerateAllFail")) or (n_ok >= 1 and (n_ok / n) >= min_rate)
+    output = render(n_ok, n - n_ok)
+    err = "" if ok else ("all %d children failed" % n if n_ok == 0
+                         else "%d/%d below minSuccessRate %s" % (n_ok, n, min_rate))
+    # The step's structured value: ok children's parsed values (schema) or texts
+    # (no schema), in ITEM order — failures simply aren't in it, so a downstream
+    # consumer never has to strip FAIL markers again.
+    jarr = [r[3] for r in results if r and r[0] and r[3] is not None]
+    return ok, output, err, jarr
+
+
+def _die(msg, code=2):
+    sys.stderr.write("pervio-orchestrate: %s\n" % msg)
+    sys.exit(code)
+
+
+def _parse(argv, flags):
+    out = {}
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a.startswith("--") and a[2:] in flags:
+            if i + 1 >= len(argv):
+                _die("missing value for %s" % a)
+            out[a[2:]] = argv[i + 1]
+            i += 2
+        else:
+            _die("unknown/malformed arg: %s" % a)
+    return out
+
+
+def _wf_dir(wf_id):
+    if not wf_id or not VALID_ID.match(wf_id):
+        _die("bad workflow id")
+    return os.path.join(WF, wf_id)
+
+
+def _read_json(path, default=None):
+    """Missing file → default: a legitimate 'nothing written yet'. But a file that
+    EXISTS and fails to read/parse is a real fault (disk error, external truncation),
+    not emptiness — surface it on stderr (runner.err / the tick log) instead of
+    silently returning {} that looks identical to an empty ledger. Still returns
+    default so a caller mid-run doesn't crash on one bad read."""
+    try:
+        with open(path, "r", errors="replace") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {} if default is None else default
+    except (OSError, ValueError) as e:
+        sys.stderr.write("pervio-orchestrate: corrupt/unreadable %s: %s\n"
+                         % (path, str(e)[:200]))
+        return {} if default is None else default
+
+
+def _write_atomic(path, obj):
+    # Per-writer tmp name: two processes writing the same path (a tick and a phone
+    # verb touching the same schedule.json) must not share one ".tmp" and interleave
+    # into a half-written file before os.replace.
+    tmp = "%s.tmp.%d" % (path, os.getpid())
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def _expand_dir(d):
+    d = d or "~"
+    if d == "~":
+        return HOME
+    if d.startswith("~/"):
+        return os.path.join(HOME, d[2:])
+    return d
+
+
+# ---------- start ----------
+
+def _dir_ok(d):
+    """A spec/step `dir` may be absent (inherit), '~'-relative, or absolute — all the
+    user's explicit choice, and no worse than what a command step could `cd` to. What
+    we refuse is a '..' component: the path-traversal shape ('~/../.ssh') that lets an
+    IMPORTED workflow silently point steps outside where the importer thinks it runs."""
+    if d is None:
+        return True
+    if not isinstance(d, str) or not d.strip():
+        return False
+    return ".." not in d.replace("\\", "/").split("/")
+
+
+def _validate_spec(spec):
+    """Raise ValueError on a malformed spec (shared by start and schedule tick —
+    tick must record the error instead of dying)."""
+    if isinstance(spec, dict) and spec.get("kind") == "playbook":
+        # A playbook wrapper ({"kind":"playbook","body":…}) is conversation
+        # methodology, not a runnable spec. EVERY launch door funnels through
+        # here — start, the whole schedule family (add/update/fire/tick), and
+        # rerun's spec round trip — so this one gate refuses them all with the
+        # same words the app and MCP surface verbatim.
+        raise ValueError("playbook cannot be started as a workflow — "
+                         "load it into a conversation")
+    steps = spec.get("steps")
+    if not isinstance(steps, list) or not steps:
+        raise ValueError("spec needs a non-empty steps[]")
+    if not _dir_ok(spec.get("dir")):
+        raise ValueError("spec dir %r is invalid (no '..' traversal)" % spec.get("dir"))
+    for i, s in enumerate(steps):
+        if not isinstance(s, dict) or not s.get("id") or not VALID_ID.match(str(s.get("id"))):
+            raise ValueError("step %d needs a valid id" % i)
+        if str(s.get("id")) in RESERVED_IDS:
+            raise ValueError("step id %r is reserved" % s.get("id"))
+        if not _dir_ok(s.get("dir")):
+            raise ValueError("step %s dir %r is invalid (no '..' traversal)"
+                             % (s.get("id"), s.get("dir")))
+        cmdline = s.get("command")
+        if cmdline is not None and not (isinstance(cmdline, str) and cmdline.strip()):
+            raise ValueError("step %s command must be a non-empty string" % s.get("id"))
+        # dependsOn was taken on faith: a non-list (an imported or hand-edited spec)
+        # raised inside the runner's DAG loop, killed the detached runner mid-flight
+        # and left ledger.status "running" forever; a bare string iterated into
+        # characters, i.e. a dependency on steps that don't exist. It is the ORDER of
+        # the whole run — check the shape here, at the door.
+        dep = s.get("dependsOn")
+        if dep is not None:
+            if not isinstance(dep, list):
+                raise ValueError("step %s dependsOn must be a list of step ids, got %s"
+                                 % (s.get("id"), type(dep).__name__))
+            for d in dep:
+                if not isinstance(d, str) or not d.strip():
+                    raise ValueError("step %s dependsOn entries must be non-empty step ids"
+                                     % s.get("id"))
+        fo = s.get("fanout")
+        if fo is not None:
+            if cmdline:
+                raise ValueError("step %s can't be both a command and a fan-out" % s.get("id"))
+            if not isinstance(fo, dict) or not (fo.get("over") or "").strip():
+                raise ValueError("step %s fanout needs an 'over' source" % s.get("id"))
+            if fo.get("split") not in (None, "numbered", "lines", "json"):
+                raise ValueError("step %s fanout split must be numbered|lines|json" % s.get("id"))
+            if fo.get("tolerateAllFail") not in (None, True, False):
+                raise ValueError("step %s fanout tolerateAllFail must be a boolean" % s.get("id"))
+            if fo.get("max") is not None:
+                fmax = fo["max"]
+                # Require a real int. bool is an int subclass (reject True/False);
+                # float/str/None are out — and NOT calling int() means JSON Infinity
+                # (→ float('inf')) can't slip through as an uncaught OverflowError, and
+                # 1.9 isn't silently truncated to 1.
+                if isinstance(fmax, bool) or not isinstance(fmax, int):
+                    raise ValueError("step %s fanout max must be an integer" % s.get("id"))
+                if fmax < 1 or fmax > FANOUT_MAX_CAP:
+                    raise ValueError("step %s fanout max must be 1..%d"
+                                     % (s.get("id"), FANOUT_MAX_CAP))
+        if s.get("optional") not in (None, True, False):
+            raise ValueError("step %s optional must be a boolean" % s.get("id"))
+        rt = s.get("retry")
+        if rt is not None:
+            # A real small int: bool is an int subclass (True is not "1 retry"),
+            # and >5 is a cost bug typed as a preference.
+            if isinstance(rt, bool) or not isinstance(rt, int) or rt < 0 or rt > 5:
+                raise ValueError("step %s retry must be an integer 0..5" % s.get("id"))
+        sch = s.get("outputSchema")
+        if sch is not None:
+            # The schema constrains an AGENT's answer; a command's stdout is the
+            # author's own program — validating it would only mask their bug.
+            if s.get("command"):
+                raise ValueError("step %s: outputSchema applies to agent steps, "
+                                 "not commands" % s.get("id"))
+            if not isinstance(sch, dict):
+                raise ValueError("step %s outputSchema must be an object "
+                                 "(a JSON-Schema subset)" % s.get("id"))
+        sti = s.get("stdin")
+        if sti is not None:
+            # stdin is the data lane INTO a command (the command line stays a
+            # fixed string). An agent step's input is its prompt; a stdin there
+            # is a confusion worth refusing loudly.
+            if not s.get("command"):
+                raise ValueError("step %s: stdin only applies to command steps"
+                                 % s.get("id"))
+            if not isinstance(sti, str):
+                raise ValueError("step %s stdin must be a string template"
+                                 % s.get("id"))
+        if fo is not None and JSON_REF_RE.search((fo.get("over") or "")) \
+                and fo.get("split") is not None:
+            # A structured source IS the item list; a split strategy on top can
+            # only contradict it.
+            raise ValueError("step %s: fanout over {{id.json}} is already "
+                             "item-shaped — remove the split" % s.get("id"))
+        pub = s.get("publish")
+        if pub is False:
+            # A hand-written `false` means "not published" — tolerate it as
+            # absent instead of erroring (the app's encoder omits the key, but
+            # JSON edited by hand shouldn't be punished for being explicit).
+            pub = None
+            s.pop("publish", None)
+        if pub is not None and pub is not True:
+            # publish marks this step's output as the workflow's publication.
+            # Exactly true (default archive dir) or a non-empty dir string —
+            # anything else (1, {}) is a typo'd spec, not a preference.
+            if not (isinstance(pub, str) and pub.strip()):
+                raise ValueError("step %s publish must be true or a directory string"
+                                 % s.get("id"))
+            if not _dir_ok(pub):
+                raise ValueError("step %s publish dir %r is invalid (no '..' traversal)"
+                                 % (s.get("id"), pub))
+        if pub is not None and s.get("fanout") is not None:
+            # A fan-out's aggregate output carries FAIL markers and progress
+            # headers — machinery, not a publication. Publish the downstream
+            # step that synthesizes it instead. (Silently no-op'ing here was
+            # worse: the card would just never appear.)
+            raise ValueError("step %s can't publish a fan-out's aggregate — "
+                             "publish the downstream synthesis step" % s.get("id"))
+    ids = [str(s["id"]) for s in steps]
+    if len(set(ids)) != len(ids):
+        # Duplicates used to silently collapse in by_id; under worktree isolation
+        # they'd race one branch/worktree path mid-run — reject up front.
+        raise ValueError("duplicate step ids")
+    # Every {{id.output}} ref (prompt or fanout.over) must name a real step. A ref to
+    # nothing used to substitute "" at runtime: the consumer quietly worked from an
+    # empty input and the run still reported `done` — a wrong answer nobody sees.
+    # Refuse the START instead, before a single turn is paid for.
+    idset = set(ids)
+    for s in steps:
+        for r in _step_refs(s):
+            if r not in idset:
+                raise ValueError("step %s references {{%s.output}} — no step with id %r"
+                                 % (s.get("id"), r, r))
+        # Same rule for the timing edges: _dep_edges keeps only real ids, so a
+        # dangling dependsOn would silently become "no dependency at all" — the step
+        # would run early against an unfinished producer. Say so at the door instead.
+        for d in (s.get("dependsOn") or []):
+            if d not in idset:
+                raise ValueError("step %s dependsOn %r — no step with that id"
+                                 % (s.get("id"), d))
+    # {{id.json}} may only name a step that actually produces a structured
+    # value: a fan-out (ok-children array) or an agent step with outputSchema.
+    # Referencing anything else would substitute "" at runtime — the silent
+    # empty-input class this validator exists to kill.
+    structured_ids = {str(s["id"]) for s in steps
+                      if s.get("fanout") is not None
+                      or (s.get("outputSchema") is not None and not s.get("command"))}
+    for s in steps:
+        texts = [s.get("prompt", ""), s.get("stdin") or ""]
+        if isinstance(s.get("fanout"), dict):
+            texts.append(s["fanout"].get("over", "") or "")
+        for txt in texts:
+            for r in JSON_REF_RE.findall(txt):
+                if r in idset and r not in structured_ids:
+                    raise ValueError(
+                        "step %s references {{%s.json}} but step %r has no "
+                        "structured output (needs fanout or outputSchema)"
+                        % (s.get("id"), r, r))
+    # ...and the edges those refs create must not form a CYCLE. Making refs into
+    # ordering edges (so a consumer can't race its producer) turned a self- or
+    # mutually-referencing spec from "completes with an empty substitution" into
+    # "the scheduler waits forever and the run fails" — a regression for anyone
+    # who had such a spec working. Reject it at the door with the cycle spelled
+    # out, so nobody pays for a run that cannot finish.
+    dep = _dep_edges(steps)
+    state = {}                       # id -> 1 visiting, 2 done
+    stack = []
+
+    def walk(node):
+        if state.get(node) == 2:
+            return
+        if state.get(node) == 1:
+            cyc = stack[stack.index(node):] + [node]
+            raise ValueError("dependency cycle: " + " → ".join(cyc)
+                             + " (a {{id.output}} reference is an ordering edge)")
+        state[node] = 1
+        stack.append(node)
+        for nxt in sorted(dep.get(node) or ()):
+            walk(nxt)
+        stack.pop()
+        state[node] = 2
+
+    for sid_ in ids:
+        walk(sid_)
+    # A fan-out `as` var must not collide with a real step id (would shadow a ref).
+    for s in steps:
+        as_var = (s.get("fanout") or {}).get("as", "item")
+        if as_var in set(ids):
+            raise ValueError("step %s fanout 'as' %r collides with a step id" % (s.get("id"), as_var))
+    # The publication is singular — one home card, one back-issue reader per
+    # workflow — so at most one step may carry publish.
+    if sum(1 for s in steps if s.get("publish") is not None) > 1:
+        raise ValueError("only one step may publish")
+
+
+def _params_from_b64(raw):
+    """--params-b64 payload: a JSON object of name->value. Mechanical layer only —
+    names must fit the placeholder grammar, values must be str/int/bool (anything
+    else is rejected outright; there is no coercion). Declaration-level checks
+    (required/default/type-vs-declaration) belong to pervio-mcp, which holds the
+    template wrapper; a direct CLI caller owns its own values."""
+    try:
+        obj = json.loads(base64.b64decode(raw).decode("utf-8"))
+    except Exception as e:
+        raise ValueError("bad params: %s" % e)
+    if not isinstance(obj, dict):
+        raise ValueError("params must be a JSON object of name->value")
+    for k, v in obj.items():
+        if not isinstance(k, str) or not PARAM_NAME.match(k):
+            raise ValueError("param name %r is invalid (^[a-z][a-z0-9_]{0,23}$)" % (k,))
+        # bool first: it subclasses int, and bools ARE accepted (rendered true/false).
+        if not isinstance(v, (bool, int, str)):
+            raise ValueError("param %r value must be a string/integer/boolean, got %s"
+                             % (k, type(v).__name__))
+        # Second-order injection gate: a value carrying a RUNTIME placeholder
+        # ({{step.output}} / {{item}}) would land verbatim in the prompt and be
+        # expanded by the later ref pass with that step's real output — a param
+        # must stay data all the way down. Same fail-closed posture as the
+        # {{param. leftover probe.
+        if isinstance(v, str) and (ANY_REF_RE.search(v) or "{{item}}" in v):
+            raise ValueError("param %r value must not contain runtime placeholders "
+                             "({{step.output}} / {{step.json}} / {{item}})" % (k,))
+    return obj
+
+
+def _param_text(v):
+    """A param value as prompt/dir text: strings verbatim, ints as digits,
+    bools as JSON literals (true/false)."""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    return v if isinstance(v, str) else str(v)
+
+
+def _param_leftover(x):
+    """True if any string ANYWHERE in the spec (keys included) still carries a
+    {{param. prefix — the fail-closed probe behind the whole-start rejection."""
+    if isinstance(x, str):
+        return PARAM_LEFTOVER.search(x) is not None
+    if isinstance(x, list):
+        return any(_param_leftover(v) for v in x)
+    if isinstance(x, dict):
+        return any(_param_leftover(k) or _param_leftover(v) for k, v in x.items())
+    return False
+
+
+def _apply_params(spec, params):
+    """F2 mechanical substitution: {{param.<name>}} -> value, in each step's
+    `prompt`, its `stdin` DATA lane, and the top-level spec `dir` ONLY — params
+    never reach a shell (command/verify are fixed strings, same trust level as
+    before; stdin is piped bytes, not shell — 2026-09-02, so a parameterized
+    command step reads its knobs off stdin instead of being unbuildable). Single pass:
+    a substituted VALUE that itself contains "{{param." is NOT re-expanded — the
+    leftover probe below rejects the start instead (fail closed). Any leftover
+    anywhere (a placeholder in a command/verify/step-dir, an unknown name, a
+    malformed name) rejects the whole start."""
+    if not isinstance(spec, dict):
+        return                      # _validate_spec owns the shape complaint
+
+    def sub(text):
+        return PARAM_RE.sub(
+            lambda m: _param_text(params[m.group(1)]) if m.group(1) in params
+            else m.group(0), text)
+
+    if isinstance(spec.get("dir"), str):
+        spec["dir"] = sub(spec["dir"])
+    steps = spec.get("steps")
+    for s in (steps if isinstance(steps, list) else []):
+        if isinstance(s, dict) and isinstance(s.get("prompt"), str):
+            s["prompt"] = sub(s["prompt"])
+        if isinstance(s, dict) and isinstance(s.get("stdin"), str):
+            s["stdin"] = sub(s["stdin"])
+    if _param_leftover(spec):
+        raise ValueError("unresolved {{param.*}} placeholder remains after "
+                         "substitution — params only substitute into prompts, "
+                         "dir and stdin")
+
+
+def _spec_to_start(o, verb):
+    """The spec a start would run, from --spec-b64 [--params-b64]: decoded,
+    parameters filled in, validated. One function for `start` and `resolve`, so
+    what `resolve` prints is what `start` runs."""
+    if "spec-b64" not in o:
+        _die("%s needs --spec-b64" % verb)
+    try:
+        spec = json.loads(base64.b64decode(o["spec-b64"]).decode("utf-8"))
+    except Exception as e:
+        _die("bad spec: %s" % e)
+    if "params-b64" in o:
+        # Substitution runs BEFORE _validate_spec, so the substituted dir goes
+        # through the exact same _dir_ok gate as a literal one below.
+        try:
+            _apply_params(spec, _params_from_b64(o["params-b64"]))
+        except ValueError as e:
+            _die(str(e))
+    try:
+        _validate_spec(spec)
+    except ValueError as e:
+        _die(str(e))
+    return spec
+
+
+def cmd_resolve(argv):
+    """What `start` would run for the same --spec-b64 [--params-b64], printed as
+    JSON and NOT started: parameters filled in, the spec validated. pervio-mcp
+    asks this before a start made from a conversation, so the check it holds
+    the workflow to — and the sheet the phone shows — are about the workflow as
+    it would really run (security review 2026-11-22, #1 and #2)."""
+    o = _parse(argv, {"spec-b64", "params-b64"})
+    sys.stdout.write(json.dumps(_spec_to_start(o, "resolve"), ensure_ascii=False) + "\n")
+
+
+def cmd_start(argv):
+    o = _parse(argv, {"spec-b64", "params-b64", "resume-from", "device", "origin"})
+    spec = _spec_to_start(o, "start")
+    try:
+        # --device / --origin: the phone (its push device id) and the server entry
+        # on it that started this workflow — the completion push goes to that
+        # phone only, as it already does for a run (谁发的推给谁, 2026-10-18).
+        who = {k: o[k] for k in ("device", "origin") if o.get(k)}
+        wf_id = _start_wf(spec, extra=who or None, resume_from=o.get("resume-from"))
+    except ValueError as e:
+        _die(str(e))
+    sys.stdout.write(json.dumps({"wfId": wf_id}) + "\n")
+
+
+def _resume_cache_ids(spec, old_rd):
+    """Which steps of `spec` can reuse the old run's results outright: the old
+    run finished them, the step's canonical JSON is unchanged, and every
+    dependency is itself cached — the first edited step breaks the chain for
+    everything downstream of it. Returns (cached_ids, old_ledger_steps_by_id).
+
+    Worktree-isolated workflows are refused: a cached write step's commits
+    live on branches of the OLD run — a new integration branch can't
+    resurrect that git state honestly, and pretending otherwise would merge
+    phantom work."""
+    old_spec = _read_json(os.path.join(old_rd, "spec.json"))
+    old_led = _read_json(os.path.join(old_rd, "ledger.json"))
+    if not old_spec.get("steps") or not old_led.get("steps"):
+        raise ValueError("resume: old run has no spec/ledger to reuse")
+    steps = spec.get("steps") or []
+    if _plan_isolation(spec, steps):
+        raise ValueError("resume is not supported for worktree-isolated workflows "
+                         "(parallel write steps) — start it fresh")
+    # The OLD run's isolation matters too (2026-08-22 audit, P1): its write
+    # steps' commits live on ITS branches. If they never merged back, caching
+    # those steps as 'done' would build the new run on a tree that LACKS their
+    # work — a silent wrong result. Merged runs are safe: the work is already
+    # in the user's branch. Checking only the new spec was the exact hole.
+    old_git = old_led.get("git") or {}
+    if old_git and not old_git.get("merged"):
+        raise ValueError("resume: the old run used worktree isolation and its "
+                         "work never merged back (%s) — its steps can't be "
+                         "reused honestly; start fresh"
+                         % (old_git.get("branch") or "results on its branches"))
+    old_led_by = {st.get("id"): st for st in old_led.get("steps", [])}
+    if (old_spec.get("dir", "~") != spec.get("dir", "~")
+            or old_spec.get("setup") != spec.get("setup")):
+        return set(), old_led_by      # different ground under every step: no reuse
+    old_by = {s.get("id"): s for s in old_spec.get("steps", [])}
+
+    def canon(x):
+        return json.dumps(x, sort_keys=True, ensure_ascii=False)
+
+    dep = _dep_edges(steps)
+    cached = set()
+    changed = True
+    while changed:                    # steps[] isn't topo-sorted; fixpoint is
+        changed = False
+        for s in steps:
+            sid = s["id"]
+            if sid in cached:
+                continue
+            osd, ol = old_by.get(sid), old_led_by.get(sid)
+            if not osd or not ol or ol.get("status") != "done":
+                continue
+            if canon(osd) != canon(s):
+                continue
+            if any(d not in cached for d in dep.get(sid, ())):
+                continue
+            # A structured step's cache is its json artifact — a downstream
+            # {{id.json}} of a cached step with no artifact would substitute ""
+            # and quietly feed empty input (2026-08-22 audit, P2). No artifact,
+            # no cache: the step (and its dependents) re-run instead.
+            if (s.get("fanout") is not None
+                    or (s.get("outputSchema") is not None and not s.get("command"))):
+                if not os.path.exists(os.path.join(old_rd, "json", "%s.json" % sid)):
+                    continue
+            cached.add(sid)
+            changed = True
+    return cached, old_led_by
+
+
+def _start_wf(spec, extra=None, resume_from=None):
+    """Create the run dir + ledger and spawn the detached runner. Returns the wfId.
+    `extra` merges extra fields into the ledger root (e.g. scheduleId, so list and
+    the schedule pruner can tell a schedule's runs apart). Spec must be validated.
+    `resume_from` seeds unchanged, already-done steps from that prior run
+    (ledger 'done'+cached, json artifacts and fan-out children copied over) so
+    only the edited tail spends tokens. Raises ValueError when resuming is
+    impossible; a plain start never does."""
+    steps = spec.get("steps")
+    cached, old_led_by, old_rd = set(), {}, None
+    if resume_from:
+        if not VALID_ID.match(resume_from or ""):
+            raise ValueError("resume: bad run id %r" % resume_from)
+        old_rd = os.path.join(WF, resume_from)
+        if not os.path.isdir(old_rd):
+            raise ValueError("resume: no run %s" % resume_from)
+        cached, old_led_by = _resume_cache_ids(spec, old_rd)
+    os.makedirs(WF, mode=0o700, exist_ok=True)
+    wf_id = uuid.uuid4().hex[:12]
+    rd = _wf_dir(wf_id)
+    os.makedirs(rd, mode=0o700)
+
+    _write_atomic(os.path.join(rd, "spec.json"), spec)
+    for sid in sorted(cached):
+        # The artifacts a cached step's CONSUMERS read: its parsed value and its
+        # fan-out children's out.jsonls (assemble-style commands walk those by
+        # path). Worktrees are dead weight and stay behind; conversations belong
+        # to the old run, so sessionIds are deliberately NOT carried over.
+        sj = os.path.join(old_rd, "json", "%s.json" % sid)
+        if os.path.exists(sj):
+            os.makedirs(os.path.join(rd, "json"), mode=0o700, exist_ok=True)
+            shutil.copy2(sj, os.path.join(rd, "json", "%s.json" % sid))
+        sf = os.path.join(old_rd, "dispatch", "fanout", sid)
+        if os.path.isdir(sf):
+            shutil.copytree(sf, os.path.join(rd, "dispatch", "fanout", sid),
+                            ignore=shutil.ignore_patterns("wt"))
+    ledger = {
+        "wfId": wf_id,
+        "name": spec.get("name", ""),
+        "dir": spec.get("dir", "~"),
+        "status": "running",
+        "startedAt": int(time.time()),
+        "steps": [dict({
+            "id": s["id"],
+            "backend": s.get("backend", "claude"),
+            # Carried into the ledger (not just the spec) so the phone can draw the
+            # graph even when ATTACHING to a workflow it didn't start: dependsOn =
+            # timing (which row), inputs = data flow ({{id.output}} refs, the edges).
+            "dependsOn": s.get("dependsOn") if isinstance(s.get("dependsOn"), list) else [],
+            "inputs": _step_refs(s),
+            "status": "pending",
+            "output": "",
+            "error": "",
+            "bytes": 0,
+        }, **({"command": True} if s.get("command") else {}),
+           **({"optional": True} if s.get("optional") else {})) for s in steps],
+    }
+    for st in ledger["steps"]:
+        if st["id"] in cached:
+            ol = old_led_by.get(st["id"]) or {}
+            st["status"] = "done"
+            st["cached"] = True
+            st["output"] = ol.get("output", "")
+            st["bytes"] = ol.get("bytes", 0)
+    if cached:
+        ledger["resumedFrom"] = resume_from
+    if extra:
+        ledger.update(extra)
+    _write_atomic(os.path.join(rd, "ledger.json"), ledger)
+    with open(os.path.join(rd, "status"), "w") as f:
+        f.write("running")
+
+    # Detached runner: its own session (survives the SSH channel closing).
+    #
+    # Run the worker — and every agent it fans out — at a LOWER cpu/io priority, so a
+    # big parallel workflow can never starve latency-critical processes on this box:
+    # sshd and the frp client (nana) stay at the default priority and always win the
+    # scheduler, so the SSH tunnel keeps answering heartbeats even under a heavy fan-out.
+    # nice/ionice are inherited across fork+exec, so applying them to the runner covers
+    # all its child agents. Degrade gracefully if either binary is missing.
+    err_f = open(os.path.join(rd, "runner.err"), "wb")
+    runner_cmd = [sys.executable, SELF, "run", "--wf", wf_id]
+    if shutil.which("ionice"):
+        runner_cmd = ["ionice", "-c2", "-n7"] + runner_cmd
+    if shutil.which("nice"):
+        runner_cmd = ["nice", "-n", "10"] + runner_cmd
+    p = subprocess.Popen(
+        runner_cmd,
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=err_f,
+        start_new_session=True,
+    )
+    err_f.close()
+    with open(os.path.join(rd, "pgid"), "w") as f:
+        f.write(str(p.pid))
+    # Record the leader's start token alongside the pgid so a later reboot that
+    # recycles this pid can be told apart from our real still-running group
+    # (see _pgid_identity_ok). start_new_session=True makes p.pid the pgid leader.
+    tok = _proc_start(p.pid)
+    if tok:
+        with open(os.path.join(rd, "pgid.start"), "w") as f:
+            f.write(tok)
+    return wf_id
+
+
+# ---------- run (detached worker) ----------
+
+def _step_output(jsonl_path, backend):
+    """Final text a step produced: last agent_message (codex) / result (claude) —
+    plus the agent's session/thread id, recorded so deleting the workflow can also
+    delete the conversations it created, plus the turn's token usage. Returns
+    (text, err, session_id, tokens): tokens holds {tokensIn, tokensOut} (ints)
+    when the backend reported usage — claude carries it on the result event,
+    codex on turn.completed — and stays {} when the data isn't there."""
+    text = ""
+    err = ""
+    agent_sid = ""
+    tok = {}
+
+    def take_usage(o):
+        u = o.get("usage")
+        if isinstance(u, dict):
+            if isinstance(u.get("input_tokens"), int):
+                tok["tokensIn"] = u["input_tokens"]
+            if isinstance(u.get("output_tokens"), int):
+                tok["tokensOut"] = u["output_tokens"]
+
+    try:
+        with open(jsonl_path, "r", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except ValueError:
+                    continue
+                t = o.get("type")
+                if backend == "codex":
+                    if t == "thread.started" and o.get("thread_id"):
+                        agent_sid = o["thread_id"]
+                    if t == "item.completed":
+                        it = o.get("item") or {}
+                        if it.get("type") == "agent_message" and it.get("text"):
+                            text = it["text"]
+                    elif t in ("turn.failed", "error"):
+                        err = (o.get("error") or {}).get("message") or o.get("message") or "failed"
+                    elif t == "turn.completed":
+                        take_usage(o)
+                else:  # claude
+                    if o.get("session_id"):
+                        agent_sid = o["session_id"]
+                    if t == "result":
+                        if o.get("result"):
+                            text = o["result"]
+                        if o.get("is_error"):
+                            err = o.get("result") or "failed"
+                        take_usage(o)
+    except OSError:
+        pass
+    return text, err, agent_sid, tok
+
+
+def _call_gated(cmd, cwd, timeout, env=None, stdout=None):
+    """subprocess.call in its OWN session, so a timeout kills the whole process group
+    (bash -lc pipes, a wandered agent's children) — not just the leader that
+    subprocess.run's timeout would SIGKILL, leaking the rest. Returns
+    (exit_code, timed_out). stdout defaults to DEVNULL; pass an open file to capture
+    (the agent turn streams its jsonl there). Never raises."""
+    try:
+        p = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.DEVNULL,
+                             stdout=(stdout if stdout is not None else subprocess.DEVNULL),
+                             stderr=subprocess.DEVNULL, env=env, start_new_session=True)
+    except OSError:
+        return 1, False
+    _live_register(p.pid)                        # so a delete can reap this own-session child
+    try:
+        p.communicate(timeout=timeout)
+        return (p.returncode if p.returncode is not None else 1), False
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+        except OSError:
+            p.kill()
+        try:
+            p.communicate(timeout=5)
+        except (subprocess.SubprocessError, OSError):
+            pass
+        return 1, True
+    finally:
+        _live_unregister(p.pid)
+
+
+def _pipe_reader(fh, cap, tail, res, key, over, budget):
+    """Drain one pipe of a command step INCREMENTALLY into a bounded buffer, so the
+    runner's memory never depends on how much the child decides to write. Keeps at
+    most `cap` bytes — the HEAD for stdout (that's what becomes the step's output),
+    the TAIL for stderr (that's what the error line quotes) — and counts the rest so
+    the truncation marker can be honest. Reading continues past the cap (a big but
+    FINITE command must still finish and report its own exit code, exactly as before)
+    until `budget`: crossing it means the child is a firehose, so `over` is set and
+    the caller kills its process group. Records (kept_bytes, total_bytes) in res[key];
+    never raises (it runs in a thread — an exception here would be swallowed)."""
+    kept = bytearray()
+    total = 0
+    try:
+        fd = fh.fileno()
+        while True:
+            try:
+                chunk = os.read(fd, 65536)
+            except (OSError, ValueError):
+                break                                # pipe closed under us
+            if not chunk:
+                break                                # EOF: the child is done writing
+            total += len(chunk)
+            if tail:
+                kept += chunk
+                if len(kept) > cap:
+                    del kept[:len(kept) - cap]
+            elif len(kept) < cap:
+                kept += chunk[:cap - len(kept)]
+            if total > budget:
+                over.set()
+                break
+    except Exception:                                # thread guard: never propagate
+        pass
+    res[key] = (bytes(kept), total)
+
+
+def _join_all(threads, budget):
+    """Join every thread within ONE shared budget (a per-thread timeout would let N
+    stuck readers cost N × budget)."""
+    end = time.time() + budget
+    for t in threads:
+        t.join(timeout=max(0.0, end - time.time()))
+
+
+def _run_command_step(command, cwd, run_dir=None, stdin_data=None):
+    """Run a command step: bash -lc in its own SESSION so a timeout can kill the
+    WHOLE process group (pipes / backgrounded children), not just the bash leader
+    that subprocess.run's timeout would SIGKILL. Captures BYTES (non-UTF-8 stdout —
+    a stray binary in a git listing — must not raise UnicodeDecodeError and strand
+    the step), incrementally and BOUNDED: communicate() used to hold the child's
+    entire stdout in RAM and truncate afterwards, so `yes` (or any runaway loop) grew
+    the runner to gigabytes for the whole CMD_TIMEOUT and then reported an empty
+    output. Returns (text, exit_code, err). Never raises."""
+    try:
+        env = dict(os.environ)
+        if run_dir:
+            # The safe alternative to ref substitution: a command that needs an
+            # upstream step's output reads it STRUCTURED out of the run's own
+            # ledger.json (via this dir), instead of having agent-produced text
+            # spliced into a shell line.
+            env["PERVIO_WF_DIR"] = run_dir
+        p = subprocess.Popen(["bash", "-lc", command], cwd=cwd, env=env,
+                             stdin=(subprocess.PIPE if stdin_data is not None
+                                    else subprocess.DEVNULL),
+                             stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, start_new_session=True)
+    except OSError as e:
+        return "", 1, str(e)[:300]
+    _live_register(p.pid)                        # reapable by a delete mid-command
+    if stdin_data is not None:
+        # Feed from a thread: a payload bigger than the pipe buffer written from
+        # THIS thread would deadlock against a command that is already flooding
+        # stdout (both sides full, nobody draining). A command that exits without
+        # reading (BrokenPipe) is its own business — the payload is best-effort.
+        def _feed(fh=p.stdin, data=stdin_data.encode("utf-8")):
+            try:
+                fh.write(data)
+                fh.close()
+            except (BrokenPipeError, OSError, ValueError):
+                pass
+        threading.Thread(target=_feed, daemon=True).start()
+    over = threading.Event()                     # set by whichever pipe floods first
+    res = {}
+    readers = [
+        threading.Thread(target=_pipe_reader, daemon=True,
+                         args=(p.stdout, CMD_MAX_OUTPUT, False, res, "out",
+                               over, CMD_MAX_DRAIN)),
+        threading.Thread(target=_pipe_reader, daemon=True,
+                         args=(p.stderr, CMD_ERR_TAIL, True, res, "err",
+                               over, CMD_MAX_DRAIN)),
+    ]
+    for t in readers:
+        t.start()
+    deadline = time.time() + CMD_TIMEOUT
+    timed_out = flooded = False
+    try:
+        while True:
+            if over.is_set():
+                flooded = True
+                break
+            try:
+                p.wait(timeout=0.05)
+                break                            # exited on its own
+            except subprocess.TimeoutExpired:
+                pass
+            if time.time() >= deadline:
+                timed_out = True
+                break
+        if timed_out or flooded:
+            # Kill the whole session group so nothing the command spawned lingers.
+            try:
+                os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+            except OSError:
+                p.kill()
+            try:
+                p.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+        _join_all(readers, 2)                    # ONE 2s grace for both, not 2s each
+        if any(t.is_alive() for t in readers):
+            # The command is gone but something still holds its stdout open: a
+            # backgrounded grandchild that inherited the pipe. communicate() used to
+            # sit here until CMD_TIMEOUT and then kill the group with an EMPTY result;
+            # kill it now instead, and keep what the command actually wrote. (Only in
+            # this stuck case — a well-behaved `daemon >/dev/null &` closed the pipe,
+            # so its child is never touched.)
+            try:
+                os.killpg(p.pid, signal.SIGKILL)   # pgid == pid (own session)
+            except OSError:
+                pass
+            _join_all(readers, 5)
+        code = p.returncode if p.returncode is not None else 1
+    except (OSError, ValueError) as e:
+        return "", 1, str(e)[:300]
+    finally:
+        for fh in (p.stdout, p.stderr, p.stdin):
+            if fh is None:
+                continue
+            try:
+                fh.close()
+            except OSError:
+                pass
+        _live_unregister(p.pid)
+    if timed_out:
+        return "", 1, "command timeout (%ds)" % int(CMD_TIMEOUT)
+    out_b, out_total = res.get("out", (b"", 0))
+    err_b, _ = res.get("err", (b"", 0))
+    out = out_b.decode("utf-8", "replace")
+    if out_total > len(out_b):
+        out += "\n%s %d bytes]" % (CMD_TRUNC_MARK, out_total - len(out_b))
+    if flooded:
+        # Deliberately killed: never report this as a success with a quietly
+        # shortened output — the step failed, and the reason is the flood.
+        return out, 1, ("output limit exceeded (>%d bytes) — killed its process group"
+                        % CMD_MAX_DRAIN)
+    if code == 0:
+        return out, 0, ""
+    tail = err_b.decode("utf-8", "replace").strip()[-300:]
+    return out, code, "exit %d: %s" % (code, tail or "command failed")
+
+
+def _run_agent_turn(s, backend, step_dir, prompt, jsonl, spec, wf, sid, iso):
+    """One step's agent turn via pervio-chat (the non-command path, verbatim from the
+    inline original). Returns (ok, text, err, exit_code, agent_sid, tokens)."""
+    default_dir = spec.get("dir", "~")
+    b64 = base64.b64encode(prompt.encode("utf-8")).decode("ascii")
+    cmd = [CHAT, "--text", "--backend", backend,
+           "--dir", step_dir, "--prompt-b64", b64]
+    allow = []                        # claude scoped-tool allowances (one --allow)
+    if backend == "codex":
+        cmd += ["--sandbox", s.get("sandbox", "workspace-write")]
+    else:
+        cmd += ["--perm", s.get("perm", "default")]
+        if s.get("perm") == "plan":
+            # Same door run_child already sealed for fan-out children
+            # (2026-08-20 autopsy): a headless plan turn has nobody to answer
+            # ExitPlanMode's "approve?", so the call errors and the turn dies
+            # with an empty final message. TOP-LEVEL plan steps (merge/trends)
+            # ran unprotected until 2026-08-22 — prompt-level begging was their
+            # only guard. Every _run_agent_turn is orchestrator-spawned and
+            # headless by construction; the App's interactive plan flow never
+            # comes through here, so its approval sheet is untouched.
+            cmd += ["--disallow", "ExitPlanMode"]
+        # A step that needs the network (e.g. fetch an API) gets WebFetch
+        # scoped-allowed — reaches the net without bypassPermissions. Claude only.
+        if s.get("allowNetwork"):
+            allow.append("WebFetch")
+    # allowDispatch (P4): this step may spawn CHILD agent turns via pervio-dispatch,
+    # which enforces depth/concurrency/budget/tier caps itself. Scope the parent so
+    # it can call the dispatcher, put it on PATH, and hand it the run id + this step's
+    # tier + the caps. Env stays None (inherit, byte-identical) for non-dispatch steps.
+    disp_env = None
+    if s.get("allowDispatch"):
+        if backend != "codex":
+            allow.append("Bash(pervio-dispatch *)")
+        disp_top = (iso["top"] if iso else
+                    _git(os.path.realpath(_expand_dir(s.get("dir", default_dir))),
+                         "rev-parse", "--show-toplevel")[1])
+        disp_env = dict(os.environ)
+        disp_env["PATH"] = SELF_DIR + os.pathsep + os.environ.get("PATH", "")
+        disp_env["PERVIO_WF_ID"] = wf
+        disp_env["PERVIO_REPO_TOP"] = disp_top
+        disp_env["PERVIO_STEP_ID"] = sid
+        disp_env["PERVIO_PARENT_BACKEND"] = backend
+        disp_env["PERVIO_PARENT_TIER"] = (s.get("sandbox", "workspace-write") if backend == "codex"
+                                          else s.get("perm", "default"))
+        # This step is a top-level agent (depth 0); don't inherit a stray
+        # PERVIO_DISPATCH_DEPTH from the orchestrator's own env.
+        disp_env["PERVIO_DISPATCH_DEPTH"] = "0"
+        for envk, speck in (("PERVIO_BUDGET", "budgetUSD"), ("PERVIO_MAX_DEPTH", "maxDepth"),
+                            ("PERVIO_MAX_CONCURRENCY", "maxConcurrency"),
+                            ("PERVIO_MAX_DISPATCHES", "maxDispatches")):
+            if spec.get(speck) is not None:
+                disp_env[envk] = str(spec[speck])
+    if allow:
+        cmd += ["--allow", ",".join(allow)]
+    model = resolve_model(s.get("model"))
+    if model:
+        if backend == "cursor":
+            # Cursor's own names only (gpt-5.3-codex, composer-2.5…): a tier word
+            # (flagship/balanced/…) resolves to a Claude id, which means nothing
+            # to it — that step runs on Cursor's auto instead.
+            raw = (s.get("model") or "").strip()
+            if raw and resolve_model(raw) == raw:
+                cmd += ["--model", raw]
+        else:
+            cmd += ["--model", model]
+    if s.get("effort"):
+        cmd += ["--effort", s["effort"]]
+
+    with open(jsonl, "wb") as out_f:
+        code, timed_out = _call_gated(cmd, None, AGENT_TIMEOUT, env=disp_env, stdout=out_f)
+    if timed_out:
+        # Killpg already reaped the whole group; report instead of hanging forever.
+        # Still parse the partial jsonl for the session/thread id — the agent may
+        # already have emitted it, and without it delete can't sweep this (real,
+        # on-disk) timed-out conversation.
+        _, _, agent_sid, tok = _step_output(jsonl, backend)
+        return False, "", "agent turn timed out (>%ds)" % int(AGENT_TIMEOUT), code, agent_sid, tok
+    text, err, agent_sid, tok = _step_output(jsonl, backend)
+    return (code == 0 and not err), text, err, code, agent_sid, tok
+
+
+def _publish_slug(spec):
+    """Default publish dir name from the spec name: lowercased, runs of
+    non-alphanumerics collapse to one '-'. Unicode-aware (str.isalnum), NOT
+    ascii-only — otherwise every Chinese-named workflow ('论文晨报', '周报', …)
+    would slug to '' and collide in one shared 'workflow' dir."""
+    name = str(spec.get("name") or "").lower()
+    slug = re.sub(r"-{2,}", "-",
+                  "".join(c if c.isalnum() else "-" for c in name)).strip("-")
+    return slug or "workflow"
+
+
+def _publish_dir(spec, s):
+    """Absolute target dir for a publishing step: its string value verbatim
+    ('~'-expanded), or — publish: true — the per-workflow default under
+    ~/.pervio/archives/. Validation already refused '..' traversal."""
+    pub = s.get("publish")
+    if isinstance(pub, str):
+        return _expand_dir(pub)
+    return os.path.join(HOME, ".pervio", "archives", _publish_slug(spec))
+
+
+def _publish_output(spec, s, text):
+    """Archive a published step's final output as an issue: <dir>/<date>.md,
+    atomic like _write_atomic (per-writer tmp + os.replace), so a same-day
+    rerun overwrites cleanly and a reader never sees a half-written issue.
+
+    THE DATE COMES FROM THE ISSUE ITSELF — the first line's YYYY-MM-DD (the
+    digest titles itself with the fetch's UTC-cycle date) — with the server's
+    local date only as the fallback for reports that don't carry one. The
+    filename used to be local-now unconditionally, which let a midnight-side
+    run write 08-13's issue into 08-14.md: two clocks naming one thing.
+
+    Empty (stripped) output writes NOTHING — a quiet day must not become a
+    blank issue in the reader — and is not an error.
+    Returns (absolute path or "", error or "")."""
+    if not (text or "").strip():
+        return "", ""
+    d = _publish_dir(spec, s)
+    first_line = text.strip().splitlines()[0]
+    m = re.search(r"\d{4}-\d{2}-\d{2}", first_line)
+    path = os.path.join(d, (m.group(0) if m else time.strftime("%Y-%m-%d")) + ".md")
+    tmp = "%s.tmp.%d" % (path, os.getpid())
+    try:
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except OSError as e:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return "", str(e)[:200]
+    return os.path.realpath(path), ""
+
+
+def _crash_run(rd, exc):
+    """Last-resort net for the DETACHED runner. Its exceptions have no console: a
+    crash used to kill the process silently, leaving ledger.status 'running' and the
+    status file 'running' FOREVER — the phone spins on a run that is already dead, and
+    nothing ever marks it failed. Land the run as failed, name the crash, and write
+    the terminal status file. Best effort; never raises (the caller re-raises so the
+    traceback still reaches runner.err)."""
+    msg = "runner crashed: %s: %s" % (type(exc).__name__, str(exc)[:200])
+    try:
+        led = _read_json(os.path.join(rd, "ledger.json"))
+        if led:
+            for st in led.get("steps", []):
+                if st.get("status") not in ("done", "failed", "skipped"):
+                    st["status"] = "failed"
+                    st["error"] = st.get("error") or msg
+            led["status"] = "failed"
+            led["error"] = msg
+            _write_atomic(os.path.join(rd, "ledger.json"), led)
+    except Exception:
+        pass
+    try:
+        with open(os.path.join(rd, "status"), "w") as f:
+            f.write("exited:1")
+    except OSError:
+        pass
+
+
+def cmd_run(argv):
+    global _LIVE_DIR
+    o = _parse(argv, {"wf"})
+    wf = o.get("wf", "")
+    rd = _wf_dir(wf)
+    _LIVE_DIR = os.path.join(rd, "live")   # where in-flight children register for reap
+    try:
+        _run_wf(wf, rd)
+    except Exception as e:
+        _crash_run(rd, e)
+        raise                              # traceback -> runner.err, exit code stays 1
+
+
+def _run_wf(wf, rd):
+    spec = _read_json(os.path.join(rd, "spec.json"))
+    ledger = _read_json(os.path.join(rd, "ledger.json"))
+    steps = spec.get("steps", [])
+    default_dir = spec.get("dir", "~")
+    by_id = {s["id"]: (i, s) for i, s in enumerate(steps)}
+
+    lock = threading.Lock()           # guards ledger + outputs/done/failed
+    outputs = {}                      # stepId -> output text
+    outputs_json = {}                 # stepId -> parsed structured value ({{id.json}})
+    step_roots = {}                   # stepId -> its worktree root (isolated steps)
+    done = set()                      # ids that finished OK
+    failed = set()                    # ids that failed or were skipped
+    notified = set()                  # push kinds already sent (see the outcome
+                                      # ping at the end: a publish step's 「已送达」
+                                      # IS the news, so the tail must not repeat it)
+
+    def save():
+        _write_atomic(os.path.join(rd, "ledger.json"), ledger)
+
+    # ---- worktree isolation setup (None = SHARED, the exact legacy path) ----
+    iso = _plan_isolation(spec, steps)
+    git_lock = threading.Lock()       # serializes integration merges + wt remove/prune;
+                                      # NEVER held together with `lock` (deadlock rule)
+    top = iso["top"] if iso else ""
+    integ_wt = os.path.join(rd, "wt", "integration")
+    iso_branch = "pervio/wf-%s/integration" % wf
+    if iso:
+        rc, ref, _ = _git(top, "symbolic-ref", "-q", "HEAD")
+        base_ref = ref or ""          # "" = detached HEAD -> merge-back disabled
+        _git(top, "worktree", "prune")
+        rc, _, e = _git(top, "worktree", "add", integ_wt, "-b", iso_branch, iso["base"])
+        if rc != 0:
+            _git(top, "worktree", "prune")
+            rc, _, e = _git(top, "worktree", "add", integ_wt, "-b", iso_branch, iso["base"])
+        if rc != 0:
+            # Never silently degrade to shared (that's the clobber this exists to
+            # stop) — fail the whole run with git's own words.
+            for led in ledger["steps"]:
+                led["status"] = "failed"
+                led["error"] = "worktree isolation setup failed: %s" % (e or "git error")
+            ledger["status"] = "failed"
+            save()
+            with open(os.path.join(rd, "status"), "w") as f:
+                f.write("exited:1")
+            return
+        _, dirty, _ = _git(top, "status", "--porcelain")
+        note = ("working tree had uncommitted changes; isolated steps see committed "
+                "state only" if dirty else "")
+        # Written at SETUP (not end) so a hard crash still leaves the branches
+        # discoverable from the phone.
+        ledger["git"] = {"branch": iso_branch, "baseRef": base_ref,
+                         "baseCommit": iso["base"], "merged": False, "note": note}
+        save()
+
+    def run_step(idx, s):
+        sid = s["id"]
+        backend = s.get("backend", "claude")
+        led = ledger["steps"][idx]
+        # A fan-out step runs no agent turn of its own (its children get ephemeral
+        # worktrees off HEAD), so it never takes a P3 step-worktree itself.
+        iso_step = bool(iso and iso["in_repo"].get(sid) and not s.get("fanout"))
+        reader = _is_reader(s) if iso_step else False
+        stepbr = "pervio/wf-%s/steps/%s" % (wf, sid)
+        with lock:
+            snap = dict(outputs)      # deps are already done, so their outputs are set
+            snap_json = dict(outputs_json)
+            roots_snap = dict(step_roots)
+            led["status"] = "running"
+            # Wall-clock stamps per step: the phone shows durations, and the
+            # efficiency suite can prove steps OVERLAPPED from the intervals
+            # themselves instead of timing the whole run with a stopwatch
+            # (a threshold that a loaded machine turns into a coin flip).
+            led["startedAt"] = time.time()
+            if iso:
+                led["isolation"] = "worktree" if iso_step else "shared"
+                if iso_step and not reader:
+                    led["branch"] = stepbr
+            save()
+
+        # Working dir: isolated steps get a fresh worktree branched from the
+        # integration tip (which already contains every finished dependency);
+        # everything else keeps the raw spec dir exactly as before.
+        fail_early = ""
+        tip = ""
+        wt = os.path.join(rd, "wt", "steps", sid)
+        if iso_step:
+            with git_lock:
+                rc, tip, e = _git(integ_wt, "rev-parse", "HEAD")
+            if rc != 0:
+                fail_early = "isolation error: %s" % (e or "no integration tip")
+            else:
+                add = (["worktree", "add", "--detach", wt, tip] if reader
+                       else ["worktree", "add", wt, "-b", stepbr, tip])
+                rc, _, e = _git(top, *add)
+                if rc != 0:           # stale registration from a crash: prune, retry once
+                    _git(top, "worktree", "prune")
+                    rc, _, e = _git(top, *add)
+                if rc != 0:
+                    fail_early = "could not create worktree: %s" % (e or "git error")
+            if not fail_early and os.path.exists(os.path.join(wt, ".gitmodules")):
+                # Timed: this is the one git op that fetches over the network.
+                rc, _, e = _git(wt, "submodule", "update", "--init", "--recursive",
+                                timeout=SETUP_TIMEOUT)
+                if rc != 0:
+                    fail_early = "submodule init failed: %s" % (e or "git error")
+            pfx = iso["prefix"].get(sid, ".")
+            step_dir = wt if pfx in (".", "") else os.path.join(wt, pfx)
+            setup_dirt = set()
+            if not fail_early and spec.get("setup"):
+                src, setup_to = _call_gated(["bash", "-lc", spec["setup"]], step_dir,
+                                            SETUP_TIMEOUT)
+                if setup_to:
+                    fail_early = "setup timed out (>%ds) — killed its process group" % int(SETUP_TIMEOUT)
+                elif src != 0:
+                    fail_early = ("setup failed (exit %d) — step ran in a fresh worktree "
+                                  "checkout; untracked files (node_modules, .env, …) are "
+                                  "absent there" % src)
+                else:
+                    # Snapshot what setup dropped (usually un-ignored provisioning
+                    # like a .env copy): it's environment, not the step's work — it
+                    # must neither be committed nor trip the reader rescue.
+                    rc, dirt, _ = _git(wt, "status", "--porcelain")
+                    if rc == 0:
+                        setup_dirt = {l[3:].strip().strip('"') for l in dirt.splitlines() if len(l) > 3}
+        else:
+            step_dir = s.get("dir", default_dir)
+        if fail_early:
+            with lock:
+                led["status"] = "failed"; led["error"] = fail_early
+                failed.add(sid); save()
+            return
+
+        def _repoint(pid, t):
+            proot = roots_snap.get(pid, "")
+            # A producer's worktree is gone by now — re-point its absolute paths
+            # at THIS step's own checkout (or the real repo for shared consumers).
+            # Text refs only: rewriting substrings inside serialized JSON would
+            # corrupt it, and structured values shouldn't carry worktree paths.
+            mine = wt if iso_step else top
+            if proot and proot.startswith(rd) and proot != mine and mine:
+                t = t.replace(proot, mine)
+            return t
+
+        # {{item.output}}/{{item.json}} in a fan-out prompt name FIELDS of the
+        # item, not a step called "item" — keep them (and the custom `as` var)
+        # out of the ref pass so the per-item pass gets first touch.
+        keep = set(RESERVED_IDS)
+        if s.get("fanout"):
+            keep.add((s.get("fanout") or {}).get("as", "item"))
+        prompt = _resolve_refs(s.get("prompt", ""), snap, snap_json,
+                               keep_ids=keep, repoint=_repoint)
+
+        # Fan-out step: expand the upstream list into one child agent turn per item.
+        # {{id.output}}/{{id.json}} refs are already resolved above; {{item}} was
+        # kept intact and is substituted per-item inside _run_fanout.
+        if s.get("fanout"):
+            fok, fout, ferr, fjson = _run_fanout(s, prompt, snap, snap_json, led, lock,
+                                                 save, wf, sid, backend, default_dir)
+            with lock:
+                led["output"] = fout
+                led["bytes"] = len((fout or "").encode("utf-8"))
+                if fok:
+                    led["status"] = "done"; outputs[sid] = fout; done.add(sid)
+                    if fjson is not None:
+                        outputs_json[sid] = fjson
+                else:
+                    led["status"] = "failed"; led["error"] = ferr; failed.add(sid)
+                save()
+            if fok and fjson is not None:
+                _write_json_artifact(rd, sid, fjson)
+            return
+
+        # Command step: run the shell line instead of an agent turn — stdout IS the
+        # output. Deterministic, token-free (the data layer of scheduled digests).
+        # Refs are NOT substituted into the command (upstream agent text into a
+        # shell line is an injection vector); it's a fixed string, like `verify`.
+        tok = {}
+        parsed_val = None
+        prior_sids = []
+        if s.get("command"):
+            jsonl = None
+            agent_sid = ""
+            retried_sid = ""
+            # The stdin template is the command's DATA lane: refs resolve here
+            # (both kinds), while the command line itself stays a fixed string.
+            payload = None
+            if s.get("stdin") is not None:
+                payload = _resolve_refs(s["stdin"], snap, snap_json,
+                                        keep_ids=RESERVED_IDS, repoint=_repoint)
+            text, code, err = _run_command_step(s["command"], _expand_dir(step_dir), rd,
+                                                stdin_data=payload)
+            ok = (code == 0)
+            # retry:N covers commands too — a curl'd fetch is deterministic in
+            # shape but not in weather. No transient default here: without the
+            # knob a command failure is the author's own exit code, kept as-is.
+            want_retry = s.get("retry")
+            extra = want_retry if (isinstance(want_retry, int)
+                                   and not isinstance(want_retry, bool)) else 0
+            att = 0
+            while not ok and att < extra:
+                att += 1
+                with lock:
+                    led["retried"] = True
+                    save()
+                text, code, err = _run_command_step(s["command"], _expand_dir(step_dir),
+                                                    rd, stdin_data=payload)
+                ok = (code == 0)
+        else:
+            jsonl = os.path.join(rd, "%s.jsonl" % sid)
+            retried_sid = ""
+            ok, text, err, code, agent_sid, tok = _run_agent_turn(s, backend, step_dir,
+                                                                  prompt, jsonl, spec, wf,
+                                                                  sid, iso)
+            # Failure retries. Two regimes, one loop:
+            #   * retry unset — the legacy contract, byte-stable: ONE re-run and
+            #     only for transient weather (timeout / dropped connection /
+            #     overloaded API), never for the agent being wrong.
+            #   * retry: N — the author's own budget: up to N re-runs on ANY
+            #     turn failure. Their step, their tokens.
+            # Every replaced attempt's conversation is a real on-disk session
+            # the CLI already created — ids are kept so delete's sweep reaches
+            # them (the jsonl overwrite would otherwise orphan them).
+            want_retry = s.get("retry")
+            extra = want_retry if (isinstance(want_retry, int)
+                                   and not isinstance(want_retry, bool)) else None
+            attempt = 0
+            while not ok:
+                if extra is not None:
+                    if attempt >= extra:
+                        break
+                elif attempt >= 1 or not TRANSIENT_RE.search(err or ""):
+                    break
+                attempt += 1
+                if attempt == 1:
+                    retried_sid = agent_sid
+                elif agent_sid:
+                    prior_sids.append(agent_sid)
+                with lock:
+                    led["retried"] = True
+                    save()
+                ok, text, err, code, agent_sid, tok = _run_agent_turn(s, backend, step_dir,
+                                                                      prompt, jsonl, spec,
+                                                                      wf, sid, iso)
+            # outputSchema: the turn went FINE but the answer must also be the
+            # declared shape. A wrong shape earns exactly one corrective re-run
+            # (complaint + bad head appended); a second wrong answer fails the
+            # step with the complaint. Runs before the commit/verify gates —
+            # this is about the TEXT, and the re-run may still edit files.
+            if ok and s.get("outputSchema") is not None:
+                parsed_val, verr = _parse_and_validate(s["outputSchema"], text)
+                if verr:
+                    if agent_sid:
+                        prior_sids.append(agent_sid)
+                    try:
+                        os.replace(jsonl, jsonl + ".badjson1")
+                    except OSError:
+                        pass
+                    with lock:
+                        led["schemaRetry"] = True
+                        save()
+                    fix = prompt + SCHEMA_FIX_NOTE % (verr, (text or "")[:1500])
+                    ok, text, err, code, agent_sid, tok = _run_agent_turn(
+                        s, backend, step_dir, fix, jsonl, spec, wf, sid, iso)
+                    if ok:
+                        parsed_val, verr = _parse_and_validate(s["outputSchema"], text)
+                    if not ok or verr:
+                        ok = False
+                        parsed_val = None
+                        err = err or ("输出不符合契约(schema): %s" % verr)
+
+        # Isolated post-turn: commit the step's work (or rescue+fail a reader that
+        # wrote), BEFORE the verify gate so failed-verify work survives on the branch.
+        # Setup droppings are excluded throughout — they die with the worktree.
+        head = tip
+        if iso_step and ok:
+            rc, dirty, _ = _git(wt, "status", "--porcelain")
+            agent_paths = [l[3:].strip().strip('"') for l in dirty.splitlines()
+                           if len(l) > 3 and l[3:].strip().strip('"') not in setup_dirt] \
+                          if rc == 0 else []
+            if reader:
+                if agent_paths:
+                    _git(wt, "add", "-A")
+                    if setup_dirt:
+                        _git(wt, "reset", "-q", "--", *sorted(setup_dirt))
+                    _git(wt, "commit", "-m", "pervio wf %s step %s (rescued)" % (wf, sid))
+                    _git(wt, "branch", stepbr)   # detached HEAD -> preserve the commit
+                    ok = False
+                    err = ("read-classified step modified files; work preserved on %s — "
+                           "give it a write perm/sandbox" % stepbr)
+            else:
+                if agent_paths:
+                    rc1, _, e1 = _git(wt, "add", "-A")
+                    if setup_dirt:
+                        _git(wt, "reset", "-q", "--", *sorted(setup_dirt))
+                    rc2, _, e2 = _git(wt, "commit", "-m", "pervio wf %s step %s" % (wf, sid))
+                    if rc1 or rc2:
+                        ok = False
+                        err = "commit failed: %s" % (e2 or e1 or "git error")
+                if ok:                # the agent may also have committed on its own
+                    rc, h, _ = _git(wt, "rev-parse", "HEAD")
+                    if rc == 0 and h:
+                        head = h
+
+        # Verify gate: an optional shell command that must pass (exit 0) for the
+        # step to count as done — e.g. "npm test" / "ruff check .". Runs in the
+        # step's own dir (its worktree when isolated), AFTER the commit, so its
+        # scratch droppings die with the worktree instead of polluting the merge.
+        if ok and s.get("verify"):
+            vrc, verify_to = _call_gated(["bash", "-lc", s["verify"]],
+                                         _expand_dir(step_dir), VERIFY_TIMEOUT)
+            if vrc != 0:
+                ok = False
+                err = ("verify timed out (>%ds) — killed its process group" % int(VERIFY_TIMEOUT)
+                       if verify_to else "verify failed (exit %d)" % vrc)
+                if iso_step and not reader and head != tip:
+                    err += "; the step's work is committed on %s" % stepbr
+
+        # Serialized merge into the integration branch. Merge the worktree's HEAD
+        # OID (not the branch name — an agent can wander off its branch), then
+        # re-point the step branch at what actually merged.
+        if iso_step and not reader and ok and head and head != tip:
+            with git_lock:
+                rc, _, em = _git(integ_wt, "merge", "--no-ff",
+                                 "-m", "pervio wf %s: step %s" % (wf, sid), head)
+                if rc != 0:
+                    _, files, _ = _git(integ_wt, "diff", "--name-only", "--diff-filter=U")
+                    _git(integ_wt, "merge", "--abort")
+                    ok = False
+                    err = ("merge conflict — parallel steps changed: %s; work kept on %s"
+                           % (", ".join(files.split()) if files else (em or "unknown"),
+                              stepbr))
+
+        # Publish: this step IS the workflow's publication — archive its final
+        # output as today's issue the moment the STEP succeeds (`ok` is final
+        # here: verify gate and merge have had their say; a LATER step failing
+        # must not eat an already-good paper). A write failure (perms, disk)
+        # goes to runner.err but never fails the step: the missing issue shows
+        # on the home card, and the run's work survives.
+        published = ""
+        if ok and s.get("publish"):
+            published, pub_err = _publish_output(spec, s, text)
+            if pub_err:
+                sys.stderr.write("pervio-orchestrate: step %s publish failed: %s\n"
+                                 % (sid, pub_err))
+            elif published:
+                # The issue landed — ping the phone: "论文晨报 2026-08-12 已送达".
+                # The date is the PUBLISHED FILE's name (which _publish_output
+                # took from the issue's own title), not the wall clock: the push
+                # must name the issue the tap will open. Recorded so the
+                # workflow-level ping below stays quiet: this already told the
+                # user the thing they care about.
+                notified.add("publish")
+                _push_notify(spec.get("name") or "Pervio",
+                             _push_copy_published(
+                                 os.path.splitext(os.path.basename(published))[0]),
+                             thread="pervio-digest", device=ledger.get("device", ""))
+
+        # Done is marked only AFTER the merge (git_lock released first — the two
+        # locks are never nested), so dependents always branch from a tip that
+        # already contains this step.
+        with lock:
+            led["output"] = text
+            led["bytes"] = (os.path.getsize(jsonl) if jsonl and os.path.exists(jsonl)
+                            else len((text or "").encode("utf-8")))
+            if tok:
+                led.update(tok)   # tokensIn/tokensOut — only when the backend said
+            if agent_sid:
+                # For delete's conversation sweep. realpath, because that's the cwd
+                # the CLI records (its project-folder encoding resolves symlinks).
+                led["sessionId"] = agent_sid
+                led["sessionDir"] = os.path.realpath(_expand_dir(step_dir))
+            if led.get("retried") and retried_sid and retried_sid != agent_sid:
+                led["retriedSessionId"] = retried_sid   # attempt 1, swept on delete
+            keep_sids = [p for p in prior_sids if p and p != agent_sid]
+            if keep_sids:
+                # A schema-retried step has an extra REAL conversation on disk
+                # (attempt 1's) — recorded so delete's sweep reaches it too.
+                led["priorSessionIds"] = sorted(set((led.get("priorSessionIds") or [])
+                                                    + keep_sids))
+            if ok:
+                led["status"] = "done"; outputs[sid] = text; done.add(sid)
+                if parsed_val is not None:
+                    outputs_json[sid] = parsed_val
+                if published:
+                    led["publishedTo"] = published
+                if iso_step:
+                    step_roots[sid] = wt
+            else:
+                led["status"] = "failed"; led["error"] = err or ("exit %d" % code)
+                failed.add(sid)
+            led["endedAt"] = time.time()   # pairs with startedAt (see above)
+            save()
+        if ok and parsed_val is not None:
+            _write_json_artifact(rd, sid, parsed_val)
+
+        # Cleanup: successful worktrees go away (branch kept as audit); failed ones
+        # stay under the run dir for inspection until the run is deleted.
+        if iso_step and ok:
+            with git_lock:
+                _git(top, "worktree", "remove", "--force", wt)
+                if not reader and head:
+                    rc, cur, _ = _git(top, "rev-parse", "--verify", "refs/heads/" + stepbr)
+                    if rc == 0 and cur != head:
+                        _git(top, "branch", "-f", stepbr, head)
+
+    # DAG scheduler: a step runs once all its deps are done; independent steps run
+    # in parallel (capped). A step whose dependency failed is skipped. Ordering is
+    # dependsOn ∪ {{id.output}} refs — ONE graph, _dep_edges, for every mode. Shared
+    # runs used to gate on dependsOn alone, so a consumer could be submitted in the
+    # same pass as its producer, substitute "" for the ref and still report `done`;
+    # the ref IS the consumer's input, so it is always an edge.
+    dep_all = iso["dep"] if iso else _dep_edges(steps)
+
+    def eff_deps(s):
+        return sorted(dep_all.get(s["id"], ()))
+
+    # optional steps never block the graph: their failure (or skip) satisfies a
+    # dependent, whose {{ref}}s then substitute empty — a DEGRADED downstream
+    # beats a skipped one, and the three-step fanout charade that used to fake
+    # this (prep + fanout-of-1 + tolerateAllFail) retires.
+    optional_ids = {s["id"] for s in steps if s.get("optional")}
+    # Resume (WF-2): steps seeded 'done+cached' by _start_wf ran in a PRIOR run —
+    # their outputs are already in the ledger and json/, and they must not run
+    # (or publish, or push) again.
+    for i, s in enumerate(steps):
+        st = ledger["steps"][i]
+        if st.get("cached") and st.get("status") == "done":
+            done.add(s["id"])
+            outputs[s["id"]] = st.get("output", "")
+            jp = os.path.join(rd, "json", "%s.json" % s["id"])
+            if os.path.exists(jp):
+                try:
+                    with open(jp, "r") as jf:
+                        outputs_json[s["id"]] = json.load(jf)
+                except (OSError, ValueError):
+                    pass
+
+    pending = set(by_id) - done
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_PARALLEL) as ex:
+        running = {}
+        while pending or running:
+            moved = False
+            for sid in list(pending):
+                idx, s = by_id[sid]
+                deps = eff_deps(s)
+                with lock:
+                    dep_failed = any(d in failed and d not in optional_ids
+                                     for d in deps)
+                    dep_done = all(d in done or (d in failed and d in optional_ids)
+                                   for d in deps)
+                if dep_failed:
+                    with lock:
+                        ledger["steps"][idx]["status"] = "skipped"
+                        ledger["steps"][idx]["error"] = "a dependency failed"
+                        failed.add(sid); save()
+                    pending.discard(sid); moved = True
+                elif dep_done:
+                    pending.discard(sid)
+                    running[ex.submit(run_step, idx, s)] = sid
+                    moved = True
+            if running:
+                fin, _ = concurrent.futures.wait(
+                    running, return_when=concurrent.futures.FIRST_COMPLETED)
+                for f in fin:
+                    sid = running.pop(f, None)
+                    # run_step marks its own step done/failed; but an UNEXPECTED
+                    # exception (it should catch its own) would otherwise be
+                    # swallowed by the pool — leaving the step stuck 'running' and
+                    # its dependents mislabeled "cycle". Surface it as a failure.
+                    exc = f.exception()
+                    if exc is not None and sid is not None:
+                        idx = by_id[sid][0]
+                        with lock:
+                            st = ledger["steps"][idx]
+                            if st["status"] not in ("done", "failed", "skipped"):
+                                st["status"] = "failed"
+                                st["error"] = "step crashed: %s" % str(exc)[:200]
+                            failed.add(sid); save()
+            elif pending and not moved:
+                # nothing runnable and nothing changed: unsatisfiable deps / cycle
+                with lock:
+                    for sid in pending:
+                        idx, _ = by_id[sid]
+                        ledger["steps"][idx]["status"] = "failed"
+                        ledger["steps"][idx]["error"] = "unsatisfiable dependency (cycle?)"
+                        failed.add(sid)
+                    save()
+                pending.clear()
+
+    # Merge back to where the user actually is — but only when every step landed
+    # AND their checkout still sits on the same branch at the same commit as when
+    # we started (never a detached HEAD). Any guard miss or nonzero merge leaves
+    # the integration branch in place and says so; never retried, never forced.
+    if iso:
+        g = ledger["git"]
+        keep_note = g.get("note", "")
+        if failed:
+            g["note"] = "not merged: a step failed (results on %s)" % iso_branch
+        elif not g.get("baseRef"):
+            g["note"] = "not merged: repo was on a detached HEAD (results on %s)" % iso_branch
+        else:
+            # The check and the merge are ONE step under the repository's
+            # landing lock: without it another workflow can move the branch
+            # between the two, or merge at the same instant (see _LandingLock).
+            with _LandingLock(top) as landing:
+                rc, ref_now, _ = _git(top, "symbolic-ref", "-q", "HEAD")
+                rc2, head_now, _ = _git(top, "rev-parse", "HEAD")
+                if not landing.held:
+                    g["note"] = ("not merged: another workflow was still landing on this "
+                                 "repository (results on %s)" % iso_branch)
+                elif ref_now != g["baseRef"] or head_now != g["baseCommit"]:
+                    g["note"] = ("not merged: the checkout moved during the run "
+                                 "(results on %s)" % iso_branch)
+                else:
+                    # start_new_session so a concurrent `delete`'s killpg can never
+                    # kill this mid-checkout and strand a half-rewritten user tree.
+                    rc, _, em = _git(top, "merge", "--ff-only", iso_branch, new_session=True)
+                    if rc == 0:
+                        g["merged"] = True
+                        g["note"] = "merged into %s" % g["baseRef"].replace("refs/heads/", "")
+                    else:
+                        g["note"] = "not merged: %s (results on %s)" % (
+                            (em or "fast-forward refused").splitlines()[-1], iso_branch)
+        if keep_note and not g["merged"]:
+            g["note"] = (g["note"] + "; " + keep_note)
+        with git_lock:
+            # The integration worktree always goes; its branch (and the step
+            # branches) survive UNLESS everything merged — then they're redundant
+            # (all commits reachable from the user's branch) and get deleted.
+            _git(top, "worktree", "remove", "--force", integ_wt)
+            if g["merged"]:
+                _, refs, _ = _git(top, "for-each-ref", "--format=%(refname:short)",
+                                  "refs/heads/pervio/wf-%s/" % wf)
+                for br in refs.splitlines():
+                    if br.strip():
+                        _git(top, "branch", "-D", br.strip())
+
+    with lock:
+        # An optional step's failure is a recorded degradation, not a failed
+        # run: the whole point of the flag is that the workflow stands without it.
+        hard_failed = sorted(f for f in failed if f not in optional_ids)
+        ledger["status"] = "failed" if hard_failed else "done"
+        save()
+    with open(os.path.join(rd, "status"), "w") as f:
+        f.write("exited:%d" % (1 if hard_failed else 0))
+
+    # Workflow-level outcome ping — EXACTLY ONE per run, both outcomes.
+    #
+    # It used to fire only on failure, on the grounds that success was covered by
+    # "the app's own completion banner". That is no longer true and was never
+    # good: the app can only banner while iOS has not suspended it, and when it
+    # DID banner the user got two notifications for one workflow (the app's
+    # "Task finished" next to this script's push). The app now defers to this
+    # push (CompletionNotifier.serverPushArmed), so silence here is silence
+    # everywhere — which is why success must ping too.
+    #
+    # The one exception is a workflow that already published: 「今天的晨报已送达」
+    # is the same news told better, so `notified` suppresses a second buzz.
+    # Either way the title is the workflow's own name — that is what tells the
+    # user WHICH of their scheduled jobs is talking.
+    name = spec.get("name") or "Pervio"
+    if hard_failed:
+        _push_notify(name, _push_copy_failed(hard_failed), thread="pervio-wf-" + wf,
+                     device=ledger.get("device", ""))
+    elif "publish" not in notified:
+        _push_notify(name, _push_copy_done(len(steps)), thread="pervio-wf-" + wf,
+                     device=ledger.get("device", ""))
+
+
+# ---------- status / tail / list ----------
+
+def _reconcile_dead(rd, led):
+    """The ledger says running but the runner is DEAD (kill -9, reboot, power
+    loss): flip the record to the truth, once, atomically. 2026-08-22 audit P1:
+    list/status/tail all echoed the stale 'running' forever, iOS spun on it, and
+    the pruner skipped the corpse for eternity. Only ever called AFTER _wf_alive
+    said no — the runner being dead is exactly what makes this write race-free."""
+    for st in led.get("steps") or []:
+        if st.get("status") == "running":
+            st["status"] = "failed"
+            st["error"] = st.get("error") or "runner died (kill or reboot) mid-step"
+        elif st.get("status") == "pending":
+            st["status"] = "skipped"
+            st["error"] = st.get("error") or "runner died before this step started"
+    led["status"] = "failed"
+    _write_atomic(os.path.join(rd, "ledger.json"), led)
+    try:
+        with open(os.path.join(rd, "status"), "w") as f:
+            f.write("exited:1")
+    except OSError:
+        pass
+    return led
+
+
+def cmd_status(argv):
+    o = _parse(argv, {"wf"})
+    rd = _wf_dir(o.get("wf", ""))
+    if not os.path.isdir(rd):
+        _die("no such workflow", 3)
+    led = _read_json(os.path.join(rd, "ledger.json"))
+    if led.get("status") == "running" and not _wf_alive(o.get("wf", "")):
+        led = _reconcile_dead(rd, led)
+    sys.stdout.write(json.dumps(led) + "\n")
+
+
+def cmd_spec(argv):
+    """The spec a workflow was started from, verbatim — lets the phone re-run a
+    past workflow by seeding its editor with the original steps (incl. fanout /
+    dispatch knobs) instead of rebuilding from the market every time."""
+    o = _parse(argv, {"wf"})
+    rd = _wf_dir(o.get("wf", ""))
+    if not os.path.isdir(rd):
+        _die("no such workflow", 3)
+    sys.stdout.write(json.dumps(_read_json(os.path.join(rd, "spec.json"))) + "\n")
+
+
+def cmd_tail(argv):
+    o = _parse(argv, {"wf"})
+    rd = _wf_dir(o.get("wf", ""))
+    led_path = os.path.join(rd, "ledger.json")
+    for _ in range(40):
+        if os.path.exists(led_path):
+            break
+        time.sleep(0.05)
+    if not os.path.exists(led_path):
+        _die("no such workflow", 3)
+    last = None
+    last_out = time.time()
+    while True:
+        led = _read_json(led_path)
+        snap = json.dumps(led, ensure_ascii=False)
+        if snap != last:
+            sys.stdout.write(snap + "\n")
+            sys.stdout.flush()
+            last = snap
+            last_out = time.time()
+        elif time.time() - last_out >= 10:
+            # Ten silent seconds is also when a DEAD runner shows itself: a live
+            # one writes the ledger every step, a corpse never will. Checking
+            # here (not every 0.5s pass) keeps the ps probe off the hot loop.
+            if led.get("status") == "running" and not _wf_alive(o.get("wf", "")):
+                led = _reconcile_dead(rd, led)
+                sys.stdout.write(json.dumps(led, ensure_ascii=False) + "\n")
+                sys.stdout.flush()
+                break
+            # A step can sit silent for minutes (e.g. codex "thinking"), during
+            # which the ledger doesn't change and we'd emit nothing — long enough
+            # for the phone to trip its idle timeout and reconnect. Emit a
+            # heartbeat at the line boundary to keep the channel warm; the app
+            # decodes it as a blank ledger and drops it (wfId guard).
+            sys.stdout.write('{"type":"heartbeat"}\n')
+            sys.stdout.flush()
+            last_out = time.time()
+        if led.get("status") in ("done", "failed"):
+            break
+        time.sleep(0.5)
+
+
+TPL = os.path.join(HOME, ".pervio", "templates")
+
+
+def _tpl_suggested_time(v):
+    """The wrapper's daily time as canonical "HH:MM", or None to omit the field.
+
+    The phone's market calls a template a 刊物 — subscribe once, read the home
+    card — when its spec publishes AND it ships with a daily time. Server
+    templates had no way to say the time, so a publishing template landed on the
+    capability shelf with no subscribe button at all.
+
+    Zero-padded on the way out because the app parses with a strict "HH:mm", so a
+    hand-written "6:30" has to arrive as "06:30" or it is silently ignored.
+    Anything that is not a 24h time — a typo, a number, a list, a string with a
+    NUL in it — is OMITTED rather than passed through or turned into an error:
+    the app must be able to tell "no suggestion" from "a suggestion I can't
+    read", and a template with a bad time is still a perfectly runnable template.
+    """
+    if not isinstance(v, str):
+        return None
+    try:
+        hh, mm = _parse_hhmm(v)
+    except ValueError:
+        return None
+    return "%02d:%02d" % (hh, mm)
+
+
+def cmd_models(argv):
+    """The model paper: tier table + chat quick-pick menu, straight from
+    _pervio_lib. The phone reads it once per connect and caches it."""
+    print(json.dumps(models_menu(), ensure_ascii=False))
+
+
+def cmd_templates(argv):
+    """The user's personal workflow market, server-side: any *.json under
+    ~/.pervio/templates (written by hand, by the editor's Save-as-template, or
+    by Claude in a chat) shows up in the app with zero app changes. A file is
+    either a bare spec or a market-item wrapper {name, summary, spec}; the
+    WRAPPER may additionally carry "expose": true + "slug" + "params" (the F1
+    declaration pervio-mcp turns into a named pervio_run_<slug> tool — wrapper
+    fields, so a bare-spec template cannot declare them) and "suggestedTime"
+    (the daily time the app's market needs to offer a subscribe button; wrapper
+    field for the same reason). This listing passes {name, summary, spec}
+    through unchanged, plus suggestedTime canonicalised to "HH:MM" and OMITTED
+    when absent or unreadable. Broken files are LISTED with their error instead
+    of hidden — a template Claude just wrote must be debuggable from the phone.
+
+    Third kind — playbooks: {"kind":"playbook","name","summary","body"} is
+    methodology markdown LOADED INTO A CONVERSATION, never started. Listed as
+    {file,name,summary,kind,bodyChars} plus the body verbatim (playbooks are
+    small; one trip beats a follow-up fetch), with no spec validation. A
+    missing/empty body or an unknown kind is listed with its error like any
+    broken file. Files WITHOUT a kind field keep the exact legacy shape
+    (kind defaults to workflow; no new fields grafted on)."""
+    if argv[:1] == ["remove"]:
+        # `templates remove --file <name>.json`: delete ONE of the person's own
+        # template files (the market's "Mine" shelf, 2026-10-20). The name is a
+        # bare filename inside ~/.pervio/templates — no path, no "..": a template
+        # is the only thing this can ever remove. A file that isn't there is
+        # reported, not invented.
+        o = _parse(argv[1:], {"file"})
+        fn = o.get("file", "")
+        if not fn or "/" in fn or "\\" in fn or fn in (".", "..") or not fn.endswith(".json") or fn.startswith("."):
+            _die("templates remove needs --file <name>.json (a bare filename)", 2)
+        p = os.path.join(TPL, fn)
+        if not os.path.isfile(p):
+            sys.stdout.write(json.dumps({"removed": False, "file": fn, "reason": "no such template"}) + "\n")
+            sys.exit(3)
+        os.remove(p)
+        sys.stdout.write(json.dumps({"removed": True, "file": fn}) + "\n")
+        return
+    if not argv or argv[0] != "list":
+        _die("usage: pervio-orchestrate templates list | templates remove --file <name>.json")
+    items = []
+    if os.path.isdir(TPL):
+        for fn in sorted(os.listdir(TPL)):
+            if not fn.endswith(".json"):
+                continue
+            p = os.path.join(TPL, fn)
+            try:
+                mtime = int(os.path.getmtime(p))
+            except OSError:
+                continue
+            entry = {"file": fn, "mtime": mtime}
+            raw = _read_json(p)
+            kind = raw.get("kind") if isinstance(raw, dict) else None
+            if kind == "playbook":
+                body = raw.get("body")
+                if "spec" in raw:
+                    # Nothing legitimate puts a spec in a playbook — surface the
+                    # smuggle loudly instead of silently stripping it (the app
+                    # then shows a broken row, and archives/start never see it).
+                    entry.update({"ok": False, "name": str(raw.get("name") or fn),
+                                  "error": "playbook must not carry a spec"})
+                    items.append(entry)
+                    continue
+                if isinstance(body, str) and body.strip():
+                    entry.update({"ok": True, "name": str(raw.get("name") or fn),
+                                  "summary": str(raw.get("summary") or "")[:500],
+                                  "kind": "playbook", "bodyChars": len(body),
+                                  "body": body})
+                else:
+                    entry.update({"ok": False, "name": fn,
+                                  "error": "playbook needs a non-empty string body"})
+                items.append(entry)
+                continue
+            if kind not in (None, "workflow"):
+                entry.update({"ok": False, "name": fn,
+                              "error": "unknown template kind %r" % (kind,)})
+                items.append(entry)
+                continue
+            summary = ""
+            spec = raw
+            sug = None
+            if isinstance(raw, dict) and isinstance(raw.get("spec"), dict):
+                summary = str(raw.get("summary") or "")[:500]
+                # Read off the WRAPPER only — never spec["suggestedTime"] — so an
+                # imported/agent-written spec body cannot declare its own daily
+                # time, exactly as it cannot declare expose/slug/params.
+                sug = _tpl_suggested_time(raw.get("suggestedTime"))
+                spec = raw["spec"]
+            try:
+                if not raw:
+                    raise ValueError("not valid JSON")
+                _validate_spec(spec)
+                entry.update({"ok": True, "name": spec.get("name") or fn,
+                              "steps": len(spec.get("steps") or []),
+                              "summary": summary, "spec": spec})
+                if sug:
+                    entry["suggestedTime"] = sug
+            except Exception as e:
+                entry.update({"ok": False, "name": fn, "error": str(e)[:200]})
+            items.append(entry)
+    items.sort(key=lambda i: -i.get("mtime", 0))
+    sys.stdout.write(json.dumps(items, ensure_ascii=False) + "\n")
+
+
+def _spec_pub_dirs(spec):
+    """Every dir a spec publishes into, verbatim spellings: the legacy top-level
+    display.archiveDir first (so when a publish step names the same dir the
+    entry keeps the spelling the user originally declared), then each publish
+    step's dir (its string value, or the default ~/.pervio/archives/<slug> for
+    publish:true). A '..'-traversal dir is dropped outright: an IMPORTED spec
+    must not point the reader outside where the user thinks it publishes."""
+    if not isinstance(spec, dict):
+        return []
+    disp = spec.get("display") if isinstance(spec.get("display"), dict) else {}
+    dirs = []
+    d = disp.get("archiveDir")
+    if isinstance(d, str) and d.strip() and _dir_ok(d):
+        dirs.append(d)
+    steps = spec.get("steps")
+    for s in (steps if isinstance(steps, list) else []):
+        if not isinstance(s, dict):
+            continue
+        pub = s.get("publish")
+        if pub is True:
+            dirs.append("~/.pervio/archives/" + _publish_slug(spec))
+        elif isinstance(pub, str) and pub.strip() and _dir_ok(pub):
+            dirs.append(pub)
+    return dirs
+
+
+def cmd_archives(argv):
+    """The user's publications, two sources per spec: a step marked `publish`
+    (dir = its string value, or the default ~/.pervio/archives/<slug> the
+    orchestrator writes into) and the legacy top-level display.archiveDir
+    (compat layer — the paper digest's spec still declares it, zero-change
+    migration). Sources: schedule specs first, then templates (inner spec for
+    wrapped files) — a schedule IS a template put to work, so when both point
+    at the same dir (dedupe by realpath) the schedule's entry wins; archiveDir
+    and a publish step naming the same dir are ONE publication, not two. A
+    publication that exactly ONE schedule publishes into also carries that
+    schedule's vitals (scheduleId/scheduleEnabled/lastStatus/lastError/
+    lastFiredAt/nextDue) so the home card can say "this morning's issue failed"
+    without a second round trip; zero or several matching schedules leave the
+    fields absent (an ambiguous join would pin the wrong schedule's failure on
+    an innocent publication)."""
+    if not argv or argv[0] != "list":
+        _die("usage: pervio-orchestrate archives list")
+    pubs = {}                     # realpath(dir) -> entry; first writer (a schedule) wins
+
+    def consider(spec):
+        if not isinstance(spec, dict):
+            return
+        disp = spec.get("display") if isinstance(spec.get("display"), dict) else {}
+        for d in _spec_pub_dirs(spec):
+            key = os.path.realpath(_expand_dir(d))
+            if key in pubs:
+                continue
+            files = []
+            try:
+                names = os.listdir(key)
+            except OSError:
+                names = []        # dir not created yet — a publication with no issues
+            for fn in names:
+                if not fn.endswith(".md"):
+                    continue
+                try:
+                    files.append({"file": fn,
+                                  "mtime": int(os.path.getmtime(os.path.join(key, fn)))})
+                except OSError:
+                    continue
+            files.sort(key=lambda f: -f["mtime"])
+            pubs[key] = {"name": spec.get("name") or "", "dir": d,
+                         "display": disp, "actions": spec.get("actions") or [],
+                         "files": files[:90]}   # ~a quarter of a daily — plenty for the phone
+
+    sched_by_key = {}             # realpath(dir) -> [schedule ids publishing there]
+    if os.path.isdir(SCHED):
+        for sid in sorted(os.listdir(SCHED)):
+            if not VALID_ID.match(sid):
+                continue
+            spec = _read_json(os.path.join(SCHED, sid, "spec.json"))
+            consider(spec)
+            for d in _spec_pub_dirs(spec):
+                ids = sched_by_key.setdefault(os.path.realpath(_expand_dir(d)), [])
+                if sid not in ids:   # archiveDir + publish on one dir is ONE schedule
+                    ids.append(sid)
+    if os.path.isdir(TPL):
+        for fn in sorted(os.listdir(TPL)):
+            if not fn.endswith(".json"):
+                continue
+            raw = _read_json(os.path.join(TPL, fn))
+            # A playbook is conversation methodology — a spec smuggled inside
+            # its wrapper must not mint a phantom publication whose reader
+            # would surface an arbitrary dir on the phone (cmd_templates
+            # rejects such wrappers outright; this is the same gate here).
+            if isinstance(raw, dict) and raw.get("kind") == "playbook":
+                continue
+            spec = (raw["spec"] if isinstance(raw, dict) and isinstance(raw.get("spec"), dict)
+                    else raw)
+            consider(spec)
+    # The schedule join: exactly one schedule publishing into the dir pins its
+    # vitals on the entry; zero or several leave the fields absent.
+    now = _sched_now()
+    for key, entry in pubs.items():
+        ids = sched_by_key.get(key) or []
+        if len(ids) != 1:
+            continue
+        sch = _read_sched(ids[0])
+        if not sch:
+            continue
+        try:
+            nxt = _occurrence(sch, now, +1)
+        except ValueError:
+            nxt = None
+        entry.update({"scheduleId": sch.get("id") or ids[0],
+                      "scheduleEnabled": bool(sch.get("enabled")),
+                      "lastStatus": _last_status(sch),
+                      "lastError": sch.get("lastError") or "",
+                      "lastFiredAt": int(sch.get("lastFiredAt") or 0),
+                      "nextDue": int(nxt.timestamp()) if nxt else 0})
+    # A publication earns its home card by being USED: at least one issue on
+    # disk, or a live (enabled) subscription publishing into it. A template that
+    # merely ships with a publish step — the seeds, or a spec Claude wrote and
+    # nobody ran — stays a market item: a fresh user used to open the app to
+    # three empty cards (2026-10-11). A paused subscription with no issues drops
+    # off the home until it is resumed; an issue, once printed, keeps the card.
+    def _in_use(key, entry):
+        if entry["files"]:
+            return True
+        for sid in sched_by_key.get(key) or []:
+            sch = _read_sched(sid)
+            if sch and sch.get("enabled"):
+                return True
+        return False
+    items = [e for k, e in pubs.items() if _in_use(k, e)]
+    # Freshest publication first; one that hasn't produced an issue yet sorts last.
+    items.sort(key=lambda i: (0, -i["files"][0]["mtime"]) if i["files"] else (1, 0))
+    sys.stdout.write(json.dumps(items, ensure_ascii=False) + "\n")
+
+
+def cmd_list(argv):
+    items = []
+    if os.path.isdir(WF):
+        for wid in os.listdir(WF):
+            led = _read_json(os.path.join(WF, wid, "ledger.json"))
+            if led:
+                if led.get("status") == "running" and not _wf_alive(wid):
+                    led = _reconcile_dead(os.path.join(WF, wid), led)
+                items.append({k: led.get(k)
+                              for k in ("wfId", "name", "status", "startedAt", "scheduleId")})
+    items.sort(key=lambda i: i.get("startedAt", 0), reverse=True)
+    sys.stdout.write(json.dumps(items) + "\n")
+
+
+def cmd_delete(argv):
+    o = _parse(argv, {"wf"})
+    wf = o.get("wf", "")
+    rd = _wf_dir(wf)                # validates the id (no path traversal)
+    if not os.path.isdir(rd):
+        _die("no such workflow", 3)
+    residue = _delete_run(wf, rd)
+    if residue:
+        # rmtree(ignore_errors=True) used to swallow a denied unlink and this line
+        # reported success anyway: the run vanished from the phone's list while its
+        # ledger and transcripts stayed on disk forever. Say what survived instead.
+        sys.stderr.write("pervio-orchestrate: delete of %s did NOT finish — still on disk:\n%s\n"
+                         % (wf, "\n".join("  " + r for r in residue)))
+        sys.stdout.write(json.dumps({"deleted": False, "wfId": wf, "reason": "residue",
+                                     "remaining": residue}) + "\n")
+        sys.exit(1)
+    sys.stdout.write(json.dumps({"deleted": wf}) + "\n")
+
+
+def _proc_start(pid):
+    """A stable per-PROCESS token (its start time) that DIFFERS if the pid is reused
+    by a later process — the missing piece that lets us tell 'our still-running
+    session leader' from 'an unrelated login that inherited the recycled pgid after
+    a reboot'. Linux: /proc/<pid>/stat field 22. macOS/BSD: `ps -o lstart=`.
+    Returns "" when it can't be determined (old run, unknown platform)."""
+    try:
+        with open("/proc/%d/stat" % pid) as f:
+            data = f.read()
+        # comm (field 2) is parenthesized and may itself contain ')'/spaces; split
+        # after the LAST ')' so the remaining fields align. starttime is field 22,
+        # i.e. index 19 counting from field 3 (state) at index 0.
+        return data[data.rfind(")") + 1:].split()[19]
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        p = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)],
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                           timeout=5)
+        return (p.stdout or "").strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def _pgid_identity_ok(rd, pgid):
+    """True only if `pgid` is alive AND is really THIS run's process group (its start
+    token matches what we recorded), so a signal is safe. None when we can't prove
+    identity (no recorded token — an old run or a platform without start times);
+    callers fall back to the age cap. False when the pid is dead or provably reused."""
+    try:
+        os.killpg(pgid, 0)
+    except OSError:
+        return False                           # dead group
+    try:
+        with open(os.path.join(rd, "pgid.start")) as f:
+            saved = f.read().strip()
+    except OSError:
+        saved = ""
+    if not saved:
+        return None                            # can't prove identity
+    return _proc_start(pgid) == saved          # match => ours; mismatch => reused
+
+
+def _live_register(pid):
+    """Record an in-flight child's process-group leader (pid == pgid, it's a session
+    leader) in _LIVE_DIR, tagged with its start token, so _delete_run can reap it —
+    these children run in their own session and so escape the runner's pgid. No-op
+    until cmd_run sets _LIVE_DIR."""
+    if not _LIVE_DIR:
+        return
+    try:
+        os.makedirs(_LIVE_DIR, mode=0o700, exist_ok=True)
+        with open(os.path.join(_LIVE_DIR, str(pid)), "w") as f:
+            f.write(_proc_start(pid))
+    except OSError:
+        pass
+
+
+def _live_unregister(pid):
+    """Drop a child's registry entry once it has exited (normal path)."""
+    if not _LIVE_DIR:
+        return
+    try:
+        os.remove(os.path.join(_LIVE_DIR, str(pid)))
+    except OSError:
+        pass
+
+
+def _reap_live_children(rd):
+    """Reap any still-alive child groups a delete would otherwise orphan (they run in
+    their own session, outside the runner's pgid). Uses the same reused-pid safety as
+    the runner: only signal a pid whose start token still matches what we recorded, so
+    a recycled pid belonging to an unrelated process is never touched."""
+    live = os.path.join(rd, "live")
+    try:
+        names = os.listdir(live)
+    except OSError:
+        return
+    for name in names:
+        try:
+            pid = int(name)
+        except ValueError:
+            continue
+        try:
+            with open(os.path.join(live, name)) as f:
+                tok = f.read().strip()
+        except OSError:
+            continue
+        if not tok or _proc_start(pid) != tok:   # gone, or the pid was reused — skip
+            continue
+        try:
+            os.killpg(pid, signal.SIGTERM)
+            for _ in range(20):                  # up to 2s for it to exit
+                time.sleep(0.1)
+                try:
+                    os.killpg(pid, 0)
+                except ProcessLookupError:
+                    break
+            else:
+                os.killpg(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+def _residue(path, cap=20):
+    """Everything still on disk under `path` after a teardown attempt, sorted and
+    capped. An empty list is the ONLY proof that a delete actually finished —
+    shutil.rmtree(ignore_errors=True) returns None whether it removed the tree or
+    silently gave up on a denied unlink."""
+    if not os.path.exists(path):
+        return []
+    left = [path]
+    for root, dirs, files in os.walk(path):
+        for n in sorted(dirs) + sorted(files):
+            left.append(os.path.join(root, n))
+            if len(left) >= cap:
+                left.append("... (more)")
+                return left
+    return left
+
+
+def _delete_run(wf, rd):
+    """Full teardown of one run (kill, rmtree, git sweep, conversation sweep) —
+    shared by cmd_delete and the schedule pruner. Returns the list of paths that
+    are STILL on disk afterwards; empty means the run really is gone."""
+    # Read the ledger FIRST — rmtree destroys the only pointer to the project
+    # repo whose worktrees/branches this run may have created.
+    led = _read_json(os.path.join(rd, "ledger.json"))
+    # If it's still running, stop the detached runner group and WAIT for it to
+    # die before deleting: a live child mid-`worktree add` would otherwise write
+    # into the dir while rmtree walks it. Escalate to SIGKILL after 5s.
+    status = ""
+    try:
+        with open(os.path.join(rd, "status")) as f:
+            status = f.read().strip()
+    except OSError:
+        pass
+    if status == "running":
+        try:
+            with open(os.path.join(rd, "pgid")) as f:
+                pid = int(f.read().strip())
+            # Only signal a group we can vouch for. A crash/reboot can leave a stale
+            # 'running' whose pgid the OS has since handed to an unrelated process;
+            # blindly SIGTERM→SIGKILL there would murder a bystander. Signal when the
+            # start token proves it's ours, or (no token) when the run is recent
+            # enough to still plausibly be ours; otherwise just reclaim the dir.
+            ident = _pgid_identity_ok(rd, pid)
+            may_signal = ident is True
+            if ident is None:               # unprovable — gate on age, like _wf_alive
+                started = led.get("startedAt", 0)
+                may_signal = not (started and (time.time() - started) > WF_MAX_AGE)
+            if may_signal:
+                os.killpg(pid, signal.SIGTERM)
+                for _ in range(50):             # up to 5s for the group to exit
+                    time.sleep(0.1)
+                    try:
+                        os.killpg(pid, 0)       # raises when the group is gone
+                    except ProcessLookupError:
+                        break
+                else:
+                    try:
+                        os.killpg(pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+                    time.sleep(0.2)
+        except (OSError, ValueError):
+            pass
+    # Killing the runner's pgid above does NOT reach children that run in their own
+    # session (agent turns, command/setup/verify shells, fan-out children) — reap those
+    # too before rmtree, so a delete mid-run actually stops the work instead of leaving
+    # orphans writing into the dir we're about to remove. Unconditional: a crashed
+    # runner leaves registry entries behind even when status is no longer "running".
+    _reap_live_children(rd)
+    # Codex fan-out/teststep children's thread ids live ONLY in their streams
+    # inside this directory — take the register before the building comes down
+    # (the sweep runs after the rmtree, by design: conversations must not block
+    # the delete, and the claude half never needed the dir).
+    codex_threads = _codex_child_threads(rd)
+    shutil.rmtree(rd, ignore_errors=True)
+    residue = _residue(rd)      # measured BEFORE the sweeps, which never recreate rd
+    # Deleting the run is the explicit "discard its results" action: clear the
+    # stale worktree registrations (their dirs just went away with rd) and every
+    # pervio/wf-<id>/* branch. Run UNCONDITIONALLY whenever the dir is a git repo —
+    # P3 isolation (led.git), P4 dispatch, and fan-out all leave worktrees/branches
+    # under that same namespace, and dispatch/fan-out happen even when led.git is absent.
+    rc, top, _ = _git(os.path.realpath(_expand_dir(led.get("dir", "~"))),
+                      "rev-parse", "--show-toplevel")
+    if rc == 0 and top:
+        _git(top, "worktree", "prune")
+        _, refs, _ = _git(top, "for-each-ref", "--format=%(refname:short)",
+                          "refs/heads/pervio/wf-%s/" % wf)
+        for br in refs.splitlines():
+            if br.strip():
+                _git(top, "branch", "-D", br.strip())
+    _sweep_conversations(wf, led, codex_threads)
+    return residue
+
+
+CODEX_SESS = os.path.join(os.path.expanduser("~"), ".codex", "sessions")
+
+
+def _sweep_codex_sessions(thread_ids):
+    """Delete codex rollout files for the given thread ids. Codex's store
+    (~/.codex/sessions/<Y>/<M>/<D>/rollout-*-<id>.jsonl, id in the filename)
+    sat OUTSIDE every sweep since P4: claude children were reaped precisely and
+    wholesale, codex children lived forever — 21 month-old audit ghosts were
+    still haunting the project list on 2026-08-24. Best-effort like the claude
+    half: a miss never blocks the delete."""
+    import glob as _glob
+    for tid in thread_ids:
+        if not tid or not re.match(r"^[A-Za-z0-9-]{8,64}$", tid):
+            continue
+        for f in _glob.glob(os.path.join(CODEX_SESS, "**", "*%s*.jsonl" % tid),
+                            recursive=True):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+
+
+def _codex_child_threads(rd):
+    """Thread ids of every CODEX fan-out/teststep child in this run — parsed
+    from their on-disk streams (thread.started), because children never write
+    the ledger. The new audit template mints eight codex auditors per run;
+    without this, every deleted audit leaves eight ghosts."""
+    import glob as _glob
+    out = set()
+    for path in (_glob.glob(os.path.join(rd, "dispatch", "**", "out.jsonl*"), recursive=True)
+                 + _glob.glob(os.path.join(rd, "teststep", "*", "out.jsonl*"))):
+        try:
+            with open(path, errors="replace") as f:
+                for line in f:
+                    if '"thread.started"' not in line:
+                        continue
+                    try:
+                        o = json.loads(line)
+                    except ValueError:
+                        continue
+                    if o.get("type") == "thread.started" and o.get("thread_id"):
+                        out.add(str(o["thread_id"]))
+                    break
+        except OSError:
+            continue
+    return out
+
+
+def _sweep_conversations(wf, led, codex_threads=()):
+    """Deleting a workflow also discards the CONVERSATIONS its agents created, so
+    they don't pile up in the phone's history drawer. Two mechanisms:
+      (a) precise — each step's recorded sessionId/sessionDir, removed via
+          pervio-sessions delete (reusing its encoding + traversal guards); this is
+          what catches shared-mode steps that ran in the user's real project dir.
+      (b) wholesale — every ~/.claude/projects folder whose encoded name is under
+          THIS workflow's own dir (step worktrees, fan-out/dispatch scratch dirs);
+          those cwds exist only for this run, so the whole folders go, ids unneeded.
+    Codex sessions are recorded but left in place (pervio-sessions delete handles
+    claude session files only). Best-effort throughout — a sweep failure must
+    never block the delete itself."""
+    for st in (led.get("steps") or []):
+        s_dir = st.get("sessionDir")
+        # A retried step has EXTRA real conversations on disk: transient
+        # attempt 1 (retriedSessionId), any schema-retry priors
+        # (priorSessionIds) — their jsonls were overwritten/archived but the
+        # CLI session store is separate. Sweep them all.
+        sids = ([st.get("sessionId"), st.get("retriedSessionId")]
+                + list(st.get("priorSessionIds") or []))
+        if st.get("backend") == "codex":
+            # The codex store is file-per-thread — delete directly (pervio-
+            # sessions delete only speaks claude's store).
+            _sweep_codex_sessions([x for x in sids if x])
+            continue
+        for s_id in sids:
+            if not s_id or not s_dir:
+                continue
+            try:
+                r = subprocess.run([sys.executable, os.path.join(SELF_DIR, "pervio-sessions"),
+                                    "delete", "--dir", s_dir, "--session", s_id],
+                                   stdin=subprocess.DEVNULL, capture_output=True, timeout=15)
+                # Best-effort (a failure must never block the delete), but no longer
+                # SILENT: a leftover conversation now leaves a trace to clean up later.
+                if r.returncode != 0:
+                    sys.stderr.write("pervio-orchestrate: session sweep failed for %s in %s "
+                                     "(rc=%d): %s\n" % (s_id, s_dir, r.returncode,
+                                     (r.stderr or b"").decode("utf-8", "replace").strip()[:200]))
+            except (OSError, subprocess.SubprocessError) as e:
+                sys.stderr.write("pervio-orchestrate: session sweep error for %s: %s\n"
+                                 % (s_id, str(e)[:200]))
+    # Codex fan-out/teststep children (the audit template's jurors): thread
+    # ids were collected by _delete_run BEFORE the rmtree — their streams are
+    # already gone by the time this runs.
+    _sweep_codex_sessions(codex_threads)
+    # Mirrors pervio-sessions.encode (every non-alphanumeric becomes '-');
+    # test_fanout asserts the two stay byte-identical.
+    enc = re.sub(r"[^a-zA-Z0-9]", "-", os.path.realpath(_wf_dir(wf)))
+    proj_root = os.path.join(os.path.expanduser("~"), ".claude", "projects")
+    try:
+        for name in os.listdir(proj_root):
+            if name == enc or name.startswith(enc + "-"):
+                shutil.rmtree(os.path.join(proj_root, name), ignore_errors=True)
+    except OSError:
+        pass
+
+
+# ---------- schedules: fire a saved spec on a daily clock, no daemon ----------
+#
+# The OS scheduler is the dumb clock (macOS LaunchAgent StartInterval=300 / Linux
+# crontab */5 line, both registered by `schedule add` and surviving reboots on
+# their own — the phone plays no part); `schedule tick` is the brain. Semantics:
+#   - at-most-once per due period (period key = the due occurrence's date);
+#   - catch-up: after sleep/reboot/downtime, only the MOST RECENT missed period
+#     fires (a digest three days late once beats three stale digests at boot);
+#   - add/enable ARM to the current period (no surprise fire the moment you save);
+#   - overlap guard checks the last run's pgid LIVENESS, not just its ledger text,
+#     so a reboot mid-run can never wedge the schedule on a stale "running";
+#   - a failing start is retried at most 3 ticks, then gives up for the period
+#     with lastError kept visible;
+#   - after each fire, terminal runs of this schedule beyond keepRuns are pruned
+#     through the normal delete (worktrees, branches, conversations all sweep).
+
+HOOK_LABEL = "com.pervio.schedule"
+TICK_INTERVAL = 300
+CRON_TAG = "# pervio-schedule"
+
+
+def _sched_dir(sid):
+    if not sid or not VALID_ID.match(sid):
+        _die("bad schedule id")
+    return os.path.join(SCHED, sid)
+
+
+def _sched_now():
+    """Local wall-clock 'now'; PERVIO_TICK_NOW (ISO, e.g. 2026-07-08T06:03) lets
+    tests replay any moment hermetically."""
+    v = os.environ.get("PERVIO_TICK_NOW")
+    if v:
+        return datetime.datetime.fromisoformat(v)
+    return datetime.datetime.now()
+
+
+def _parse_hhmm(t):
+    m = re.match(r"^([01]?\d|2[0-3]):([0-5]\d)$", (t or "").strip())
+    if not m:
+        raise ValueError("time must be HH:MM (24h)")
+    return int(m.group(1)), int(m.group(2))
+
+
+def _occurrence(sch, now, direction):
+    """The nearest scheduled occurrence: direction=-1 → latest one <= now (due),
+    +1 → earliest one > now (next). None if `days` never matches."""
+    hh, mm = _parse_hhmm(sch.get("time"))
+    days = sch.get("days") or []          # [] = daily; else ISO weekdays 1-7
+    for step in range(8):
+        d = (now + datetime.timedelta(days=step * direction)).date()
+        if days and d.isoweekday() not in days:
+            continue
+        cand = datetime.datetime.combine(d, datetime.time(hh, mm))
+        if (direction < 0 and cand <= now) or (direction > 0 and cand > now):
+            return cand
+    return None
+
+
+def _period_key(due):
+    return due.strftime("%Y-%m-%d")
+
+
+def _read_sched(sid):
+    return _read_json(os.path.join(_sched_dir(sid), "schedule.json"))
+
+
+def _write_sched(sid, sch):
+    _write_atomic(os.path.join(_sched_dir(sid), "schedule.json"), sch)
+
+
+def _merge_sched(sid, updates):
+    """Field-level read-modify-write of schedule.json under a per-schedule lock:
+    re-read the on-disk record, apply ONLY the given fields, write atomically. Tick
+    and the phone verbs (enable/disable/fire) each touch DIFFERENT fields; without
+    this a tick that read the record seconds ago would write back a stale copy and
+    silently revert a concurrent disable, or restore a consumed lastFired and refire
+    a period. Returns the merged record (or None if the schedule vanished)."""
+    import fcntl
+    sd = _sched_dir(sid)
+    lockf = open(os.path.join(sd, ".sched.lock"), "w")
+    try:
+        fcntl.flock(lockf, fcntl.LOCK_EX)
+        cur = _read_json(os.path.join(sd, "schedule.json"))
+        if not cur:
+            return None
+        cur.update(updates)
+        _write_atomic(os.path.join(sd, "schedule.json"), cur)
+        return cur
+    finally:
+        lockf.close()
+
+
+# The subset of fields tick owns — a tick write must never clobber `enabled`
+# (the user's disable) or any field outside this set. _tick_claim_and_start writes
+# exactly these, on a record it read under the schedule's own lock.
+_TICK_FIELDS = ("lastFired", "lastFiredAt", "lastWfId", "lastError",
+                "attempts", "lastAttemptPeriod")
+
+
+def _all_scheds():
+    out = []
+    if os.path.isdir(SCHED):
+        for sid in sorted(os.listdir(SCHED)):
+            if not VALID_ID.match(sid):
+                continue
+            sch = _read_sched(sid)
+            if sch:
+                out.append(sch)
+    return out
+
+
+WF_MAX_AGE = float(os.environ.get("PERVIO_WF_MAX_AGE", str(6 * 3600)) or str(6 * 3600))
+
+
+def _wf_alive(wf):
+    """Is this run REALLY still running? status says running AND its process group is
+    alive AND that group is provably OURS. A dead pgid with a 'running' status is a
+    crash/reboot relic; and after a reboot the pgid number may be REUSED by an
+    unrelated long-lived process (login/session leader) that answers signal 0. We now
+    settle that with the recorded start token (_pgid_identity_ok): a match means the
+    group is genuinely this run — alive no matter how long it has run, so a legit long
+    workflow no longer gets declared dead and overlap-started. The 6h age cap remains
+    ONLY as the fallback when identity is unprovable (an old run predating the token,
+    or a platform without start times)."""
+    if not wf or not VALID_ID.match(wf):
+        return False
+    rd = os.path.join(WF, wf)
+    try:
+        with open(os.path.join(rd, "status")) as f:
+            if f.read().strip() != "running":
+                return False
+        with open(os.path.join(rd, "pgid")) as f:
+            pgid = int(f.read().strip())
+    except (OSError, ValueError):
+        return False
+    ident = _pgid_identity_ok(rd, pgid)
+    if ident is True:
+        return True                        # proven ours — alive regardless of age
+    if ident is False:
+        return False                       # dead, or the pid was reused
+    # ident is None: can't prove identity — fall back to the age cap self-heal.
+    led = _read_json(os.path.join(rd, "ledger.json"))
+    started = led.get("startedAt", 0)
+    if started and (time.time() - started) > WF_MAX_AGE:
+        return False                       # ancient 'running' — crash relic, pgid reuse
+    return True                            # alive group, recent, identity unknowable
+
+
+def _last_status(sch):
+    """running | done | failed | "" for the schedule's most recent run."""
+    wf = sch.get("lastWfId") or ""
+    if not wf or not VALID_ID.match(wf):
+        return ""
+    led = _read_json(os.path.join(WF, wf, "ledger.json"))
+    st = led.get("status") or ""
+    if st == "running" and not _wf_alive(wf):
+        return "failed"                   # crashed/rebooted mid-run
+    return st
+
+
+# ---- the OS hook (dumb clock). Registered iff >=1 enabled schedule exists. ----
+
+def _tick_log():
+    return os.path.join(SCHED, "tick.log")
+
+
+def _plist_path():
+    return os.path.join(HOME, "Library", "LaunchAgents", HOOK_LABEL + ".plist")
+
+
+# The name Login Items shows for the background item is ProgramArguments[0]'s
+# basename. Registering the tick as a bare `python3` (sys.executable) surfaced in
+# System Settings > General > Login Items as an anonymous "python3" — a background
+# item the user can't attribute to anything. Register instead via a thin shell
+# shim (install.sh drops it beside the launchers; it exec's python3 on this same
+# script's `schedule tick`), so the login item reads `pervio-schedule-tick`.
+SCHED_SHIM = "pervio-schedule-tick"
+
+
+def _tick_shim():
+    """The shim's absolute path (installed next to this script in ~/.pervio/bin).
+    Present on any properly-installed server; may be absent when running straight
+    from a checkout / the test tree — callers fall back to the interpreter then."""
+    return os.path.join(SELF_DIR, SCHED_SHIM)
+
+
+def _tick_argv():
+    """The command that runs one tick, as an argv list. Prefer the named shim so a
+    macOS Login Item is attributable (`pervio-schedule-tick`, not a bare
+    `python3`); fall back to `<python3> <self> schedule tick` only when the shim
+    isn't installed (a bare checkout / the tests)."""
+    shim = _tick_shim()
+    if os.path.isfile(shim) and os.access(shim, os.X_OK):
+        return [shim]
+    return [sys.executable or "/usr/bin/python3", SELF, "schedule", "tick"]
+
+
+def _plist_argv0_stale():
+    """True iff an installed macOS plist still names a bare `python3` as
+    ProgramArguments[0] while the shim IS now available — the pre-shim registration
+    that shows in Login Items as an anonymous 'python3'. A machine upgraded in place
+    keeps that old plist until something rewrites it; this lets the next tick do the
+    smooth swap exactly once (see _sched_tick), instead of waiting for the user to
+    touch the schedule. False on non-darwin, when no plist exists, or when the
+    plist already matches _tick_argv (nothing to fix)."""
+    if sys.platform != "darwin":
+        return False
+    path = _plist_path()
+    if not os.path.isfile(path):
+        return False
+    try:
+        import plistlib
+        with open(path, "rb") as f:
+            argv = (plistlib.load(f) or {}).get("ProgramArguments") or []
+    except (OSError, ValueError):
+        return False
+    if not argv or argv == _tick_argv():
+        return False
+    return "python" in os.path.basename(str(argv[0]))
+
+
+def _cron_line():
+    """The crontab command line, or None if a path can't be safely encoded. cron
+    treats an unescaped % in the command as end-of-command + stdin, so % must be
+    backslash-escaped; a " or newline in a path can't be quoted at all → refuse."""
+    exe = sys.executable or "/usr/bin/python3"
+    parts = [exe, SELF, _tick_log()]
+    if any('"' in p or "\n" in p for p in parts):
+        return None
+    exe, self_, log = (p.replace("%", r"\%") for p in parts)
+    return '*/5 * * * * "%s" "%s" schedule tick >> "%s" 2>&1 %s' % (
+        exe, self_, log, CRON_TAG)
+
+
+def _hook_reconcile():
+    """Converge the OS hook onto reality: installed exactly when an enabled
+    schedule exists (no wakeups otherwise — the clock costs nothing when idle).
+    PERVIO_SCHED_HOOK=skip writes/removes files but never calls launchctl/crontab
+    (hermetic tests must not touch the real user's agents). Best-effort: returns
+    a dict describing what happened; a hook failure never blocks the verb."""
+    want = any(s.get("enabled") for s in _all_scheds())
+    skip = os.environ.get("PERVIO_SCHED_HOOK", "") == "skip"
+    # PERVIO_SCHED_HOOK_KIND=darwin|cron picks the hook regardless of the OS — a
+    # test seam, so the launchd path (plist + launchctl shim) is exercised on a
+    # Linux CI runner too. Unset = the platform's own.
+    kind = os.environ.get("PERVIO_SCHED_HOOK_KIND") or ("darwin" if sys.platform == "darwin" else "cron")
+    if kind == "darwin":
+        return _hook_darwin(want, skip)
+    return _hook_cron(want, skip)
+
+
+def _hook_darwin(want, skip):
+    import plistlib
+    path = _plist_path()
+    out = {"kind": "launchd", "installed": want, "activated": False, "note": ""}
+    uid = os.getuid()
+
+    def lctl(*args):
+        try:
+            return subprocess.run(["launchctl"] + list(args), stdin=subprocess.DEVNULL,
+                                  capture_output=True, text=True).returncode
+        except OSError:
+            return 127
+
+    if want:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        os.makedirs(SCHED, mode=0o700, exist_ok=True)
+        plist = {
+            "Label": HOOK_LABEL,
+            # ProgramArguments[0]'s basename is the name Login Items shows; go
+            # through the named shim so it reads pervio-schedule-tick, not a bare
+            # anonymous python3. (Falls back to the interpreter if the shim isn't
+            # installed — see _tick_argv.)
+            "ProgramArguments": _tick_argv(),
+            # StartInterval proved unreliable on this launchd: the job registers
+            # but the interval timer never engages (zombie — runs stayed 0 for 13h,
+            # and stayed 1 for 35min even after a kickstart primed one run).
+            # Wall-clock calendar entries are the battle-tested cron replacement,
+            # and a window missed while asleep coalesces into ONE run on wake —
+            # which is exactly the 06:30 catch-up this schedule wants.
+            "StartCalendarInterval": [{"Minute": m} for m in range(0, 60, 5)],
+            # RunAtLoad: one tick right at login — that's the reboot catch-up.
+            "RunAtLoad": True,
+            "ProcessType": "Background",
+            "StandardOutPath": _tick_log(),
+            "StandardErrorPath": _tick_log(),
+        }
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as f:
+            plistlib.dump(plist, f)
+        os.replace(tmp, path)
+        if not skip:
+            lctl("bootout", "gui/%d/%s" % (uid, HOOK_LABEL))       # re-load fresh
+            time.sleep(1)      # bootout is async; racing the re-bootstrap of the
+                               # same label is one way to mint a zombie registration
+            if lctl("bootstrap", "gui/%d" % uid, path) == 0:
+                out["activated"] = True
+            elif lctl("load", "-w", path) == 0:                    # older launchctl
+                out["activated"] = True
+            else:
+                out["note"] = ("registered for next login (launchctl couldn't "
+                               "activate it from this session)")
+            if out["activated"]:
+                # Prime the job. A bootout immediately followed by a bootstrap of
+                # the same label can leave a ZOMBIE registration: launchctl print
+                # shows the job, yet runs stays 0 forever — neither RunAtLoad nor
+                # StartInterval ever fires (observed 2026-07-21: 13h loaded, zero
+                # executions, first 06:30 digest silently missed). One kickstart
+                # un-wedges it, and tick is at-most-once per period, so an extra
+                # run is always harmless. `start` is the pre-10.11 spelling.
+                if lctl("kickstart", "gui/%d/%s" % (uid, HOOK_LABEL)) != 0:
+                    lctl("start", HOOK_LABEL)
+    else:
+        if not skip:
+            lctl("bootout", "gui/%d/%s" % (uid, HOOK_LABEL))
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    return out
+
+
+def _hook_cron(want, skip):
+    out = {"kind": "cron", "installed": want, "activated": False, "note": ""}
+    if skip:
+        return out
+    try:
+        p = subprocess.run(["crontab", "-l"], stdin=subprocess.DEVNULL,
+                           capture_output=True, text=True)
+        # `crontab -l` exits non-zero BOTH for the benign "no crontab yet" case and
+        # for real failures (permission/spool errors). Treating the latter as "empty"
+        # and then writing our line would DESTROY the user's existing cron jobs. Only
+        # proceed on rc==0, or the well-known empty-crontab message; on anything else
+        # bail without touching the table.
+        if p.returncode == 0:
+            cur = p.stdout
+        elif re.search(r"no crontab", (p.stderr or ""), re.I):
+            cur = ""
+        else:
+            out["note"] = "left crontab untouched: 'crontab -l' failed (%s)" % (
+                (p.stderr or "").strip()[:80] or "rc %d" % p.returncode)
+            return out
+        kept = [l for l in cur.splitlines() if CRON_TAG not in l]
+        had_ours = any(CRON_TAG in l for l in cur.splitlines())
+        lines = list(kept)
+        if want:
+            os.makedirs(SCHED, mode=0o700, exist_ok=True)
+            line = _cron_line()
+            if line is None:
+                out["note"] = ("launcher path has characters cron can't quote "
+                               "(\" or newline) — not installed")
+                return out
+            lines.append(line)
+        elif not had_ours:
+            out["activated"] = False       # nothing of ours to remove; don't rewrite
+            return out
+        content = ("\n".join(lines) + "\n") if lines else ""
+        # Empty content would `crontab -` an empty table; only do that if the user
+        # actually had a crontab we're now emptying of our own line (kept==[]).
+        q = subprocess.run(["crontab", "-"], input=content, text=True,
+                           capture_output=True)
+        if q.returncode == 0:
+            out["activated"] = want
+        else:
+            out["note"] = "crontab failed: %s" % (q.stderr or "").strip()[:120]
+    except OSError as e:
+        out["note"] = "crontab unavailable: %s" % e
+    return out
+
+
+# ---- verbs ----
+
+def _sched_add(argv):
+    o = _parse(argv, {"b64"})
+    if "b64" not in o:
+        _die("schedule add needs --b64")
+    try:
+        payload = json.loads(base64.b64decode(o["b64"]).decode("utf-8"))
+        hh_mm = payload.get("time") or ""
+        _parse_hhmm(hh_mm)
+        days = payload.get("days") or []
+        if not isinstance(days, list) or any(not isinstance(d, int) or not 1 <= d <= 7
+                                             for d in days):
+            raise ValueError("days must be ISO weekday ints 1-7")
+        keep = max(1, int(payload.get("keepRuns", 7) or 7))   # validate BEFORE mkdir
+        if "enabled" in payload and not isinstance(payload["enabled"], bool):
+            raise ValueError("enabled must be a boolean")       # 0 is not False: it used to save switched ON
+        spec = payload.get("spec") or {}
+        _validate_spec(spec)
+    except Exception as e:
+        _die("bad schedule: %s" % e)
+    os.makedirs(SCHED, mode=0o700, exist_ok=True)
+    sid = uuid.uuid4().hex[:12]
+    sd = _sched_dir(sid)
+    os.makedirs(sd, mode=0o700)
+    _write_atomic(os.path.join(sd, "spec.json"), spec)
+    now = _sched_now()
+    sch = {
+        "id": sid,
+        "name": payload.get("name") or spec.get("name") or "",
+        # The phone that added it (its push device id + server entry): every run
+        # this schedule fires tells that phone only (2026-10-18).
+        "device": str(payload.get("device") or ""),
+        "origin": str(payload.get("origin") or ""),
+        "time": hh_mm,
+        "days": days,
+        "keepRuns": keep,
+        # Switched on unless the caller says otherwise: pervio-mcp saves one
+        # PAUSED when the conversation that asked for it shows nobody the
+        # request first (2026-11-21).
+        "enabled": payload.get("enabled") is not False,
+        "createdAt": int(time.time()),
+        # Armed: the current period counts as already fired, so the first real
+        # fire is the NEXT occurrence — never the moment you tap Save.
+        "lastFired": _armed_period(sch_time=hh_mm, days=days, now=now),
+        "lastFiredAt": 0,
+        "lastWfId": "",
+        "lastError": "",
+        "attempts": 0,
+        "lastAttemptPeriod": "",
+    }
+    _write_sched(sid, sch)
+    hook = _hook_reconcile()
+    sys.stdout.write(json.dumps({"id": sid, "hook": hook}) + "\n")
+
+
+def _armed_period(sch_time, days, now):
+    due = _occurrence({"time": sch_time, "days": days}, now, -1)
+    return _period_key(due) if due else ""
+
+
+def _sched_update(argv):
+    """In-place edit of a saved schedule (the id never changes):
+    {"id": required, "time"?: "HH:MM", "days"?: [1-7], "keepRuns"?: int,
+     "enabled"?: bool, "spec"?: {}} — only the given fields move. A time/days
+    change RE-ARMS the clock (same no-surprise-fire rule as add/enable: the new
+    time's current period counts as consumed, the first fire is its next real
+    occurrence) and reconciles the OS hook, as does an enabled flip; a
+    keepRuns/spec-only edit touches neither. Prints the updated schedule record
+    with nextDue recomputed under the new clock."""
+    o = _parse(argv, {"b64"})
+    if "b64" not in o:
+        _die("schedule update needs --b64")
+    try:
+        payload = json.loads(base64.b64decode(o["b64"]).decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be a JSON object")
+    except Exception as e:
+        _die("bad update: %s" % e)
+    sid = str(payload.get("id") or "")
+    cur = _read_sched(sid)                 # _sched_dir validates the id shape
+    if not cur:
+        _die("no such schedule", 3)
+    upd = {}
+    spec = None
+    try:                                   # validate EVERYTHING before writing anything
+        if "time" in payload:
+            _parse_hhmm(payload.get("time"))
+            upd["time"] = payload["time"]
+        if "days" in payload:
+            days = payload.get("days") or []
+            if not isinstance(days, list) or any(not isinstance(d, int) or not 1 <= d <= 7
+                                                 for d in days):
+                raise ValueError("days must be ISO weekday ints 1-7")
+            upd["days"] = days
+        if "keepRuns" in payload:
+            upd["keepRuns"] = max(1, int(payload.get("keepRuns") or 7))
+        if "enabled" in payload:
+            # `x in (True, False)` lets 1 and 0 through (1 == True), and the
+            # caller above this one had read 1 as "not switching it on".
+            if not isinstance(payload.get("enabled"), bool):
+                raise ValueError("enabled must be a boolean")
+            upd["enabled"] = payload["enabled"]
+        spec = payload.get("spec")
+        if spec is not None:
+            _validate_spec(spec)
+    except Exception as e:
+        _die("bad update: %s" % e)
+    clock_changed = (("time" in upd and upd["time"] != cur.get("time"))
+                     or ("days" in upd and upd["days"] != (cur.get("days") or [])))
+    re_enabled = upd.get("enabled") is True and not cur.get("enabled")
+    if clock_changed or re_enabled:
+        # Re-arm under the NEW clock: periods the new time/days would place in
+        # the past (or periods missed while paused) never fire on save.
+        upd["lastFired"] = _armed_period(upd.get("time", cur.get("time")),
+                                         upd.get("days", cur.get("days") or []),
+                                         _sched_now())
+        upd["attempts"] = 0
+    # An update that both replaces the spec and switches the schedule off must
+    # never leave new content under an armed clock, not even for the moment
+    # between two writes (the scheduler reads `enabled`, then spec.json): off
+    # first, then the new spec. Any other update keeps spec-then-record, so a
+    # schedule being switched ON is switched on over its final spec.
+    merged = None
+    if upd.get("enabled") is False:
+        merged = _merge_sched(sid, upd)
+        if merged is None:
+            _die("no such schedule", 3)
+    if spec is not None:
+        _write_atomic(os.path.join(_sched_dir(sid), "spec.json"), spec)
+    if merged is None:
+        merged = _merge_sched(sid, upd) if upd else cur
+    if merged is None:
+        _die("no such schedule", 3)
+    if clock_changed or "enabled" in upd:
+        _hook_reconcile()                  # best-effort, like every other verb
+    row = dict(merged)
+    try:
+        nxt = _occurrence(merged, _sched_now(), +1)
+    except ValueError:
+        nxt = None
+    row["nextDue"] = int(nxt.timestamp()) if nxt else 0
+    sys.stdout.write(json.dumps(row) + "\n")
+
+
+def _sched_list(argv):
+    o = _parse(argv, {"device"})
+    now = _sched_now()
+    out = []
+    for sch in _all_scheds():
+        # --device: this phone's own schedules (2026-10-19); one that recorded
+        # no device (older app, the shell) stays visible to everyone.
+        if o.get("device") and sch.get("device") and sch.get("device") != o["device"]:
+            continue
+        row = dict(sch)
+        try:
+            nxt = _occurrence(sch, now, +1)
+        except ValueError:
+            nxt = None
+        row["nextDue"] = int(nxt.timestamp()) if nxt else 0
+        row["lastStatus"] = _last_status(sch)
+        row["tz"] = datetime.datetime.now().astimezone().strftime("%z")
+        out.append(row)
+    sys.stdout.write(json.dumps(out) + "\n")
+
+
+def _sched_remove(argv):
+    o = _parse(argv, {"id"})
+    sd = _sched_dir(o.get("id", ""))
+    if not os.path.isdir(sd):
+        _die("no such schedule", 3)
+    shutil.rmtree(sd, ignore_errors=True)
+    residue = _residue(sd)                 # ignore_errors hides a denied unlink
+    hook = _hook_reconcile()               # last one out turns the clock off
+    if residue:
+        sys.stderr.write("pervio-orchestrate: schedule remove of %s did NOT finish — "
+                         "still on disk:\n%s\n"
+                         % (o["id"], "\n".join("  " + r for r in residue)))
+        sys.stdout.write(json.dumps({"removed": False, "id": o["id"], "reason": "residue",
+                                     "remaining": residue, "hook": hook}) + "\n")
+        sys.exit(1)
+    sys.stdout.write(json.dumps({"removed": o["id"], "hook": hook}) + "\n")
+
+
+def _sched_set_enabled(argv, enabled):
+    o = _parse(argv, {"id"})
+    sid = o.get("id", "")
+    if not _read_sched(sid):
+        _die("no such schedule", 3)
+    upd = {"enabled": enabled}
+    if enabled:
+        # Re-arm: periods missed while disabled don't fire on re-enable.
+        upd["lastFired"] = _armed_period(_read_sched(sid).get("time"),
+                                         _read_sched(sid).get("days"), _sched_now())
+        upd["attempts"] = 0
+    _merge_sched(sid, upd)                  # only touch these fields (never tick's)
+    hook = _hook_reconcile()
+    sys.stdout.write(json.dumps({"id": sid, "enabled": enabled, "hook": hook}) + "\n")
+
+
+def _sched_owner(sid, extra):
+    """`extra` plus the phone that owns schedule `sid` (device + origin recorded
+    at add time), so a fired run's pushes go to that phone only."""
+    try:
+        sch = _read_sched(sid)
+    except Exception:
+        sch = {}
+    for k in ("device", "origin"):
+        if sch.get(k):
+            extra[k] = sch[k]
+    return extra
+
+
+def _sched_fire(argv):
+    """Fire NOW, regardless of the clock — the 'test it once' button. Does not
+    consume the period (the scheduled occurrence still runs), but does set
+    lastWfId so the overlap guard sees it."""
+    o = _parse(argv, {"id"})
+    sid = o.get("id", "")
+    sch = _read_sched(sid)
+    if not sch:
+        _die("no such schedule", 3)
+    spec = _read_json(os.path.join(_sched_dir(sid), "spec.json"))
+    try:
+        _validate_spec(spec)
+        wid = _start_wf(spec, extra=_sched_owner(sid, {"scheduleId": sid}))
+    except Exception as e:
+        _die("fire failed: %s" % e)
+    # Merge ONLY fire's fields — never lastFired (fire doesn't consume the period),
+    # so a tick that just wrote lastFired isn't clobbered back to a stale value.
+    _merge_sched(sid, {"lastWfId": wid, "lastFiredAt": int(time.time()), "lastError": ""})
+    _prune_sched_runs(sid, int(sch.get("keepRuns", 7) or 7))
+    sys.stdout.write(json.dumps({"id": sid, "wfId": wid}) + "\n")
+
+
+def _prune_sched_runs(sid, keep):
+    """Keep this schedule's newest `keep` runs, delete the older TERMINAL ones —
+    through the normal delete, so conversations sweep too. A still-running run is
+    never deleted; since a fire prunes while its OWN just-started run is running,
+    the count can transiently be keep+1 (that run is over budget but live) — the
+    next day's prune, with it now terminal, brings it back to keep. Bounded, never
+    a leak. (Real schedules fire ~24h apart; same-second fires would only collide
+    the startedAt sort, not the bound.)"""
+    runs = []
+    if os.path.isdir(WF):
+        for wid in os.listdir(WF):
+            led = _read_json(os.path.join(WF, wid, "ledger.json"))
+            if led.get("scheduleId") == sid and led.get("status"):
+                runs.append((led.get("startedAt", 0), wid, led.get("status")))
+    runs.sort(reverse=True)
+    # A 'running' corpse (runner killed hard) used to be immune to pruning
+    # forever. Settle its status first; a truly live run stays protected.
+    runs = [(ts, wid,
+             st if st != "running" or _wf_alive(wid)
+             else _reconcile_dead(_wf_dir(wid),
+                                  _read_json(os.path.join(WF, wid, "ledger.json"))
+                                  ).get("status", "failed"))
+            for ts, wid, st in runs]
+    kept = 0
+    for _, wid, st in runs:
+        if st == "running" or kept < max(1, keep):
+            kept += 1
+            continue
+        try:
+            _delete_run(wid, _wf_dir(wid))
+        except Exception:
+            pass                           # pruning must never break the tick
+
+
+def _tick_claim_and_start(sid, period):
+    """ORDERING IS DELIBERATE — start the run FIRST, claim the period AFTER.
+    The 2026-08-22 audit flagged the crash window between the two (kernel kill
+    mid-lock → run started, period unclaimed → next tick fires the period
+    again) and suggested claiming first. Rejected: claim-then-crash means the
+    period is consumed and NOTHING ran — the digest silently never happens and
+    nothing retries it. A microsecond window that can duplicate one issue
+    (same-day publish overwrites anyway) beats one that can silently skip a
+    day. The PAID part of a tick, done entirely inside the schedule's own lock — the
+    same lock every phone verb (enable / disable / update / fire) takes through
+    _merge_sched. Re-reads the record, re-checks that it is still enabled and that
+    this period is still unclaimed, starts the run, and claims the period, all in ONE
+    critical section. Before this the decision and the claim straddled an unlocked
+    window: a pause (or a remove) that landed inside it was invisible, the run started
+    anyway, and the user paid for a schedule they had just turned off.
+
+    Never blocks: a contended lock means a phone verb is mid-update, so the schedule is
+    left for the next tick — nothing is written, the period stays unconsumed, and five
+    minutes later it fires normally. Returns
+    ("fired", wfId) | ("busy", "") | ("skip", "") | ("error", message)."""
+    import fcntl
+    sd = _sched_dir(sid)
+    try:
+        lockf = open(os.path.join(sd, ".sched.lock"), "w")
+    except OSError as e:
+        return "error", str(e)[:300]
+    try:
+        try:
+            fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return "busy", ""
+        # Authoritative re-reads, INSIDE the lock: the loop's snapshot was taken
+        # before _wf_alive, which can block on ps/killpg for seconds.
+        cur = _read_json(os.path.join(sd, "schedule.json"))
+        if not cur or not cur.get("enabled"):
+            return "skip", ""                  # disabled or removed since the snapshot
+        last = cur.get("lastFired") or ""
+        if last and last >= period:
+            return "skip", ""                  # already paid for this period
+        if cur.get("lastAttemptPeriod") == period and cur.get("attempts", 0) >= 3:
+            return "skip", ""
+        spec = _read_json(os.path.join(sd, "spec.json"))
+        try:
+            _validate_spec(spec)
+            wid = _start_wf(spec, extra=_sched_owner(sid, {"scheduleId": sid}))
+        except Exception as e:
+            cur.update({"attempts": (cur.get("attempts", 0) + 1
+                                     if cur.get("lastAttemptPeriod") == period else 1),
+                        "lastAttemptPeriod": period, "lastError": str(e)[:300]})
+            _write_atomic(os.path.join(sd, "schedule.json"), cur)
+            return "error", str(e)[:300]
+        # Claim in the SAME critical section that started it (the record was read
+        # under this lock, so writing it whole cannot clobber a concurrent verb).
+        cur.update({"lastFired": period, "lastFiredAt": int(time.time()),
+                    "lastWfId": wid, "lastError": "", "attempts": 0,
+                    "lastAttemptPeriod": period})
+        _write_atomic(os.path.join(sd, "schedule.json"), cur)
+        return "fired", wid
+    finally:
+        lockf.close()
+
+
+def _sched_tick(argv):
+    """The brain. Silent no-op when nothing is due (the log stays tiny); prints
+    one JSON line naming what fired. Serialized by a non-blocking flock so a
+    slow tick can't stack up behind the 5-minute clock."""
+    import fcntl
+    os.makedirs(SCHED, mode=0o700, exist_ok=True)
+    lockf = open(os.path.join(SCHED, ".tick.lock"), "w")
+    try:
+        fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return                             # a previous tick is still at it
+    # In-place upgrade self-heal: a machine that registered before the shim existed
+    # still runs an old plist whose ProgramArguments[0] is a bare `python3` (an
+    # anonymous Login Item). Rewrite + re-bootstrap it ONCE, the first tick that
+    # sees the shim now available — not every tick (that would bootout/bootstrap the
+    # job on the 5-minute clock forever). After the swap _plist_argv0_stale is False.
+    if _plist_argv0_stale():
+        try:
+            _hook_reconcile()
+        except Exception:
+            pass                           # never let a hook re-register stall a tick
+    now = _sched_now()
+    fired = []
+    for sch in _all_scheds():
+        sid = sch.get("id", "")
+        try:
+            if not sch.get("enabled"):
+                continue
+            due = _occurrence(sch, now, -1)
+            if not due:
+                continue
+            period = _period_key(due)
+            # Consumed-period guard, order-aware: skip if this exact period ran, OR
+            # if a LATER period already ran (the wall clock moved backward — westward
+            # travel / NTP / manual correction — and `due` is now an old occurrence
+            # we already covered). Equality alone would refire it.
+            last = sch.get("lastFired") or ""
+            if last and last >= period:
+                continue
+            if sch.get("lastAttemptPeriod") == period and sch.get("attempts", 0) >= 3:
+                continue                   # gave up on this period (lastError says why)
+            if _wf_alive(sch.get("lastWfId")):
+                continue                   # previous run still going — retry next tick
+            # Everything above is a cheap FILTER on a snapshot; the authoritative
+            # re-read, the launch and the period claim happen together under the
+            # schedule's lock, so a DISABLE can never land between them (remove does not take this lock — a delete racing a tick can still start one final run).
+            outcome, detail = _tick_claim_and_start(sid, period)
+            if outcome != "fired":
+                continue                   # busy / disabled / already claimed / error
+            fired.append({"id": sid, "wfId": detail, "period": period})
+            _prune_sched_runs(sid, int(sch.get("keepRuns", 7) or 7))
+        except Exception as e:             # one broken schedule must not stall the rest
+            try:
+                _merge_sched(sid, {"lastError": str(e)[:300]})
+            except Exception:
+                pass
+    if fired:
+        sys.stdout.write(json.dumps({"tick": now.isoformat(timespec="minutes"),
+                                     "fired": fired}) + "\n")
+
+
+def cmd_schedule(argv):
+    subs = {"add": _sched_add, "update": _sched_update, "list": _sched_list,
+            "remove": _sched_remove,
+            "enable": lambda a: _sched_set_enabled(a, True),
+            "disable": lambda a: _sched_set_enabled(a, False),
+            "fire": _sched_fire, "tick": _sched_tick,
+            "install": lambda a: sys.stdout.write(json.dumps(_hook_reconcile()) + "\n"),
+            "uninstall": lambda a: sys.stdout.write(json.dumps(_hook_reconcile()) + "\n")}
+    if not argv or argv[0] not in subs:
+        _die("usage: pervio-orchestrate schedule "
+             "{add|update|list|remove|enable|disable|fire|tick|install|uninstall} …")
+    subs[argv[0]](argv[1:])
+
+
+def cmd_teststep(argv):
+    """Iterate ONE step against a PRIOR run's recorded inputs (WF-3): the step
+    definition comes from --spec-b64 (your edited spec) or the old run's own,
+    the {{ref}} inputs come from the old ledger/json artifacts, and the turn
+    runs through run_child's ephemeral worktree — writes never land. Fan-out
+    steps test a single child (--item N, default 0). Prints the result and the
+    outputSchema verdict; exit 0 only when both are good. Prompt iteration on
+    step 19 of a 40-minute pipeline becomes a 2-minute loop.
+
+    Command steps are refused: they are deterministic — run the line yourself
+    with PERVIO_WF_DIR pointed at the old run."""
+    o = _parse(argv, {"wf", "step", "item", "spec-b64"})
+    rd = _wf_dir(o.get("wf", ""))
+    if not os.path.isdir(rd):
+        _die("no workflow %s" % o.get("wf", ""))
+    old_led = _read_json(os.path.join(rd, "ledger.json"))
+    spec = _read_json(os.path.join(rd, "spec.json"))
+    if "spec-b64" in o:
+        try:
+            spec = json.loads(base64.b64decode(o["spec-b64"]).decode("utf-8"))
+        except Exception as e:
+            _die("bad spec: %s" % e)
+        try:
+            _validate_spec(spec)
+        except ValueError as e:
+            _die(str(e))
+    sid = o.get("step", "")
+    s = next((x for x in spec.get("steps", []) if x.get("id") == sid), None)
+    if not s:
+        _die("no step %r in the spec" % sid)
+    if s.get("command"):
+        _die("step %s is a command step — deterministic, so run it yourself:\n"
+             "  PERVIO_WF_DIR=%s bash -lc <the command>" % (sid, rd))
+
+    # The old run's outputs are this test's inputs — done steps only.
+    snap, snap_json = {}, {}
+    for st in old_led.get("steps", []):
+        if st.get("status") == "done":
+            snap[st.get("id", "")] = st.get("output", "")
+    jd = os.path.join(rd, "json")
+    if os.path.isdir(jd):
+        for name in os.listdir(jd):
+            if name.endswith(".json"):
+                try:
+                    with open(os.path.join(jd, name)) as f:
+                        snap_json[name[:-5]] = json.load(f)
+                except (OSError, ValueError):
+                    pass
+
+    fo = s.get("fanout")
+    keep = set(RESERVED_IDS)
+    if fo:
+        keep.add(fo.get("as", "item"))
+    prompt = _resolve_refs(s.get("prompt", ""), snap, snap_json, keep_ids=keep)
+    item_label = ""
+    if fo:
+        over = fo.get("over", "") or ""
+        mj = JSON_REF_RE.search(over)
+        if mj:
+            src_v = snap_json.get(mj.group(1))
+            if not isinstance(src_v, list):
+                _die("fanout source %s has no structured array in run %s"
+                     % (over, o.get("wf")))
+            items = src_v
+        else:
+            m = REF_RE.search(over)
+            txt = snap.get(m.group(1), "") if m else ""
+            if not txt.strip():
+                _die("fanout source %s is empty in run %s" % (over, o.get("wf")))
+            try:
+                items = _fanout_split(fo.get("split", "numbered"), txt)
+            except (ValueError, TypeError) as e:
+                _die("fanout split failed: %s" % e)
+        try:
+            idx = int(o.get("item", "0") or "0")
+        except ValueError:
+            _die("--item must be an integer")
+        if idx < 0 or idx >= len(items):
+            _die("item %d out of range (this run split %d items)" % (idx, len(items)))
+        x = items[idx]
+        as_var = fo.get("as", "item")
+
+        def key_sub(mm):
+            if isinstance(x, dict):
+                vv = x.get(mm.group(1))
+                if vv is None:
+                    return ""
+                return vv if isinstance(vv, str) else _json_text(vv)
+            return ""
+        prompt = re.compile(r"\{\{\s*" + re.escape(as_var)
+                            + r"\.([A-Za-z0-9_-]+)\s*\}\}").sub(key_sub, prompt)
+        prompt = re.compile(r"\{\{\s*" + re.escape(as_var) + r"\s*\}\}").sub(
+            lambda _m: x if isinstance(x, str) else _json_text(x), prompt)
+        item_label = " [item %d]" % idx
+
+    base = os.path.join(rd, "teststep")
+    os.makedirs(base, mode=0o700, exist_ok=True)
+    n = 1 + max([int(d) for d in os.listdir(base) if d.isdigit()] or [0])
+    tdir = os.path.join(base, str(n))
+    backend = s.get("backend", "claude")
+    step_dir = os.path.realpath(_expand_dir(s.get("dir", spec.get("dir", "~"))))
+    rc_, top, _ = _git(step_dir, "rev-parse", "--show-toplevel")
+    top = os.path.realpath(top) if rc_ == 0 and top else None
+    requested = s.get("sandbox", "read-only") if backend == "codex" else s.get("perm", "plan")
+    try:
+        eff = clamp_tier(backend, requested, backend, requested)
+    except DispatchError as de:
+        _die("tier: %s" % de.detail)
+    if fo:
+        try:
+            child_timeout = float(fo.get("timeoutSec") or 0)
+        except (TypeError, ValueError):
+            child_timeout = 0.0
+        timeout = (min(max(child_timeout, 60.0), 900.0) if child_timeout > 0
+                   else CHILD_TIMEOUT)
+    else:
+        timeout = AGENT_TIMEOUT
+    b64 = base64.b64encode(prompt.encode("utf-8")).decode("ascii")
+    branch = None if top is None else "pervio/wf-%s/teststep/%d" % (o.get("wf"), n)
+    t0 = time.time()
+    try:
+        ok, text, _cost, err = run_child(b64, backend, eff, top, tdir, branch, 0,
+                                         timeout, CHAT, resolve_model(s.get("model")),
+                                         s.get("effort"), None,
+                                         bool(s.get("allowNetwork")))
+    except DispatchError as de:
+        _die("child failed to start: %s" % de.detail)
+    verdict = ""
+    if ok and s.get("outputSchema") is not None:
+        _val, verr = _parse_and_validate(s["outputSchema"], text)
+        verdict = "schema: ok" if not verr else "schema: FAIL — %s" % verr
+        if verr:
+            ok = False
+    lines = ["teststep %s/%s%s  (%.0fs, 一次性 worktree,写入不落地)"
+             % (o.get("wf"), sid, item_label, time.time() - t0),
+             "result: %s%s" % ("OK" if ok else "FAIL", (" — " + err) if err else "")]
+    if verdict:
+        lines.append(verdict)
+    sys.stdout.write("\n".join(lines) + "\n---\n" + (text or "") + "\n")
+    _write_atomic(os.path.join(tdir, "result.json"),
+                  {"ok": ok, "step": sid, "item": o.get("item"),
+                   "error": err, "schema": verdict, "text": text})
+    sys.exit(0 if ok else 1)
+
+
+CMDS = {"start": cmd_start, "resolve": cmd_resolve, "run": cmd_run, "status": cmd_status,
+        "spec": cmd_spec, "tail": cmd_tail, "list": cmd_list, "delete": cmd_delete,
+        "teststep": cmd_teststep,
+        "schedule": cmd_schedule, "templates": cmd_templates, "archives": cmd_archives,
+        "models": cmd_models}
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] not in CMDS:
+        _die("usage: pervio-orchestrate {start|status|tail|list|delete|schedule} …")
+    CMDS[sys.argv[1]](sys.argv[2:])
+
+
+if __name__ == "__main__":
+    main()

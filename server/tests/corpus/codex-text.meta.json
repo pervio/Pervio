@@ -1,0 +1,47 @@
+{
+  "scenario": "codex-text",
+  "backend": "codex",
+  "model": "gpt-5.4-mini",
+  "capturedUTC": "2026-08-07T08:57:48Z",
+  "cliVersion": "codex-cli 0.146.1",
+  "command": "server/bin/pervio-chat --text --backend codex --dir /home/pervio/work --prompt-b64 <base64 of the prompt below> --sandbox read-only --model gpt-5.4-mini --effort low",
+  "prompt": "Reply with exactly this sentence and nothing else: The corpus is alive.",
+  "exitCode": 0,
+  "events": 4,
+  "seconds": 17.6,
+  "usage": {
+    "inputTokens": 12080,
+    "cachedInputTokens": 5504,
+    "outputTokens": 19,
+    "reasoningOutputTokens": 8,
+    "costUSD": null
+  },
+  "sessionIdRedactedTo": "00000000-0000-4000-8000-000000000001",
+  "covers": [
+    "thread.started",
+    "turn.started",
+    "item.completed agent_message",
+    "turn.completed + usage (incl. reasoning_output_tokens)"
+  ],
+  "twin": "claude-text",
+  "noTwinBecause": null,
+  "free": false,
+  "redactions": [
+    "workdir (plain, realpath, and '-'-encoded) -> /home/pervio/work",
+    "$HOME -> /home/pervio, username -> pervio",
+    "hostname -> pervio-host",
+    "IANA timezone -> Etc/UTC",
+    "UUIDs -> 00000000-0000-4000-8000-0000000000NN (consistent within a file)",
+    "req_… -> req_000…NN",
+    "bulk vendor/environment values -> '<redacted: …>' markers (keys and types preserved; see 'scrubbedPaths')"
+  ],
+  "scrubbedPaths": [
+    "payload.base_instructions.text",
+    "payload.content.text",
+    "payload.state.environments.timezone",
+    "payload.state.host_skills.body",
+    "payload.timezone"
+  ],
+  "regenerate": "python3 server/tests/capture_corpus.py --only codex-text",
+  "note": "REAL agent output. Everything except the values listed under 'redactions' is byte-for-byte what the CLI emitted."
+}

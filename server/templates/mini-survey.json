@@ -1,0 +1,288 @@
+{
+ "name": "arXiv topic mini-survey · 文献综述",
+ "expose": true,
+ "slug": "arxiv_mini_survey",
+ "params": [
+  {
+   "name": "query",
+   "label": "英文检索词",
+   "description": "arXiv 全文检索词,英文,如 LLM agent memory",
+   "type": "string",
+   "required": true
+  },
+  {
+   "name": "title",
+   "label": "研究题目",
+   "description": "一句话研究题目,综述围绕它组织",
+   "type": "string",
+   "default": "(未单独给出,以检索词代表的方向为题)"
+  },
+  {
+   "name": "audience",
+   "label": "读者画像",
+   "description": "背景/技能/算力,如\"做过RAG,熟RL,8×A100\"",
+   "type": "string",
+   "default": "有 LLM/agent 基础的中文研究者,具体背景与算力未知"
+  }
+ ],
+ "summary": "Rebuilt 2026-08-23 after three live pilots: no fetch pipeline at all — 3 perspective researchers independently search literature (Semantic Scholar keyless API + arXiv via WebFetch, citation snowballing, honest-gap reporting under rate limits), a flagship merger maps agreements/real disagreements/coverage gaps and grades the briefs, a gap-scanner turns those into targeted follow-up questions (optional fill round — empty list just skips), and a flagship writer produces the five-section Chinese mini-survey. 6/6 spot-checked citations real across pilots. All outputs are engine-validated JSON contracts; the old template's fetch step violated the params-never-enter-commands rule and could never start.",
+ "spec": {
+  "name": "文献小综述",
+  "dir": "~",
+  "steps": [
+   {
+    "id": "angles",
+    "backend": "claude",
+    "perm": "plan",
+    "model": "balanced",
+    "dependsOn": [],
+    "prompt": "你是调研规划员。题目:{{param.title}}(检索词:{{param.query}})。读者:{{param.audience}}。\n\n任务:把这个题目拆成 3 个互补的调研视角,每个视角一个研究员独立去查。视角之间要错开(比如:方法谱系/评测与数字/开源落地/争议与局限),按这个题目的实际情况定制,不要硬套。\n\n输出一个 JSON 数组,除数组外一个字都不要(不解释、不要代码围栏):\n[{\"name\": \"视角名(≤10字)\", \"focus\": \"这个视角要回答什么,一两句\", \"queries\": [\"英文检索词1\", \"英文检索词2\"]}]",
+    "outputSchema": {
+     "type": "array",
+     "minItems": 3,
+     "maxItems": 3,
+     "items": {
+      "type": "object",
+      "required": [
+       "name",
+       "focus",
+       "queries"
+      ],
+      "properties": {
+       "name": {
+        "type": "string",
+        "maxLength": 24
+       },
+       "focus": {
+        "type": "string",
+        "maxLength": 200
+       },
+       "queries": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 3,
+        "items": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   },
+   {
+    "id": "research",
+    "backend": "claude",
+    "perm": "plan",
+    "model": "balanced",
+    "allowNetwork": true,
+    "dependsOn": [
+     "angles"
+    ],
+    "prompt": "你是文献研究员,只负责下面这一个视角,独立作业(其他研究员的结果你看不到):\n视角:{{item.name}}\n焦点:{{item.focus}}\n建议检索词:{{item.queries}}\n\n工具与打法(你有 WebFetch,能打开任何 https 地址):\n- Semantic Scholar 免 key 检索接口(把 QUERY 换成检索词,空格用 + ):\n  https://api.semanticscholar.org/graph/v1/paper/search?query=QUERY&fields=title,year,abstract,citationCount,externalIds&limit=20\n- 顺引文滚雪球:锁定关键论文后用\n  https://api.semanticscholar.org/graph/v1/paper/arXiv:ID/references?fields=title,year,citationCount,externalIds&limit=30\n- arXiv 摘要页 https://arxiv.org/abs/ID 可读单篇细节。\n- 接口回 429/限速/超时:等几秒重试一次;仍不行就换检索词或改用 arXiv 页面,并把「哪路数据没拿到」如实写进 findings——如实的空缺好过硬凑。\n- 预算纪律:总共至多 8 次抓取,挑引用数高的和近两年的读,别漫游。\n\n诚实红线:论文清单里只许写你真的在返回数据里见到的论文;编造 id 等于全篇作废。\n\n输出一个 JSON 对象,除对象外一个字都不要(不要代码围栏;字符串里别用英文双引号,要引用就用「」):\n{\"angle\": \"视角名\", \"papers\": [{\"id\": \"arXiv编号或DOI\", \"title\": \"标题\", \"year\": 2024, \"one_line\": \"一句话它做了什么\", \"numbers\": \"关键数字,没有写「无」\"}], \"findings\": \"这个视角的三五条核心发现,连成一段人话\", \"open_questions\": [\"这个视角查完仍悬着的问题\"]}\npapers 至多 8 篇,宁缺毋滥;文献确实稀少就如实报少,把 findings 用来说清为什么少、邻近领域谁在碰。",
+    "outputSchema": {
+     "type": "object",
+     "required": [
+      "angle",
+      "papers",
+      "findings"
+     ],
+     "properties": {
+      "angle": {
+       "type": "string"
+      },
+      "papers": {
+       "type": "array",
+       "maxItems": 8,
+       "items": {
+        "type": "object",
+        "required": [
+         "id",
+         "title",
+         "one_line"
+        ],
+        "properties": {
+         "id": {
+          "type": "string"
+         },
+         "title": {
+          "type": "string"
+         },
+         "year": {
+          "type": "integer"
+         },
+         "one_line": {
+          "type": "string",
+          "maxLength": 160
+         },
+         "numbers": {
+          "type": "string",
+          "maxLength": 160
+         }
+        }
+       }
+      },
+      "findings": {
+       "type": "string",
+       "minLength": 60
+      },
+      "open_questions": {
+       "type": "array",
+       "maxItems": 5,
+       "items": {
+        "type": "string"
+       }
+      }
+     }
+    },
+    "fanout": {
+     "over": "{{angles.json}}",
+     "max": 3,
+     "maxParallel": 3,
+     "timeoutSec": 600,
+     "tolerateAllFail": true
+    }
+   },
+   {
+    "id": "merge",
+    "backend": "claude",
+    "perm": "plan",
+    "model": "flagship",
+    "dependsOn": [
+     "research"
+    ],
+    "prompt": "三个研究员各自独立调研了「{{param.title}}」的一个视角,下面是他们的完整简报(JSON 数组,互相没见过对方):\n{{research.json}}\n\n当初的视角规划:\n{{angles.json}}\n\n你的职责是整合与批判,不是转述:\n1) 按论文 id 去重,把三份简报整合成一张地图:主要路线、代表工作、关键数字。\n2) 明确列出三类信号,没有就如实说没有:a. 真分歧(同一问题不同说法,写清根源);b. 覆盖缺口(规划该查到但没人查到的);c. 交叉印证(两人独立指向同一结论,标高置信)。\n3) 诚实评价三份简报:谁查得实、谁在灌水、哪些论文 id 建议核实。\n\n【输出纪律 · 无人值守】这是无人值守运行,没有人会回答你或批准计划:不要提问,不要把成果写进计划文件、不要把成果当作「计划」提交——下游只保存你最后一条普通回复,最终回复必须就是完整成果本身,不加「我已完成」「报告如下」之类的前后缀;成果写进计划文件或中途消息里等于全部丢失。\n用中文 markdown,≤1000 字。"
+   },
+   {
+    "id": "gapscan",
+    "backend": "claude",
+    "perm": "plan",
+    "model": "balanced",
+    "dependsOn": [
+     "merge"
+    ],
+    "prompt": "下面是一份多视角调研的整合报告:\n{{merge.output}}\n\n任务:从报告的「分歧」与「缺口」里,挑出**值得再派一个研究员定向补查**的条目——补上它能实质改变结论或填上关键空白的才算,鸡毛蒜皮不算。至多 3 条;报告里没有值得补的就输出空数组 []。\n\n输出一个 JSON 数组,除数组外一个字都不要(不要代码围栏):\n[{\"kind\": \"分歧|缺口\", \"question\": \"要补查的问题,一句话\", \"why\": \"补上它为什么重要\", \"queries\": [\"英文检索词1\", \"英文检索词2\"]}]",
+    "outputSchema": {
+     "type": "array",
+     "maxItems": 3,
+     "items": {
+      "type": "object",
+      "required": [
+       "kind",
+       "question",
+       "queries"
+      ],
+      "properties": {
+       "kind": {
+        "type": "string",
+        "maxLength": 8
+       },
+       "question": {
+        "type": "string",
+        "maxLength": 200
+       },
+       "why": {
+        "type": "string",
+        "maxLength": 200
+       },
+       "queries": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 3,
+        "items": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   },
+   {
+    "id": "fill",
+    "backend": "claude",
+    "perm": "plan",
+    "model": "balanced",
+    "allowNetwork": true,
+    "optional": true,
+    "dependsOn": [
+     "gapscan"
+    ],
+    "prompt": "你是补查研究员,只负责下面这一个问题(它来自一份多视角调研的分歧/缺口清单):\n类型:{{item.kind}}\n问题:{{item.question}}\n为什么重要:{{item.why}}\n建议检索词:{{item.queries}}\n\n工具与打法(你有 WebFetch,能打开任何 https 地址):\n- Semantic Scholar 免 key 检索接口(把 QUERY 换成检索词,空格用 + ):\n  https://api.semanticscholar.org/graph/v1/paper/search?query=QUERY&fields=title,year,abstract,citationCount,externalIds&limit=20\n- 顺引文滚雪球:锁定关键论文后用\n  https://api.semanticscholar.org/graph/v1/paper/arXiv:ID/references?fields=title,year,citationCount,externalIds&limit=30\n- arXiv 摘要页 https://arxiv.org/abs/ID 可读单篇细节。\n- 接口回 429/限速/超时:等几秒重试一次;仍不行就换检索词或改用 arXiv 页面,并把「哪路数据没拿到」如实写进 findings——如实的空缺好过硬凑。\n- 预算纪律:总共至多 8 次抓取,挑引用数高的和近两年的读,别漫游。\n\n诚实红线:论文清单里只许写你真的在返回数据里见到的论文;编造 id 等于全篇作废。\n\n输出一个 JSON 对象,除对象外一个字都不要(不要代码围栏;字符串里别用英文双引号,要引用就用「」):\n{\"question\": \"原问题\", \"verdict\": \"查证后的回答,两三句人话;查不到就如实说查不到\", \"papers\": [{\"id\": \"arXiv编号或DOI\", \"title\": \"标题\", \"one_line\": \"一句话它说了什么\"}]}\npapers 至多 5 篇。",
+    "outputSchema": {
+     "type": "object",
+     "required": [
+      "question",
+      "verdict"
+     ],
+     "properties": {
+      "question": {
+       "type": "string"
+      },
+      "verdict": {
+       "type": "string",
+       "minLength": 20
+      },
+      "papers": {
+       "type": "array",
+       "maxItems": 5,
+       "items": {
+        "type": "object",
+        "required": [
+         "id",
+         "title"
+        ],
+        "properties": {
+         "id": {
+          "type": "string"
+         },
+         "title": {
+          "type": "string"
+         },
+         "one_line": {
+          "type": "string",
+          "maxLength": 160
+         }
+        }
+       }
+      }
+     }
+    },
+    "fanout": {
+     "over": "{{gapscan.json}}",
+     "max": 3,
+     "maxParallel": 3,
+     "timeoutSec": 600,
+     "tolerateAllFail": true
+    }
+   },
+   {
+    "id": "write",
+    "backend": "claude",
+    "perm": "plan",
+    "model": "flagship",
+    "dependsOn": [
+     "merge",
+     "fill"
+    ],
+    "prompt": "你是资深研究员,为一位准备进入新方向的中文读者写 mini-survey。题目:{{param.title}}。读者画像:{{param.audience}}。\n\n材料一 · 三视角整合报告:\n{{merge.output}}\n\n材料二 · 定向补查结果(可能为空,空了就按整合报告写):\n{{fill.output}}\n\n按此结构输出 Markdown:\n# {{param.title}} mini-survey\n## 1 问题分解 —— 把大题拆成 3-6 个子问题,说明依赖关系与哪个是瓶颈;\n## 2 方法谱系 —— 按技术路线分 2-4 派,每派:核心假设、代表工作 2-3 篇(引 arXiv:ID)、优劣;\n## 3 代表工作对比 —— Markdown 表:工作(arXiv:ID)|路线|关键机制|评测与数字|局限;\n## 4 分歧与开放问题 —— 材料里的真分歧如实写两说;开放问题区分「材料共同承认的」与「我的推断」;\n## 5 切入建议 —— 结合读者画像给 2-3 条路径:先复现哪篇、可借用什么基建、90 天内可出结果的最小实验。\n规则:只允许引用材料内出现过的论文(格式 arXiv:ID);引入材料外背景必须标注「(背景,非本批材料)」;材料标注过「建议核实」的论文,引用时保留该标注;覆盖不足就在开头如实声明;全文中文,术语保英文。\n\n【输出纪律 · 无人值守】这是无人值守运行,没有人会回答你或批准计划:不要提问,不要把成果写进计划文件、不要把成果当作「计划」提交——下游只保存你最后一条普通回复,最终回复必须就是完整成果本身,不加「我已完成」「报告如下」之类的前后缀;成果写进计划文件或中途消息里等于全部丢失。"
+   },
+   {
+    "id": "prep",
+    "backend": "claude",
+    "dependsOn": [],
+    "command": "mkdir -p \"$HOME/arxiv-surveys\" && echo \"REPORT_DATE: $(date +%F)\""
+   },
+   {
+    "id": "save",
+    "backend": "claude",
+    "perm": "acceptEdits",
+    "model": "fast",
+    "dir": "~/arxiv-surveys",
+    "dependsOn": [
+     "write",
+     "prep"
+    ],
+    "prompt": "日期信息:{{prep.output}}\n把下面内容一字不改写入当前目录文件 `survey_<REPORT_DATE的日期>_<题目英文slug>.md`(slug 从题目自拟,小写连字符):\n\n{{write.output}}\n\n只用文件写入工具,不要执行任何命令(Bash 会被拒)。写完仅回复文件名。"
+   }
+  ]
+ }
+}

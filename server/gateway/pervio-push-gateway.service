@@ -1,0 +1,21 @@
+[Unit]
+Description=Pervio push gateway (APNs relay, ciphertext-blind)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=pervio-gw
+Group=pervio-gw
+ExecStart=/usr/bin/python3 /opt/pervio-gateway/pervio-push-gateway.py
+Restart=always
+RestartSec=3
+StateDirectory=pervio-gateway
+Environment=PERVIO_GW_STATE=/var/lib/pervio-gateway
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadOnlyPaths=/etc/pervio-gateway
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,436 @@
+#!/usr/bin/env python3
+"""pervio-feedback — record a paper verdict: content-carrying, twice.
+
+Every verdict lands in TWO places (2026-08-21, taste v2 design docs/taste.md):
+  * taste-journal.jsonl (sibling of memory.md) — the permanent, append-only
+    event log. One JSON line per event, ALWAYS carrying the paper's content
+    (title + gist, auto-resolved from the published issues in archive/), so a
+    bare 👍 is never a mute id. Nothing ever deletes or rewrites these lines.
+  * memory.md 反馈 section — the human-visible ledger the score judges read
+    (until the profile layer replaces it). When the user typed no note, the
+    resolved TITLE stands in for it — the「(无备注)」mute-id era is over.
+
+`migrate` upgrades an existing 反馈 section in place: fills titles into
+(无备注) lines and seeds the journal from history. Idempotent.
+
+The write half of the paper-digest scoring loop: the App's long-press menu on an
+arXiv link runs this over SSH, the daily 晨报 judges/editor read the 反馈 section
+back (their prompts already do — this script only has to land the line where they
+look). One paper = one line, newest at the top, re-scoring the same id replaces
+the old line.
+
+  pervio-feedback --id 2607.15610 --verdict 👍 [--note "一句话"] [--file PATH]
+
+--verdict must be one of 👍 👎 少看 多看 — byte-for-byte the App's menu items.
+Everything OUTSIDE the 反馈 section (bounded by the next "## " heading or EOF)
+is preserved byte-for-byte; the file is written atomically (tmp + os.replace).
+On success stdout is a single JSON line {"ok": true, "line": "<written line>"}
+— the App's confirmation. PERVIO_NOW (ISO) pins the date for hermetic tests.
+"""
+import contextlib
+import datetime
+import fcntl
+import json
+import os
+import re
+import sys
+
+# Header + format comment copied verbatim from the production memory.md so a
+# recreated file is indistinguishable from the seeded one. VERDICTS must equal
+# the WorkflowMarket paper-digest action menu byte-for-byte.
+HEADER = "## 反馈(你在聊天里给的反应,近的在上;晨报据此调整,agent 只读不写这一节)"
+COMMENT = "<!-- 格式:- YYYY-MM-DD | 👍/👎/多看/少看 | arXiv:ID 或主题 | 一句话。聊天里说「把这条记进论文反馈:…」即可。 -->"
+PLACEHOLDER = "(暂无)"
+NO_NOTE = "(无备注)"       # a mute verdict's note slot — NOT the section placeholder
+VERDICTS = ("👍", "👎", "少看", "多看")
+MAX_ENTRIES = 50
+NOTE_MAX = 120
+
+
+def die(msg):
+    sys.stderr.write("pervio-feedback: %s\n" % msg)
+    sys.exit(1)
+
+
+def parse_args(argv):
+    o = {"id": "", "verdict": "", "note": "", "file": "~/.pervio/papers/memory.md"}
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a.startswith("--") and a[2:] in o and i + 1 < len(argv):
+            o[a[2:]] = argv[i + 1]
+            i += 2
+        else:
+            die("unknown/malformed arg: %s" % a)
+    return o
+
+
+@contextlib.contextmanager
+def _exclusive(lock_path):
+    """Serialize the whole read-modify-write. Recording one verdict rewrites the
+    ENTIRE file, so two overlapping runs (two taps in the App's long-press menu,
+    or a tap while the 晨报 records one) both read the same "before", both write
+    the whole thing back, and the loser's line is gone — with both printing
+    ok:true. memory.md has no backup, so a lost verdict is lost for good.
+
+    The lock is a sibling dotfile, never the target itself: we replace the target
+    by rename, so a lock held on that inode would be a lock on a file nobody can
+    reach any more. SystemExit from die() unwinds through the finally, so the
+    lock is released on every exit path."""
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError as e:
+        die("cannot take the write lock %s: %s" % (lock_path, e))
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def _fsync_dir(d):
+    """Make the rename itself durable — best effort; a crash right after a
+    successful replace must not resurrect the pre-write directory entry."""
+    try:
+        fd = os.open(d, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+def today():
+    v = os.environ.get("PERVIO_NOW")
+    if v:
+        # Same 'Z' normalization as pervio-arxiv-fetch: fromisoformat() rejects a
+        # trailing Z before Python 3.11, and tests inject exactly that form.
+        try:
+            return datetime.datetime.fromisoformat(v.replace("Z", "+00:00")) \
+                .strftime("%Y-%m-%d")
+        except ValueError as e:
+            die("PERVIO_NOW unparseable: %s" % e)
+    return datetime.datetime.now().strftime("%Y-%m-%d")
+
+
+def _archive_dir(memory_path):
+    """Issues live beside memory.md (production: ~/.pervio/papers/archive);
+    deriving from the --file dir keeps tests hermetic with zero extra flags."""
+    return os.path.join(os.path.dirname(memory_path) or ".", "archive")
+
+
+def lookup_paper(memory_path, arxiv_id):
+    """(title, gist) for a rated paper, best-effort, from the published issues
+    (newest first, capped at 40 files). Two shapes cover every tier:
+      * a list line   - [arXiv:ID](url) TITLE [·markers]   (速读/扫过/值得看):
+        title = text after the link, badge/markers stripped; gist = the
+        indented follow-up line when there is one (速读摘要/看点).
+      * a 必读 block  ### TITLE …\n[arXiv:ID](url) …: title = the nearest
+        preceding ### heading; gist stays empty (the title carries enough).
+    Unknown id → ("", "") — the caller degrades to the old behavior."""
+    adir = _archive_dir(memory_path)
+    try:
+        files = sorted((f for f in os.listdir(adir) if f.endswith(".md")),
+                       reverse=True)[:40]
+    except OSError:
+        return "", ""
+    needle = "arXiv:%s" % arxiv_id
+    for name in files:
+        try:
+            with open(os.path.join(adir, name), encoding="utf-8") as f:
+                lines = f.read().split("\n")
+        except (OSError, UnicodeDecodeError):
+            continue
+        for i, line in enumerate(lines):
+            if needle not in line:
+                continue
+            m = re.match(r"- \[arXiv:%s\]\([^)]*\)\s*(.*)$" % re.escape(arxiv_id), line)
+            if m:
+                t = m.group(1)
+                t = re.sub(r"^`[^`]*`\s*", "", t)          # skim 的 ★ 徽章
+                t = re.sub(r"\s*·(仅摘要|未过核查)\s*$", "", t).strip()
+                gist = ""
+                if i + 1 < len(lines) and lines[i + 1].startswith("  "):
+                    gist = lines[i + 1].strip()
+                    gist = re.sub(r"^(看点|读原文|可以试|观望)[::]\s*", "", gist)[:80]
+                if t:
+                    return t, gist
+            if line.startswith("[arXiv:"):                 # 必读 block 的 meta 行
+                for j in range(i - 1, max(-1, i - 6), -1):
+                    if lines[j].startswith("### "):
+                        return lines[j][4:].strip(), ""
+    return "", ""
+
+
+def journal_append(memory_path, obj):
+    """One JSON line into the permanent event log, beside memory.md. O_APPEND
+    keeps concurrent writers whole-line safe; nothing ever rewrites this file."""
+    jp = os.path.join(os.path.dirname(memory_path) or ".", "taste-journal.jsonl")
+    line = json.dumps(obj, ensure_ascii=False) + "\n"
+    fd = os.open(jp, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
+    try:
+        os.write(fd, line.encode("utf-8"))
+    finally:
+        os.close(fd)
+
+
+def upsert(content, entry, arxiv_id):
+    """Return content with `entry` at the top of the 反馈 section (created if
+    absent), any older line for the same id and the (暂无) placeholder removed,
+    and the section capped at MAX_ENTRIES lines. Bytes outside the section —
+    header line to next '## ' heading or EOF — pass through untouched."""
+    if not re.search(r"(?m)^## 反馈(?:$|[\s((])", content):
+        if content and not content.endswith("\n"):
+            content += "\n"
+        if content:
+            content += "\n"                     # blank line between sections
+        content += HEADER + "\n" + COMMENT + "\n"
+    m = re.search(r"(?m)^## 反馈(?:$|[\s((]).*\n?", content)
+    body_start = m.end()
+    nxt = re.search(r"(?m)^## ", content[body_start:])
+    body_end = body_start + nxt.start() if nxt else len(content)
+
+    # split('\n') (never splitlines) so every byte of the body round-trips —
+    # a trailing '' element encodes the final newline.
+    lines = content[body_start:body_end].split("\n")
+    # Anchored to the third field (note is the LAST field, so two leading
+    # pipes are deterministic): a note citing another id must not get that
+    # unrelated entry deleted when the cited paper is re-scored.
+    same_id = re.compile(r"^-\s[^|]*\|[^|]*\|\s*arXiv:%s(?!\d)\s*\|" % re.escape(arxiv_id))
+    lines = [l for l in lines
+             if l.strip() != PLACEHOLDER and not same_id.search(l)]
+    at = 0
+    while at < len(lines) and lines[at].lstrip().startswith("<!--"):
+        at += 1
+    lines.insert(at, entry)
+    # Cap: entries are the "- " lines, newest at the top, so overflow is
+    # trimmed bottom-up (oldest first). Non-entry lines are never counted.
+    over = sum(1 for l in lines if l.startswith("- ")) - MAX_ENTRIES
+    for i in range(len(lines) - 1, -1, -1):
+        if over <= 0:
+            break
+        if lines[i].startswith("- "):
+            del lines[i]
+            over -= 1
+    return content[:body_start] + "\n".join(lines) + content[body_end:]
+
+
+def main():
+    o = parse_args(sys.argv[1:])
+    if not re.fullmatch(r"\d{4}\.\d{4,5}", o["id"]):
+        die("--id must be a new-style arXiv id (NNNN.NNNNN), got: %r" % o["id"])
+    if o["verdict"] not in VERDICTS:
+        die("--verdict must be one of %s, got: %r" % ("/".join(VERDICTS), o["verdict"]))
+    # The note lands in a one-line-per-entry file agents parse: fold all
+    # whitespace (incl. newlines) to single spaces and bound the length.
+    user_note = re.sub(r"\s+", " ", o["note"]).strip()[:NOTE_MAX]
+
+    path = os.path.expanduser(o["file"])
+    d = os.path.dirname(path) or "."
+    os.makedirs(d, mode=0o700, exist_ok=True)
+
+    # Content resolution: what IS this paper. With no user note, the resolved
+    # title stands in for it — a verdict the judges can generalize from beats
+    # a mute id every time (the「(无备注)」era shipped exactly that puzzle).
+    # A user note wins the visible slot; the title rides the journal either way.
+    title, gist = lookup_paper(path, o["id"])
+    note = user_note or (("《%s》" % title)[:NOTE_MAX] if title else NO_NOTE)
+
+    entry = "- %s | %s | arXiv:%s | %s" % (today(), o["verdict"], o["id"], note)
+    # Read AND write under one lock — see _exclusive(). Everything between here
+    # and the os.replace is the critical section; nothing outside it touches the
+    # file, so a concurrent run either sees the whole old file or the whole new
+    # one, never a half-applied merge.
+    with _exclusive(os.path.join(d, "." + os.path.basename(path) + ".lock")):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+            mode = os.stat(path).st_mode & 0o777
+        except FileNotFoundError:
+            content, mode = "", 0o600
+        except (OSError, UnicodeDecodeError) as e:
+            die("read %s: %s" % (path, e))
+
+        out = upsert(content, entry, o["id"])
+        if not out.endswith("\n"):
+            out += "\n"
+
+        tmp = path + ".tmp"          # safe as a fixed name: we hold the lock
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(out)
+                f.flush()
+                os.fsync(f.fileno())   # the rename must not commit ahead of the bytes
+            os.chmod(tmp, mode)
+            os.replace(tmp, path)
+        except OSError as e:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            die("write %s: %s" % (path, e))
+        _fsync_dir(d)
+        # The permanent event: appended INSIDE the lock so journal order always
+        # matches ledger order. Never rewritten, never capped — this is the
+        # record the daily profile integration reads (docs/taste.md).
+        journal_append(path, {"ts": today(), "act": o["verdict"], "id": o["id"],
+                              "title": title, "gist": gist, "note": user_note,
+                              "src": "rate"})
+    print(json.dumps({"ok": True, "line": entry}, ensure_ascii=False))
+
+
+def cmd_migrate():
+    """One-time (idempotent) upgrade of an existing 反馈 section: resolve
+    titles into (无备注) lines, and seed the journal from every line — history
+    must not stay mute just because it predates the journal. Re-running skips
+    events the journal already holds (keyed date|act|id)."""
+    o = parse_args(sys.argv[2:]) if len(sys.argv) > 2 else \
+        {"id": "", "verdict": "", "note": "", "file": "~/.pervio/papers/memory.md"}
+    path = os.path.expanduser(o["file"])
+    d = os.path.dirname(path) or "."
+    jp = os.path.join(d, "taste-journal.jsonl")
+    seen = set()
+    try:
+        with open(jp, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                    seen.add("%s|%s|%s" % (e.get("ts"), e.get("act"), e.get("id")))
+                except ValueError:
+                    continue
+    except OSError:
+        pass
+
+    row = re.compile(r"^- (\d{4}-\d{2}-\d{2}) \| (\S+) \| arXiv:(\d{4}\.\d{4,5}) \| (.*)$")
+    filled, seeded = 0, 0
+    with _exclusive(os.path.join(d, "." + os.path.basename(path) + ".lock")):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+            mode = os.stat(path).st_mode & 0o777
+        except OSError as e:
+            die("read %s: %s" % (path, e))
+        out_lines = []
+        for line in content.split("\n"):
+            m = row.match(line)
+            if not m:
+                out_lines.append(line)
+                continue
+            ts, act, pid, note = m.groups()
+            title, gist = lookup_paper(path, pid)
+            if note.strip() == NO_NOTE and title:
+                line = "- %s | %s | arXiv:%s | %s" % (
+                    ts, act, pid, ("《%s》" % title)[:NOTE_MAX])
+                filled += 1
+            key = "%s|%s|%s" % (ts, act, pid)
+            if key not in seen and act in VERDICTS:
+                journal_append(path, {"ts": ts, "act": act, "id": pid,
+                                      "title": title, "gist": gist,
+                                      "note": "" if note.strip() == NO_NOTE else note,
+                                      "src": "migrate"})
+                seen.add(key)
+                seeded += 1
+            out_lines.append(line)   # the processed row goes BACK — this line
+                                     # missing once ate every verdict it touched
+        new = "\n".join(out_lines)
+        if new != content:
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(new)
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(tmp, mode)
+            os.replace(tmp, path)
+            _fsync_dir(d)
+    print(json.dumps({"ok": True, "filled": filled, "seeded": seeded}))
+
+
+PROFILE_HEADER = "## 口味画像(机器每日整合你的打分;可读可改,机器下次整合会尊重你的改动)"
+PROFILE_MAX_RULES = 12
+PROFILE_MAX_CHARS = 600
+
+
+def cmd_profile():
+    """Replace the whole 口味画像 section — the ONLY legal writer of it.
+
+    Called by `pervio-digest-assemble tasteapply` with the integration agent's
+    output. Validation is the trust boundary between a model's text and the
+    user's memory.md: every line must be a "- " bullet, ≤PROFILE_MAX_RULES
+    lines, ≤PROFILE_MAX_CHARS hanzi-ish chars total — anything else is
+    refused with rc!=0 and memory.md stays byte-identical. Same lock + atomic
+    replace discipline as the 反馈 writer; bytes outside the section survive
+    untouched."""
+    args = sys.argv[2:]
+    o = {"b64": "", "file": "~/.pervio/papers/memory.md"}
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a.startswith("--") and a[2:] in o and i + 1 < len(args):
+            o[a[2:]] = args[i + 1]; i += 2
+        else:
+            die("profile: unknown/malformed arg: %s" % a)
+    try:
+        import base64
+        body = base64.b64decode(o["b64"], validate=True).decode("utf-8").strip()
+    except Exception as e:
+        die("profile: --b64 undecodable: %s" % e)
+    lines = [l.rstrip() for l in body.split("\n") if l.strip()]
+    if not lines:
+        die("profile: empty content")
+    if len(lines) > PROFILE_MAX_RULES:
+        die("profile: %d rules > cap %d" % (len(lines), PROFILE_MAX_RULES))
+    bad = [l for l in lines if not l.startswith("- ")]
+    if bad:
+        die("profile: non-bullet line: %r" % bad[0][:80])
+    total = sum(len(l) for l in lines)
+    if total > PROFILE_MAX_CHARS + 200:      # 200 = bullets/dates slack
+        die("profile: %d chars > cap" % total)
+
+    path = os.path.expanduser(o["file"])
+    d = os.path.dirname(path) or "."
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    section = PROFILE_HEADER + "\n" + "\n".join(lines) + "\n"
+    with _exclusive(os.path.join(d, "." + os.path.basename(path) + ".lock")):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+            mode = os.stat(path).st_mode & 0o777
+        except FileNotFoundError:
+            content, mode = "", 0o600
+        except (OSError, UnicodeDecodeError) as e:
+            die("read %s: %s" % (path, e))
+        m = re.search(r"(?m)^## 口味画像.*?(?=^## |\Z)", content, re.S)
+        if m:
+            content = content[:m.start()] + section + content[m.end():]
+        else:
+            if content and not content.endswith("\n"):
+                content += "\n"
+            if content:
+                content += "\n"
+            content += section
+        tmp = path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(content)
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(tmp, mode)
+            os.replace(tmp, path)
+        except OSError as e:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            die("write %s: %s" % (path, e))
+        _fsync_dir(d)
+    print(json.dumps({"ok": True, "rules": len(lines)}))
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "migrate":
+        cmd_migrate()
+    elif len(sys.argv) > 1 and sys.argv[1] == "profile":
+        cmd_profile()
+    else:
+        main()

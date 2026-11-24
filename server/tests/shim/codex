@@ -1,0 +1,293 @@
+#!/usr/bin/env python3
+"""Committed test shim for `codex`. pervio-chat passes the prompt as the last
+positional arg and -C <dir>; a `SHIM:{json}` line drives behavior (same protocol
+as the claude shim). Emits codex-style events: a thread.started carrying thread_id,
+then item.completed(agent_message) + turn.completed / turn.failed."""
+import json
+import os
+import sys
+import time
+
+if os.environ.get("SHIM_ENV_LOG"):
+    try:
+        with open(os.environ["SHIM_ENV_LOG"], "a") as _f:
+            _f.write(json.dumps({k: v for k, v in os.environ.items() if k.startswith("PERVIO_PROVIDER") or k.startswith("OPENAI_")}) + "\n")
+    except OSError:
+        pass
+
+if os.environ.get("SHIM_ARGV_LOG"):        # lets tests inspect the child's real argv
+    try:
+        with open(os.environ["SHIM_ARGV_LOG"], "a") as _f:
+            _f.write(json.dumps(sys.argv) + "\n")
+    except OSError:
+        pass
+
+args = sys.argv[1:]
+
+
+def app_server():
+    """The app-server face of the shim: the JSON-RPC subset pervio-codex-app speaks.
+    A turn is driven by the same SHIM:{json} line (now inside turn/start's text):
+    trace steps become item/started+item/completed, `approve` raises a
+    commandExecution approval request and records the client's decision in
+    $SHIM_APPROVAL_LOG, `write` lands files, `sleep` waits (interruptible: a
+    turn/interrupt during it ends the turn as interrupted and is logged too).
+    Every request seen is logged to $SHIM_RPC_LOG (method + params)."""
+    def rpc_log(obj):
+        if os.environ.get("SHIM_RPC_LOG"):
+            try:
+                with open(os.environ["SHIM_RPC_LOG"], "a") as f:
+                    f.write(json.dumps(obj) + "\n")
+            except OSError:
+                pass
+    def send(obj):
+        sys.stdout.write(json.dumps(obj) + "\n"); sys.stdout.flush()
+    def notify(method, params):
+        send({"jsonrpc": "2.0", "method": method, "params": params})
+    def read_msg():
+        line = sys.stdin.readline()
+        if not line:
+            return None
+        try:
+            return json.loads(line)
+        except ValueError:
+            return {}
+    thread_id = "shimthread"; turn_no = 0; interrupted = {"flag": False}
+    # $SHIM_CODEX_REPLAY: a file of notifications a REAL `codex app-server`
+    # sent for one turn (server/tests/tasks/*.appserver.jsonl, recorded by
+    # capture_tasks.py). The thread takes the recording's own id, and turn/start
+    # plays the notifications back as they came — sub-agent threads and all.
+    replay = []
+    if os.environ.get("SHIM_CODEX_REPLAY"):
+        with open(os.environ["SHIM_CODEX_REPLAY"], encoding="utf-8") as f:
+            replay = [json.loads(l) for l in f if l.strip()]
+    replay_turn = next((m["params"] for m in replay if m.get("method") == "turn/started"), {})
+    while True:
+        m = read_msg()
+        if m is None:
+            return
+        if not m or "method" not in m:
+            continue
+        method, params, rid = m.get("method"), m.get("params") or {}, m.get("id")
+        rpc_log({"method": method, "params": params})
+        if method == "initialize":
+            send({"jsonrpc": "2.0", "id": rid, "result": {"userAgent": "shim/0", "codexHome": os.path.expanduser("~/.codex")}})
+        elif method == "initialized":
+            pass
+        elif method in ("thread/start", "thread/resume"):
+            if method == "thread/resume":
+                thread_id = params.get("threadId") or thread_id
+            else:
+                thread_id = replay_turn.get("threadId") or os.environ.get("SHIM_CODEX_THREAD", "") or thread_id
+            if params.get("cwd"):
+                try: os.chdir(params["cwd"])
+                except OSError: pass
+            send({"jsonrpc": "2.0", "id": rid, "result": {"thread": {"id": thread_id}, "model": params.get("model") or "shim-model",
+                                                           "cwd": params.get("cwd") or os.getcwd(), "sandbox": params.get("sandbox"),
+                                                           "approvalPolicy": params.get("approvalPolicy") or "never"}})
+            notify("thread/started", {"thread": {"id": thread_id}})
+        elif method == "turn/start" and replay:
+            send({"jsonrpc": "2.0", "id": rid, "result": {"turn": {"id": (replay_turn.get("turn") or {}).get("id", "turn-replay"),
+                                                                    "items": [], "status": "inProgress"}}})
+            for m in replay:
+                send(m)
+                time.sleep(float(os.environ.get("SHIM_CODEX_REPLAY_GAP", "0.005")))
+        elif method == "turn/start":
+            turn_no += 1; turn_id = "turn-%d" % turn_no
+            steered = []                       # words steered in mid-turn (turn/steer): the answer carries them
+            text = " ".join(c.get("text", "") for c in params.get("input", []) if isinstance(c, dict))
+            ins = {}
+            for line in text.splitlines():
+                if line.strip().startswith("SHIM:"):
+                    try: ins = json.loads(line.strip()[5:])
+                    except ValueError: pass
+            if not ins and os.environ.get("SHIM_CODEX_JSON"):
+                try: ins = json.loads(os.environ["SHIM_CODEX_JSON"])
+                except ValueError: pass
+            if "text" not in ins and os.environ.get("SHIM_CODEX_TEXT"):
+                ins["text"] = os.environ["SHIM_CODEX_TEXT"]
+            if os.environ.get("SHIM_PROMPT_LOG"):
+                try:
+                    with open(os.environ["SHIM_PROMPT_LOG"], "a") as f:
+                        f.write(text + "\n===PROMPT-END===\n")
+                except OSError:
+                    pass
+            send({"jsonrpc": "2.0", "id": rid, "result": {"turn": {"id": turn_id, "items": [], "status": "inProgress"}}})
+            # codex reports the turn's own words as an item of the turn, in this
+            # shape (0.160.1 and 0.169 alike, captured 2026-11-21).
+            um0 = {"type": "userMessage", "id": "item-user-%d" % turn_no, "clientId": None,
+                   "content": [{"type": "text", "text": text, "text_elements": []}]}
+            notify("item/started", {"threadId": thread_id, "turnId": turn_id, "item": um0, "startedAtMs": 0})
+            notify("item/completed", {"threadId": thread_id, "turnId": turn_id, "item": um0, "completedAtMs": 0})
+            notify("turn/started", {"threadId": thread_id, "turn": {"id": turn_id, "items": [], "status": "inProgress"}})
+            n = 0
+            for step in ins.get("trace", []):
+                n += 1
+                if "tool" in step:
+                    item = {"type": "commandExecution", "id": "item-%d" % n, "command": step.get("command", step["tool"]),
+                            "cwd": os.getcwd(), "status": "completed", "exitCode": 0, "aggregatedOutput": ""}
+                else:
+                    item = {"type": "agentMessage", "id": "item-%d" % n, "text": step.get("say", "")}
+                notify("item/started", {"threadId": thread_id, "turnId": turn_id, "item": dict(item, status="inProgress") if item["type"] == "commandExecution" else item, "startedAtMs": 0})
+                notify("item/completed", {"threadId": thread_id, "turnId": turn_id, "item": item, "completedAtMs": 0})
+                time.sleep(float(ins.get("trace_gap", 0.05)))
+            if ins.get("approve"):
+                ap = ins["approve"]
+                send({"jsonrpc": "2.0", "id": 900, "method": "item/commandExecution/requestApproval",
+                      "params": {"threadId": thread_id, "turnId": turn_id, "itemId": "item-approve",
+                                 "command": ap.get("command", "rm -rf build"), "cwd": os.getcwd(),
+                                 "reason": ap.get("reason", "needs your ok"), "startedAtMs": 0}})
+                while True:
+                    reply = read_msg()
+                    if reply is None:
+                        return
+                    if reply.get("id") == 900:
+                        decision = (reply.get("result") or {}).get("decision", "")
+                        break
+                    if reply.get("method") == "turn/interrupt":
+                        rpc_log({"method": "turn/interrupt", "params": reply.get("params") or {}})
+                        send({"jsonrpc": "2.0", "id": reply.get("id"), "result": {}})
+                        decision = "interrupted"; interrupted["flag"] = True
+                        break
+                if os.environ.get("SHIM_APPROVAL_LOG"):
+                    with open(os.environ["SHIM_APPROVAL_LOG"], "a") as f:
+                        f.write(decision + "\n")
+                if decision == "accept":
+                    notify("item/completed", {"threadId": thread_id, "turnId": turn_id, "completedAtMs": 0,
+                                              "item": {"type": "commandExecution", "id": "item-approve", "command": ap.get("command", "rm -rf build"),
+                                                       "cwd": os.getcwd(), "status": "completed", "exitCode": 0}})
+            for w in ins.get("write", []):
+                d = os.path.dirname(w["file"])
+                if d:
+                    os.makedirs(d, exist_ok=True)
+                with open(w["file"], "w") as f:
+                    f.write(w["content"])
+            if ins.get("sleep") and not interrupted["flag"]:
+                # interruptible: poll stdin for a turn/interrupt while "working"
+                import select
+                end = time.time() + float(ins["sleep"])
+                while time.time() < end:
+                    r, _, _ = select.select([sys.stdin], [], [], 0.05)
+                    if r:
+                        reply = read_msg()
+                        if reply is None:
+                            return
+                        if reply.get("method") == "turn/interrupt":
+                            rpc_log({"method": "turn/interrupt", "params": reply.get("params") or {}})
+                            send({"jsonrpc": "2.0", "id": reply.get("id"), "result": {}})
+                            interrupted["flag"] = True
+                            break
+                        if reply.get("method") == "turn/steer":
+                            # codex's own shape: the active turn takes the words at its
+                            # next step; a stale expectedTurnId is refused.
+                            prm = reply.get("params") or {}
+                            rpc_log({"method": "turn/steer", "params": prm})
+                            if prm.get("expectedTurnId") not in (None, turn_id):
+                                send({"jsonrpc": "2.0", "id": reply.get("id"),
+                                      "error": {"code": -32600, "message": "turn %s is not active" % prm.get("expectedTurnId")}})
+                                continue
+                            send({"jsonrpc": "2.0", "id": reply.get("id"), "result": {"turnId": turn_id}})
+                            words = "\n".join(c.get("text", "") for c in prm.get("input") or [] if isinstance(c, dict))
+                            steered.append(words)
+                            um = {"type": "userMessage", "id": "item-steer-%d" % len(steered), "clientId": None,
+                                  "content": [{"type": "text", "text": words, "text_elements": []}]}
+                            notify("item/started", {"threadId": thread_id, "turnId": turn_id, "item": um, "startedAtMs": 0})
+                            notify("item/completed", {"threadId": thread_id, "turnId": turn_id, "item": um, "completedAtMs": 0})
+            if interrupted["flag"]:
+                notify("turn/completed", {"threadId": thread_id, "turn": {"id": turn_id, "items": [], "status": "interrupted"}})
+                continue
+            notify("item/completed", {"threadId": thread_id, "turnId": turn_id, "completedAtMs": 0,
+                                      "item": {"type": "agentMessage", "id": "item-final",
+                                               "text": ins.get("text", "ok") + "".join("\n" + w for w in steered)}})
+            if "usage" in ins:
+                u = ins["usage"]
+                notify("thread/tokenUsage/updated", {"threadId": thread_id, "tokenUsage": {"last": {
+                    "inputTokens": u.get("input_tokens", 0), "cachedInputTokens": u.get("cached_input_tokens", 0),
+                    "outputTokens": u.get("output_tokens", 0), "reasoningOutputTokens": u.get("reasoning_output_tokens", 0)}}})
+            if ins.get("is_error"):
+                notify("turn/completed", {"threadId": thread_id, "turn": {"id": turn_id, "items": [], "status": "failed",
+                                                                            "error": {"message": "shim failure"}}})
+            else:
+                notify("turn/completed", {"threadId": thread_id, "turn": {"id": turn_id, "items": [], "status": "completed"}})
+        elif method == "turn/interrupt":
+            send({"jsonrpc": "2.0", "id": rid, "result": {}})
+        elif method == "turn/steer":           # no turn running: refused, like codex
+            rpc_log({"method": "turn/steer", "params": params})
+            send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32600, "message": "no active turn"}})
+        else:
+            send({"jsonrpc": "2.0", "id": rid, "result": {}})
+
+
+if args[:1] == ["app-server"]:
+    if args[1:2] == ["--help"] or os.environ.get("SHIM_CODEX_NO_APPSERVER"):
+        if os.environ.get("SHIM_CODEX_NO_APPSERVER"):      # an older codex: no such subcommand
+            sys.stderr.write("error: unrecognized subcommand 'app-server'\n"); sys.exit(2)
+        print("[experimental] Run the app server"); sys.exit(0)
+    app_server(); sys.exit(0)
+if args[:2] == ["exec", "--help"]:
+    print("Usage: codex exec [OPTIONS] [PROMPT]\n\nOptions:\n      --add-dir <DIR>  Additional directories that should be writable alongside the primary workspace\n")
+    sys.exit(0)
+for i, a in enumerate(args):
+    if a == "-C" and i + 1 < len(args):
+        try:
+            os.chdir(args[i + 1])
+        except OSError:
+            pass
+prompt = args[-1] if args else ""
+if os.environ.get("SHIM_PROMPT_LOG"):      # lets tests see the FULL prompt (meta keeps 140 chars)
+    try:
+        with open(os.environ["SHIM_PROMPT_LOG"], "a") as _f:
+            _f.write(prompt + "\n===PROMPT-END===\n")
+    except OSError:
+        pass
+ins = {}
+for line in prompt.splitlines():
+    line = line.strip()
+    if line.startswith("SHIM:"):
+        try:
+            ins = json.loads(line[5:])
+        except ValueError:
+            pass
+
+if not ins and os.environ.get("SHIM_CODEX_JSON"):
+    try:
+        ins = json.loads(os.environ["SHIM_CODEX_JSON"])
+    except ValueError:
+        pass
+if "text" not in ins and os.environ.get("SHIM_CODEX_TEXT"):   # see the claude shim
+    ins["text"] = os.environ["SHIM_CODEX_TEXT"]
+
+tid = ins.get("sid", "shimthread")
+sys.stdout.write(json.dumps({"type": "thread.started", "thread_id": tid}) + "\n")
+sys.stdout.flush()
+
+for step in ins.get("trace", []):      # streamed progress, as in the claude shim
+    if "tool" in step:
+        item = {"type": "command_execution", "command": step.get("command", step["tool"]), "exit_code": 0}
+    else:
+        item = {"type": "agent_message", "text": step.get("say", "")}
+    sys.stdout.write(json.dumps({"type": "item.completed", "item": item}) + "\n")
+    sys.stdout.flush()
+    time.sleep(float(ins.get("trace_gap", 0.2)))
+
+for w in ins.get("write", []):
+    d = os.path.dirname(w["file"])
+    if d:
+        os.makedirs(d, exist_ok=True)
+    with open(w["file"], "w") as f:
+        f.write(w["content"])
+
+if ins.get("sleep"):
+    time.sleep(float(ins["sleep"]))
+
+sys.stdout.write(json.dumps({"type": "item.completed",
+                             "item": {"type": "agent_message", "text": ins.get("text", "ok")}}) + "\n")
+if ins.get("is_error"):
+    sys.stdout.write(json.dumps({"type": "turn.failed", "error": {"message": "shim failure"}}) + "\n")
+else:
+    done = {"type": "turn.completed"}
+    if "usage" in ins:                  # let token-ledger tests control the usage counts
+        done["usage"] = ins["usage"]
+    sys.stdout.write(json.dumps(done) + "\n")
+sys.stdout.flush()
+sys.exit(int(ins.get("rc", 0)))

@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Thin shim: run one scheduling tick. Its ONLY job is to give the macOS
+# LaunchAgent (and its Login Items row) a NAMED program to point at, instead of a
+# bare `python3` that surfaces in System Settings > General > Login Items as an
+# anonymous "python3" nobody can attribute. launchd invokes this every 5 minutes;
+# it exec's the real brain, pervio-orchestrate's `schedule tick`, in place — so the
+# process the OS tracks IS this file's name, `pervio-schedule-tick`.
+#
+# Self-locating: pervio-orchestrate sits right next to this shim (install.sh drops
+# both into ~/.pervio/bin), so resolve that dir from $0 rather than hard-coding it.
+# exec (no fork) keeps launchd's job pointed at the python it starts, and passes
+# any extra args straight through.
+set -euo pipefail
+here="$(cd "$(dirname "$0")" && pwd)"
+exec python3 "$here/pervio-orchestrate" schedule tick "$@"

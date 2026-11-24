@@ -1,0 +1,1274 @@
+#!/usr/bin/env python3
+"""pervio-view — read one archived issue on a real screen, and score it there.
+
+  pervio-view --dir <归档目录> [--file <YYYY-MM-DD.md> | --latest]
+              [--idle <秒,默认600>] [--detach] [--open]
+
+Renders ONE issue of a publication as self-contained HTML (styles inlined, no
+network references) and serves it from a 127.0.0.1-only http server on a random
+port. It prints ONE line of JSON — {"url", "pid", "expiresIn"} — and stops
+there: the phone shows that address to the human, who types/clicks it in their
+own browser. Nothing here ever raises a window, moves focus or makes a sound.
+
+Three things carry the weight:
+
+1. The report is UNTRUSTED text. Only the constructs the real archives under
+   ~/.pervio actually use are rendered — h1..h3, `- ` lists, `> ` quotes,
+   `---` rules, exact `<details>`/`<summary>` lines, `[t](url)` links, bare-URL
+   lines, `**b**`, `*i*`, `` `code` `` and "data lines". Everything else is
+   escaped text. A stray `<script>`, an `onerror=` attribute, a `javascript:`
+   href or a forged `<details open onclick=...>` therefore renders as visible
+   characters. A CSP nonce is the second wall: the page's own script is the
+   only script the browser will execute even if the first wall ever cracked.
+
+2. The browser NEVER sends a command. A scoring click posts only
+   {actionIndex, captureGroups, choiceIndex}; the server rebuilds the command
+   from the publication spec's own `actions[].run` template and refuses unless
+   the choice is a member of that action's `menu` and the capture groups are
+   groups that action really matched in THIS report. The command is executed as
+   an argv array — no shell string is ever constructed — with a 30s timeout.
+   Only "/", "/score" and "/alive" exist; there is no path-to-file mapping to
+   traverse.
+
+3. The process kills itself. A watchdog thread inside this very process exits
+   after `--idle` seconds of silence, and unconditionally at the 60-minute
+   ceiling — so a --detach'ed server whose caller (an ssh session, the phone)
+   vanished still dies on schedule instead of becoming somebody else's orphan.
+   Starting up also clears the previous instance recorded in ~/.pervio/view.json
+   — sweep and record happen as ONE locked step so simultaneous launches cannot
+   all survive unrecorded, and the recorded pid is signalled only if it is still
+   a pervio-view BY NAME, never a recycled stranger that merely mentions one.
+
+4. Reading is silent, and "silence" used to mean "gone". The idle clock can only
+   see requests, and a long report is ONE — so the more carefully you read, the
+   sooner the page died under you. The open page therefore says so itself:
+   "/alive" every idle/3 seconds, sent ONLY while that tab is visible. It is the
+   smallest thing that can be an activity signal — same one-shot token as every
+   other request, no body accepted, no file read, no command run, twelve bytes
+   of {"ok": true} back — so somebody who already holds the token gains nothing
+   over the GET "/" they could send instead. Hidden tab or closed window: no
+   requests, the idle clock runs again, the reader exits as it always did. And
+   the ceiling is untouchable from out there: the watchdog compares the deadline
+   BEFORE it looks at the idle clock, so no amount of pinging moves it.
+"""
+import base64
+import contextlib
+import fcntl
+import hmac
+import html
+import json
+import os
+import re
+import secrets
+import select
+import shlex
+import signal
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import socketserver
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+
+class _LoopbackServer(ThreadingHTTPServer):
+    """HTTPServer.server_bind reverse-resolves the bound address (getfqdn →
+    mDNS on macOS), which stalls startup for ~30 s with some resolvers (seen
+    with a Homebrew python on the Mac mini, 2026-10-17). Loopback needs no name."""
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = host
+        self.server_port = port
+
+HOME = os.path.expanduser("~")
+SELF = os.path.realpath(__file__)
+SELF_DIR = os.path.dirname(SELF)
+NAME = "pervio-view"
+PIDFILE = os.path.join(HOME, ".pervio", "view.json")
+LOCKFILE = os.path.join(HOME, ".pervio", "view.lock")
+
+IDLE_DEFAULT = 600
+HARD_CAP = 3600           # 60 minutes, absolute — never negotiable
+KEEPALIVE_MAX = 60        # the visible page never pings more slowly than this
+MAX_REPORT = 2_000_000    # bytes of markdown; beyond this the page says so
+MAX_BODY = 65_536         # bytes of scoring request
+MAX_DETAILS = 16          # <details> nesting honoured; deeper is plain text
+CMD_TIMEOUT = 30
+FILE_RE = re.compile(r"^[A-Za-z0-9._-]+\.md$")
+
+os.umask(0o077)
+
+
+def _die(msg):
+    sys.stderr.write("pervio-view: %s\n" % msg)
+    sys.exit(1)
+
+
+def _keepalive_secs(idle):
+    """How often the OPEN page tells the server that somebody is still reading.
+
+    A THIRD of the window it has to beat, so three pings in a row can be lost —
+    a sleeping laptop, a stalled request, a throttled timer — before the reader
+    is declared gone. Never slower than 60s (the default 600s window pings ten
+    times, which is 11 bytes a minute) and never faster than 1s.
+
+    Derived rather than fixed because --idle belongs to the caller: a fixed 60s
+    timer would never fire once inside a 30s window, and the feature would
+    silently do nothing for exactly the people who asked for the shortest one."""
+    return max(1, min(KEEPALIVE_MAX, idle // 3))
+
+
+def _bin(name):
+    """Sibling binary first (repo checkout / deployed dir), else ~/.pervio/bin —
+    the same resolution pervio-mcp uses."""
+    p = os.path.join(SELF_DIR, name)
+    return p if os.path.exists(p) else os.path.join(HOME, ".pervio", "bin", name)
+
+
+ORCH = _bin("pervio-orchestrate")
+
+# ---------------------------------------------------------------- state
+TOKEN = ""                # one-shot, regenerated every launch
+PAGE = b""                # the whole rendered issue, built once at startup
+ACTIONS = []              # compiled publication actions
+HITS = set()              # (actionIndex, tuple(groups)) actually present in the page
+LAST = [0.0]              # monotonic-ish timestamp of the last authorised request
+INFLIGHT = [0]            # scoring commands running right now
+INFLIGHT_LOCK = threading.Lock()
+CSP = ""
+
+
+# ---------------------------------------------------------------- pid file
+def _proc_cmd(pid):
+    """The command line of `pid`, or "" if there is no such process."""
+    out = ""
+    try:
+        r = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
+                           capture_output=True, text=True, timeout=5)
+        out = (r.stdout or "").strip()
+    except Exception:
+        out = ""
+    if not out:
+        try:
+            with open("/proc/%d/cmdline" % pid, "rb") as f:
+                out = f.read().replace(b"\0", b" ").decode("utf-8", "replace").strip()
+        except OSError:
+            out = ""
+    return out
+
+
+def _forget_pidfile():
+    try:
+        os.remove(PIDFILE)
+    except OSError:
+        pass
+
+
+def _write_pidfile(port):
+    try:
+        os.makedirs(os.path.dirname(PIDFILE), exist_ok=True)
+        tmp = "%s.tmp.%d" % (PIDFILE, os.getpid())
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"pid": os.getpid(), "port": port, "name": NAME,
+                       "started": int(time.time())}, f)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, PIDFILE)
+    except OSError:
+        pass          # a read-only home must not stop the reader from working
+
+
+def _drop_pidfile():
+    try:
+        with open(PIDFILE, encoding="utf-8") as f:
+            d = json.load(f)
+        if isinstance(d, dict) and d.get("pid") == os.getpid():
+            os.remove(PIDFILE)
+    except Exception:
+        pass
+
+
+def _is_ours(pid):
+    """True iff `pid` really is a pervio-view. The command line is TOKENISED and
+    the program word compared EXACTLY (basename == NAME, and only in argv[0] or
+    the script slot right after the interpreter). A substring test would aim a
+    SIGKILL at a recycled pid that merely MENTIONS the string — an editor with
+    this file open, a `grep -rn pervio-view`, another agent's argv — and pids do
+    get recycled, which is the whole reason this gate exists."""
+    toks = _proc_cmd(pid).split()
+    for i, tok in enumerate(toks[:2]):
+        if os.path.basename(tok) == NAME and (i == 0 or "/" in tok):
+            return True
+    return False
+
+
+def _kill_leftover():
+    """Clear the previous instance on this machine. Two gates before any signal
+    is sent: the pid must come from OUR pid file, and that pid must still be a
+    pervio-view by name. Callers hold the claim lock — see _claim()."""
+    try:
+        with open(PIDFILE, encoding="utf-8") as f:
+            d = json.load(f)
+    except Exception:
+        return
+    pid = d.get("pid") if isinstance(d, dict) else None
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1 \
+            or pid == os.getpid():
+        _forget_pidfile()
+        return
+    if not _is_ours(pid):
+        _forget_pidfile()
+        return
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.kill(pid, sig)
+        except OSError:
+            break
+        t0 = time.time()
+        while time.time() - t0 < 3:
+            if not _is_ours(pid):
+                break
+            time.sleep(0.1)
+        if not _is_ours(pid):
+            break
+    _forget_pidfile()
+
+
+@contextlib.contextmanager
+def _pid_lock():
+    """Serialise the whole claim across processes. flock is released by the
+    kernel when the fd closes or the holder dies, so a launcher killed mid-claim
+    cannot wedge the next one. A home we cannot write degrades to no lock rather
+    than to no reader — same rule as _write_pidfile."""
+    fd = -1
+    try:
+        os.makedirs(os.path.dirname(LOCKFILE), exist_ok=True)
+        fd = os.open(LOCKFILE, os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except OSError:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        fd = -1
+    try:
+        yield
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)          # closing releases the flock
+            except OSError:
+                pass
+
+
+def _claim(port):
+    """Become THE pervio-view of this machine: clear the instance the pid file
+    names and record ourselves in its place — both halves under ONE lock, and
+    only once this process is ready to serve.
+
+    Apart, the two halves are a TOCTOU with teeth: launch three at the same
+    instant and all three read the same empty pid file, all three survive, and
+    only the last is recorded — the other two are then unreachable forever,
+    since every later launch can only ever see the one pid on file."""
+    with _pid_lock():
+        _kill_leftover()
+        _write_pidfile(port)
+
+
+# ---------------------------------------------------------------- actions
+def _compile_actions(raw):
+    """Mirror of the App's CompiledAction.compile: an action needs a usable
+    regex, a non-empty menu and a run template that tokenises. Anything else is
+    dropped rather than half-honoured."""
+    out = []
+    for a in raw if isinstance(raw, list) else []:
+        if not isinstance(a, dict):
+            continue
+        pat, menu, run = a.get("match"), a.get("menu"), a.get("run")
+        if not (isinstance(pat, str) and pat and isinstance(run, str) and run.strip()):
+            continue
+        if not (isinstance(menu, list) and menu
+                and all(isinstance(x, str) and x for x in menu)):
+            continue
+        try:
+            rx = re.compile(pat)
+        except re.error:
+            continue
+        try:
+            toks = shlex.split(run)
+        except ValueError:
+            continue
+        if not toks:
+            continue
+        out.append({"re": rx, "menu": list(menu), "toks": toks})
+    return out
+
+
+def _load_actions(dirpath):
+    """The publication's actions, from `pervio-orchestrate archives list`. A
+    missing/failing orchestrate is not fatal — the issue still reads, it just
+    has no scoring buttons."""
+    try:
+        r = subprocess.run([sys.executable, ORCH, "archives", "list"],
+                           capture_output=True, text=True, timeout=30)
+        items = json.loads(r.stdout or "[]")
+    except Exception:
+        return []
+    for it in items if isinstance(items, list) else []:
+        if not isinstance(it, dict) or not isinstance(it.get("dir"), str):
+            continue
+        try:
+            key = os.path.realpath(os.path.expanduser(it["dir"]))
+        except Exception:
+            continue
+        if key == dirpath:
+            return _compile_actions(it.get("actions"))
+    return []
+
+
+def _first_hit(text):
+    """First action whose regex hits `text`, with that match's capture groups —
+    byte-for-byte the App's firstHit (unmatched optional groups become "")."""
+    if not text:
+        return None
+    for i, a in enumerate(ACTIONS):
+        m = a["re"].search(text)
+        if m is None:
+            continue
+        return i, [g if g is not None else "" for g in m.groups()]
+    return None
+
+
+PLACEHOLDER = re.compile(r"\{(choice|[1-9])\}")
+
+
+def _build_argv(toks, groups, choice):
+    """The command as an ARGV ARRAY. The template's own words are split once
+    (at compile time); placeholders are then filled in a single left-to-right
+    pass per token, so a value containing "{choice}", a space, a quote or a
+    ';' stays exactly one argument and is never rescanned. A leading '~' is
+    expanded on the TEMPLATE token only — never on a substituted value."""
+    argv = []
+    for tok in toks:
+        if tok.startswith("~"):
+            tok = os.path.expanduser(tok)
+        parts = []
+        i = 0
+        while i < len(tok):
+            m = PLACEHOLDER.match(tok, i)
+            if m is None:
+                parts.append(tok[i])
+                i += 1
+                continue
+            key = m.group(1)
+            if key == "choice":
+                parts.append(choice)
+            else:
+                n = int(key)
+                parts.append(groups[n - 1] if n <= len(groups) else "")
+            i = m.end()
+        argv.append("".join(parts))
+    return argv
+
+
+def _run_argv(argv):
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True,
+                           timeout=CMD_TIMEOUT, cwd=HOME)
+    except subprocess.TimeoutExpired:
+        return 124, "", "超时(%ds)" % CMD_TIMEOUT
+    except OSError as e:
+        return 127, "", str(e)
+    return p.returncode, (p.stdout or "")[-4000:], (p.stderr or "")[-4000:]
+
+
+# ---------------------------------------------------------------- markdown
+HEADING_RE = re.compile(r"^(#{1,6})\s+(.*\S)\s*$")
+BULLET_RE = re.compile(r"^\s*[-*]\s+(.+?)\s*$")
+QUOTE_RE = re.compile(r"^>\s?(.*)$")
+# 方法图行(2026-08-27):整行 ![alt](https://arxiv.org/…) 才算,其余照旧走
+# prose 转义——与链接同一套不信任姿态。
+IMG_LINE = re.compile(r"^!\[([^\]]*)\]\((https://arxiv\.org/[^)\s]+)\)$")
+RULE_RE = re.compile(r"^\s*(-{3,}|\*{3,}|_{3,})\s*$")
+SUMMARY_RE = re.compile(r"^<summary>(.*)</summary>$")
+INLINE_RE = re.compile(r"""
+      (?P<code>`[^`\n]+`)
+    | (?P<link>\[(?P<lt>[^\]\n]+)\]\((?P<lu>[^)\s]+)\))
+    | (?P<bold>\*\*(?P<bt>[^*\n]+)\*\*)
+    | (?P<em>\*(?P<et>[^*\n]+)\*)
+    | (?P<url>https?://[^\s<>()\[\]{}"'，。、；]+)
+""", re.X)
+
+
+def _esc(s):
+    return html.escape(s, quote=True)
+
+
+def _safe_url(u):
+    """http/https only, no whitespace or control characters. This is what stops
+    `javascript:` and `data:` hrefs — those render as plain text instead."""
+    if not isinstance(u, str) or len(u) > 2000:
+        return False
+    if not u.lower().startswith(("http://", "https://")):
+        return False
+    return not any(c.isspace() or ord(c) < 0x20 for c in u)
+
+
+def _anchor(url, label, cls=""):
+    return ('<a %shref="%s" target="_blank" rel="noopener noreferrer">%s</a>'
+            % (('class="%s" ' % cls) if cls else "", _esc(url), _esc(label)))
+
+
+def inline(text):
+    """Inline markdown -> HTML. Every literal run goes through _esc, and each
+    construct is emitted from its PARSED pieces, so no attacker-controlled byte
+    ever reaches the output unescaped."""
+    out = []
+    pos = 0
+    for m in INLINE_RE.finditer(text):
+        out.append(_esc(text[pos:m.start()]))
+        pos = m.end()
+        if m.group("code") is not None:
+            out.append("<code>%s</code>" % _esc(m.group("code")[1:-1]))
+        elif m.group("link") is not None:
+            u = m.group("lu")
+            out.append(_anchor(u, m.group("lt")) if _safe_url(u)
+                       else _esc(m.group("link")))
+        elif m.group("bold") is not None:
+            out.append("<strong>%s</strong>" % _esc(m.group("bt")))
+        elif m.group("em") is not None:
+            out.append("<em>%s</em>" % _esc(m.group("et")))
+        else:
+            whole = m.group("url")
+            u = whole.rstrip(".,;:!?)]}")
+            out.append(_anchor(u, u) if _safe_url(u) else _esc(u))
+            out.append(_esc(whole[len(u):]))
+    out.append(_esc(text[pos:]))
+    return "".join(out)
+
+
+def _bare_url_line(t):
+    """The line is nothing but one URL — the App turns those into chips."""
+    if any(c.isspace() for c in t) or not _safe_url(t):
+        return None
+    return t
+
+
+def _chip_label(url):
+    """owner/name for a github URL, the bare host otherwise — same rule as the
+    App's linkLabel, so the two readers name a chip identically."""
+    try:
+        p = urllib.parse.urlsplit(url)
+    except ValueError:
+        return url
+    host = (p.hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if host == "github.com":
+        segs = [s for s in p.path.split("/") if s][:2]
+        if len(segs) == 2:
+            return "/".join(segs)
+    return host or url
+
+
+def _is_data_line(t):
+    """A "data line": short, `·`-separated, carries digits, no links, no
+    sentence-ending punctuation. Conservative on purpose (the App's rule)."""
+    return (" · " in t and len(t) <= 64 and any(c.isdigit() for c in t)
+            and "http" not in t and "](" not in t and "。" not in t)
+
+
+def parse_blocks(lines, i=0, depth=0):
+    """Markdown -> block list. `<details>`/`</details>` are honoured only as
+    EXACT whole lines (that is how the generators write them); a `<details open
+    onclick=...>` is not that line, so it stays prose and gets escaped. An
+    unmatched `</details>` at depth 0 is prose too, and an unclosed `<details>`
+    is closed at EOF — the output can never carry an unbalanced tag.
+
+    Nesting is capped at MAX_DETAILS. This recurses (and so does blocks_html),
+    and the report is untrusted by contract: a file with a thousand nested
+    `<details>` would otherwise be a RecursionError — the reader dying on input
+    somebody else wrote. Past the cap the line is simply not that construct any
+    more, so it renders as the visible text `<details>`, like every other
+    unsupported line. Real archives nest one level."""
+    out = []
+    para, items, quote = [], [], []
+
+    def flush():
+        if para:
+            out.append({"k": "p", "t": "\n".join(para)})
+            del para[:]
+        if items:
+            out.append({"k": "ul", "items": list(items)})
+            del items[:]
+        if quote:
+            out.append({"k": "quote", "t": "\n".join(quote)})
+            del quote[:]
+
+    while i < len(lines):
+        raw = lines[i]
+        t = raw.strip()
+        if t == "</details>" and depth > 0:
+            flush()
+            return out, i + 1
+        if t == "<details>" and depth < MAX_DETAILS:
+            flush()
+            i += 1
+            summary = ""
+            if i < len(lines):
+                m = SUMMARY_RE.match(lines[i].strip())
+                if m is not None:
+                    summary = m.group(1)
+                    i += 1
+            inner, i = parse_blocks(lines, i, depth + 1)
+            out.append({"k": "details", "summary": summary, "blocks": inner})
+            continue
+        if not t:
+            flush()
+            i += 1
+            continue
+        m = IMG_LINE.match(t)
+        if m is not None:
+            # 方法图(2026-08-27):晨报嵌的作者原图。只认整行、只认 arxiv;
+            # 其余一切照旧走 prose 转义——和链接同一套不信任姿态。
+            flush()
+            out.append({"k": "img", "alt": m.group(1), "url": m.group(2)})
+            i += 1
+            continue
+        m = HEADING_RE.match(t)
+        if m is not None:
+            flush()
+            out.append({"k": "h", "level": len(m.group(1)), "t": m.group(2)})
+            i += 1
+            continue
+        if RULE_RE.match(t) is not None:
+            flush()
+            out.append({"k": "rule"})
+            i += 1
+            continue
+        m = BULLET_RE.match(raw)
+        if m is not None:
+            if para or quote:
+                flush()
+            items.append(m.group(1))
+            i += 1
+            continue
+        m = QUOTE_RE.match(t)
+        if m is not None:
+            if para or items:
+                flush()
+            quote.append(m.group(1))
+            i += 1
+            continue
+        u = _bare_url_line(t)
+        if u is not None:
+            flush()
+            out.append({"k": "chip", "url": u, "label": _chip_label(u), "t": t})
+            i += 1
+            continue
+        if _is_data_line(t):
+            flush()
+            out.append({"k": "data", "t": t})
+            i += 1
+            continue
+        if items or quote:
+            flush()
+        para.append(t)
+        i += 1
+    flush()
+    return out, i
+
+
+def _argv_safe(groups):
+    """A capture group comes out of the UNTRUSTED report and goes in as an ARGV
+    ELEMENT of whatever the run template names — so a value starting with '-'
+    can be read by that program as a FLAG rather than as a value.
+
+    There is no `--` separator to hide behind: pervio-feedback, the real target
+    of the paper-digest action, parses only `--<known-key> value` pairs and dies
+    on a bare `--` ("unknown/malformed arg: --"), so inserting one would break
+    the very command this is meant to protect — and the templates are free-form,
+    so no separator is right for all of them. The shape is refused instead: a
+    block whose match yields such a group gets no buttons, and /score says no."""
+    return all(isinstance(g, str) and not g.startswith("-") for g in groups)
+
+
+def _acts_html(text):
+    """The button group for whatever action this block's RAW markdown hits.
+    The buttons carry indices only — no command, no template, no path — and the
+    (action, groups) pair is remembered so /score can refuse anything the page
+    never actually offered."""
+    hit = _first_hit(text)
+    if hit is None:
+        return ""
+    ai, groups = hit
+    if not _argv_safe(groups):
+        return ""
+    HITS.add((ai, tuple(groups)))
+    btns = "".join(
+        '<button type="button" class="act" data-choice="%d">%s</button>'
+        % (i, _esc(lbl)) for i, lbl in enumerate(ACTIONS[ai]["menu"]))
+    return ('<span class="acts" data-action="%d" data-groups="%s">%s</span>'
+            % (ai, _esc(json.dumps(groups, ensure_ascii=False)), btns))
+
+
+FIG_DIR = os.path.join(os.path.expanduser("~"), ".pervio", "papers", "figures")
+FIG_ID = re.compile(r"/html/(\d{4}\.\d{4,5})v")
+
+
+def _fig_local(url):
+    """出刊时 Mac 已把图缓存到本地——桌面读者从自己身上取,秒开;缓存缺席
+    才让浏览器直连 arxiv(慢,但那是兜底该有的样子)。"""
+    m = FIG_ID.search(url)
+    if not m:
+        return None
+    import glob as _glob
+    hits = _glob.glob(os.path.join(FIG_DIR, m.group(1) + ".*"))
+    return m.group(1) if hits else None
+
+
+def _img_html(b):
+    url = b["url"]
+    if not _safe_url(url):
+        return "<p>%s</p>" % _esc("![%s](%s)" % (b.get("alt", ""), url))
+    fid = _fig_local(url)
+    src = ("/fig/%s?t=%s" % (fid, TOKEN)) if fid else url
+    cap = ('<figcaption>%s</figcaption>' % _esc(b["alt"])) if b.get("alt") else ""
+    return ('<figure class="mfig"><img src="%s" alt="%s" loading="lazy">%s</figure>'
+            % (_esc(src), _esc(b.get("alt", "")), cap))
+
+
+def blocks_html(blocks):
+    out = []
+    for b in blocks:
+        k = b["k"]
+        if k == "h":
+            lvl = min(b["level"], 4)
+            out.append("<h%d>%s%s</h%d>"
+                       % (lvl, inline(b["t"]), _acts_html(b["t"]), lvl))
+        elif k == "p":
+            out.append("<p>%s%s</p>" % (inline(b["t"]), _acts_html(b["t"])))
+        elif k == "ul":
+            out.append("<ul>%s</ul>" % "".join(
+                "<li>%s%s</li>" % (inline(x), _acts_html(x)) for x in b["items"]))
+        elif k == "quote":
+            out.append("<blockquote>%s%s</blockquote>"
+                       % (inline(b["t"]), _acts_html(b["t"])))
+        elif k == "rule":
+            out.append("<hr>")
+        elif k == "img":
+            out.append(_img_html(b))
+        elif k == "data":
+            out.append('<div class="data">%s%s</div>'
+                       % (inline(b["t"]), _acts_html(b["t"])))
+        elif k == "chip":
+            out.append('<div class="chipline">%s%s</div>'
+                       % (_anchor(b["url"], b["label"], "chip"), _acts_html(b["t"])))
+        elif k == "details":
+            out.append('<details class="fold"><summary>%s</summary>'
+                       '<div class="foldbody">%s</div></details>'
+                       % (inline(b["summary"]), blocks_html(b["blocks"])))
+    return "".join(out)
+
+
+def sections_html(blocks):
+    """`##` starts a card, `#` stays the page title — the App's report layout."""
+    out = []
+    card = []
+    open_card = [False]
+
+    def close():
+        if not open_card[0]:
+            return
+        while card and card[0] == "<hr>":
+            card.pop(0)
+        while card and card[-1] == "<hr>":
+            card.pop()
+        out.append('<section class="card">%s</section>' % "".join(card))
+        del card[:]
+        open_card[0] = False
+
+    for b in blocks:
+        if b["k"] == "h" and b["level"] == 1:
+            close()
+            out.append(blocks_html([b]))
+        elif b["k"] == "h" and b["level"] == 2:
+            close()
+            card.append(blocks_html([b]))
+            open_card[0] = True
+        elif open_card[0]:
+            card.append(blocks_html([b]))
+        elif b["k"] == "rule":
+            continue
+        else:
+            out.append('<div class="lede">%s</div>' % blocks_html([b]))
+    close()
+    return "".join(out)
+
+
+CSS = """
+:root{--bg:#f6f6f4;--card:#fff;--ink:#1c1c1e;--dim:#6b6b70;--line:#e3e3e0;
+      --accent:#3b6ea5;--chip:#eef2f7}
+@media (prefers-color-scheme:dark){
+ :root{--bg:#141416;--card:#1d1d20;--ink:#ececf0;--dim:#9a9aa2;--line:#2c2c31;
+       --accent:#7aa9dd;--chip:#25262b}}
+*{box-sizing:border-box}
+body{margin:0;padding:32px 20px 96px;background:var(--bg);color:var(--ink);
+ font:16px/1.75 -apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",
+ "Segoe UI",sans-serif;-webkit-font-smoothing:antialiased}
+main{max-width:760px;margin:0 auto}
+h1{font-size:30px;line-height:1.35;margin:0 0 6px;letter-spacing:-.01em}
+h2{font-size:15px;margin:0 0 14px;color:var(--dim);letter-spacing:.14em;
+ text-transform:uppercase;font-weight:600}
+h3{font-size:20px;line-height:1.45;margin:22px 0 6px;font-weight:650}
+h4{font-size:17px;margin:18px 0 6px}
+p{margin:10px 0}
+a{color:var(--accent);text-underline-offset:3px}
+.lede{margin:0 auto 18px}
+.lede blockquote{margin:0}
+.mfig{margin:10px 0}.mfig img{max-width:100%;border-radius:8px;display:block}.mfig figcaption{font-size:12px;color:#8a8f98;margin-top:4px}
+section.card{background:var(--card);border:1px solid var(--line);border-radius:16px;
+ padding:20px 22px;margin:16px 0}
+blockquote{margin:12px 0;padding:2px 0 2px 14px;border-left:3px solid var(--line);
+ color:var(--dim)}
+ul{margin:10px 0;padding-left:20px}
+li{margin:8px 0}
+hr{border:0;border-top:1px solid var(--line);margin:18px 0}
+code{background:var(--chip);border-radius:5px;padding:1px 6px;font-size:13px;
+ font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.data{font-size:12.5px;color:var(--dim);margin:6px 0;letter-spacing:.01em}
+.chipline{margin:8px 0}
+a.chip{display:inline-block;background:var(--chip);border:1px solid var(--line);
+ border-radius:999px;padding:2px 12px;font-size:12.5px;text-decoration:none;
+ color:var(--dim)}
+details.fold{margin:12px 0;border-top:1px solid var(--line);padding-top:10px}
+details.fold>summary{cursor:pointer;color:var(--dim);font-size:14px}
+.foldbody{padding-top:4px}
+.acts{display:inline-flex;gap:6px;margin-left:8px;vertical-align:middle}
+.acts.done{opacity:.45}
+button.act{font:inherit;font-size:12.5px;line-height:1.6;background:var(--chip);
+ color:var(--dim);border:1px solid var(--line);border-radius:999px;
+ padding:0 10px;cursor:pointer}
+button.act:hover{color:var(--ink)}
+button.act[disabled]{opacity:.4;cursor:default}
+.warn{background:#fff4d6;border:1px solid #f0dca8;color:#6a5410;border-radius:12px;
+ padding:10px 14px;margin:12px 0;font-size:14px}
+@media (prefers-color-scheme:dark){.warn{background:#3a3118;border-color:#5b4d22;
+ color:#e8d9a8}}
+.foot{max-width:760px;margin:26px auto 0;color:var(--dim);font-size:12.5px}
+.toast{position:fixed;left:50%;bottom:24px;transform:translate(-50%,14px);
+ background:var(--ink);color:var(--bg);border-radius:10px;padding:9px 16px;
+ font-size:14px;opacity:0;pointer-events:none;transition:.18s}
+.toast.show{opacity:1;transform:translate(-50%,0)}
+.toast.bad{background:#a5342b;color:#fff}
+"""
+
+JS = """
+(function(){
+  var t = new URLSearchParams(location.search).get('t') || '';
+  var toast = document.getElementById('toast'), timer = 0;
+  function say(msg, bad){
+    toast.textContent = msg;
+    toast.className = bad ? 'toast bad show' : 'toast show';
+    clearTimeout(timer);
+    timer = setTimeout(function(){ toast.className = 'toast'; }, 4000);
+  }
+  document.addEventListener('click', function(e){
+    var b = e.target.closest ? e.target.closest('button.act') : null;
+    if (!b || b.disabled) return;
+    var g = b.parentElement;
+    if (!g || g.className.indexOf('acts') < 0) return;
+    var body;
+    try {
+      body = JSON.stringify({
+        actionIndex: parseInt(g.getAttribute('data-action'), 10),
+        captureGroups: JSON.parse(g.getAttribute('data-groups')),
+        choiceIndex: parseInt(b.getAttribute('data-choice'), 10)
+      });
+    } catch (err) { say('\\u8bfb\\u4e0d\\u51fa\\u9009\\u9879', true); return; }
+    b.disabled = true;
+    fetch('/score?t=' + encodeURIComponent(t), {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: body
+    }).then(function(r){
+      return r.json().catch(function(){ return {}; })
+              .then(function(j){ return {s: r.status, j: j}; });
+    }).then(function(o){
+      b.disabled = false;
+      if (o.s === 200 && o.j && o.j.ok) {
+        g.className = 'acts done';
+        say('\\u5df2\\u8bb0\\u4e0b\\uff1a' + b.textContent);
+      } else {
+        say('\\u6ca1\\u8bb0\\u4e0a\\uff1a' + ((o.j && o.j.error) || o.s), true);
+      }
+    }).catch(function(err){ b.disabled = false; say('' + err, true); });
+  });
+
+  // Reading is silent, and the server can only see requests: a long report is
+  // one GET and then nothing at all, so an idle clock that watches the wire
+  // counts the most careful reader as the one who walked away. The page says
+  // otherwise itself — but only when it is actually being looked at. The timer
+  // keeps ticking in a hidden tab (browsers throttle it to a crawl anyway);
+  // what stops is the REQUEST, in the one gate below, so a backgrounded window
+  // or another desktop leaves the idle clock running from the last thing a
+  // human really did, and the reader exits on schedule as it always has.
+  // Closing the page takes the timer with it. The ping carries the same
+  // one-shot token as everything else, asks for nothing, and cannot outlast the
+  // absolute ceiling — the watchdog checks that before it looks at the clock.
+  //
+  // And it gives up. A reader whose server has already exited is a tab that
+  // would otherwise knock on a loopback port forever — a port the OS will hand
+  // to some unrelated local service sooner or later, and the knock carries this
+  // page's token in its query string. Three consecutive failures stop the timer
+  // for good. Three and not one, so a single hiccup cannot end the keepalive;
+  // and by the third the loopback has been refusing for three whole intervals —
+  // the entire idle window wherever the interval is idle/3, three minutes at
+  // the 60s cap. Nothing on 127.0.0.1 does that except a process that has gone.
+  var kaTimer = 0, kaMiss = 0;
+  function kaStop(){ if (kaTimer) { clearInterval(kaTimer); kaTimer = 0; } }
+  function kaMissed(){ if (++kaMiss >= 3) kaStop(); }
+  function ping(){
+    if (document.visibilityState !== 'visible') return;
+    fetch('/alive?t=' + encodeURIComponent(t), {cache: 'no-store'})
+      .then(function(r){ if (r.ok) { kaMiss = 0; } else { kaMissed(); } })
+      .catch(kaMissed);
+  }
+  document.addEventListener('visibilitychange', function(){ if (kaTimer) ping(); });
+  kaTimer = setInterval(ping, __KA__ * 1000);
+})();
+"""
+
+
+def render(md, truncated, issue, nonce, keepalive):
+    blocks, _ = parse_blocks(md.split("\n"))
+    body = sections_html(blocks)
+    warn = ('<div class="warn">报告超过 %d 字节,已截断显示;完整内容仍在服务器上。</div>'
+            % MAX_REPORT) if truncated else ""
+    foot = ('<div class="foot">%s · 本页只在本机 127.0.0.1 上,闲置后自动关闭。</div>'
+            % _esc(issue))
+    # int() and not the caller's value verbatim: the only thing that reaches the
+    # page is a number this program computed, so the placeholder cannot become a
+    # way to write javascript into the one script the CSP nonce trusts.
+    js = JS.replace("__KA__", str(int(keepalive)))
+    return ("<!doctype html>\n<html lang=\"zh\">\n<head>\n"
+            "<meta charset=\"utf-8\">\n"
+            "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n"
+            "<meta name=\"referrer\" content=\"no-referrer\">\n"
+            "<title>%s</title>\n<style nonce=\"%s\">%s</style>\n</head>\n<body>\n"
+            "<main>%s%s</main>\n%s\n<div id=\"toast\" class=\"toast\"></div>\n"
+            "<script nonce=\"%s\">%s</script>\n</body>\n</html>\n"
+            % (_esc(issue), nonce, CSS, warn, body, foot, nonce, js))
+
+
+# ---------------------------------------------------------------- http
+class Handler(BaseHTTPRequestHandler):
+    server_version = "pervio-view"
+    sys_version = ""
+
+    def log_message(self, *a):
+        pass                      # a reader must be silent; stdout is the JSON line
+
+    def _send(self, code, body, ctype="application/json; charset=utf-8"):
+        data = body if isinstance(body, bytes) else body.encode("utf-8")
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Content-Security-Policy", CSP)
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+        except OSError:
+            pass
+
+    def _err(self, code, msg):
+        self._send(code, json.dumps({"ok": False, "error": msg}, ensure_ascii=False))
+
+    def _authed(self):
+        """Every request carries the one-shot token or gets nothing. Also the
+        only place the idle clock is reset — an unauthenticated knock from
+        anything else on the box must not keep the reader alive."""
+        got = urllib.parse.parse_qs(
+            urllib.parse.urlsplit(self.path).query).get("t", [""])[0]
+        got = got.encode("ascii", "replace").decode("ascii")
+        if not hmac.compare_digest(got, TOKEN):
+            self._err(403, "forbidden")
+            return False
+        LAST[0] = time.time()
+        return True
+
+    def do_GET(self):
+        if not self._authed():
+            return
+        path = urllib.parse.urlsplit(self.path).path
+        if path == "/alive":
+            # The open page's keepalive. Its entire job is the line ABOVE this
+            # one: _authed() has already moved LAST[0], the single place in this
+            # program where the idle clock is touched, and it did so only
+            # because the token matched. Everything else about this branch is
+            # deliberately nothing — no body is read, no file is named, no
+            # command is built, and the answer carries twelve bytes that are the
+            # same for every reader and every report. A caller who holds the
+            # token could keep the reader alive with GET "/" anyway; this is
+            # only the cheap way to do it. A caller who does not never reaches
+            # here, and the 403 above leaves the clock where it was.
+            self._send(200, json.dumps({"ok": True}))
+            return
+        if path.startswith("/fig/"):
+            fid = path[len("/fig/"):]
+            if not re.match(r"^\d{4}\.\d{4,5}$", fid):
+                self._err(404, "not found")
+                return
+            import glob as _glob
+            hits = _glob.glob(os.path.join(FIG_DIR, fid + ".*"))
+            if not hits:
+                self._err(404, "not found")
+                return
+            ext = os.path.splitext(hits[0])[1].lower()
+            ctype = {".png": "image/png", ".jpg": "image/jpeg",
+                     ".jpeg": "image/jpeg", ".gif": "image/gif",
+                     ".webp": "image/webp"}.get(ext, "application/octet-stream")
+            try:
+                with open(hits[0], "rb") as f:
+                    self._send(200, f.read(), ctype)
+            except OSError:
+                self._err(404, "not found")
+            return
+        if path != "/":
+            self._err(404, "not found")
+            return
+        self._send(200, PAGE, "text/html; charset=utf-8")
+
+    def do_POST(self):
+        if not self._authed():
+            return
+        if urllib.parse.urlsplit(self.path).path != "/score":
+            self._err(404, "not found")
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = -1
+        if length < 0 or length > MAX_BODY:
+            self._drain(length)
+            self._err(413, "body too large")
+            return
+        raw = self.rfile.read(length) if length else b""
+        try:
+            req = json.loads(raw.decode("utf-8"))
+        except Exception:
+            self._err(400, "malformed request")
+            return
+        if not isinstance(req, dict):
+            self._err(400, "malformed request")
+            return
+        # ONLY these three keys are read. A body carrying "command"/"run"/"argv"
+        # is not rejected, it is simply irrelevant — there is no code path that
+        # could ever look at it.
+        ai = req.get("actionIndex")
+        cg = req.get("captureGroups")
+        ci = req.get("choiceIndex")
+        if isinstance(ai, bool) or isinstance(ci, bool):
+            self._err(400, "actionIndex/choiceIndex must be numbers")
+            return
+        if not (isinstance(ai, int) and 0 <= ai < len(ACTIONS)):
+            self._err(400, "unknown action")
+            return
+        act = ACTIONS[ai]
+        menu = act["menu"]
+        if not (isinstance(ci, int) and 0 <= ci < len(menu)):
+            self._err(400, "choice is not on this action's menu")
+            return
+        if not (isinstance(cg, list) and all(isinstance(x, str) for x in cg)):
+            self._err(400, "captureGroups must be strings")
+            return
+        if not _argv_safe(cg):
+            self._err(400, "a capture group would arrive as a flag")
+            return
+        if (ai, tuple(cg)) not in HITS:
+            self._err(400, "capture groups do not match this report")
+            return
+        argv = _build_argv(act["toks"], list(cg), menu[ci])
+        with INFLIGHT_LOCK:
+            INFLIGHT[0] += 1
+        try:
+            rc, out, err = _run_argv(argv)
+        finally:
+            with INFLIGHT_LOCK:
+                INFLIGHT[0] -= 1
+            LAST[0] = time.time()
+        self._send(200 if rc == 0 else 502, json.dumps(
+            {"ok": rc == 0, "rc": rc, "output": out.strip(),
+             "error": (err or out).strip()[:400] if rc != 0 else ""},
+            ensure_ascii=False))
+
+    def _drain(self, length):
+        left = min(max(length, 0), 8_000_000)
+        while left > 0:
+            chunk = self.rfile.read(min(left, 65536))
+            if not chunk:
+                break
+            left -= len(chunk)
+
+
+# ---------------------------------------------------------------- lifecycle
+def _watchdog(idle, deadline):
+    """Self-owned: this thread lives inside the served process, so it fires
+    whether the caller is still attached, gone, or never existed.
+
+    A scoring command still running is not idleness — a click at second 599 of
+    a 600s window must not have its write killed halfway, and since each command
+    is capped at 30s the wait it can add is bounded. The ABSOLUTE ceiling is not
+    negotiable that way: it fires in flight or not, and a command caught by it
+    is simply left to finish on its own (it is a separate process; what dies
+    here is only our ability to report its result)."""
+    while True:
+        time.sleep(0.25)
+        now = time.time()
+        if now >= deadline or (INFLIGHT[0] == 0 and now - LAST[0] >= idle):
+            _drop_pidfile()
+            os._exit(0)
+
+
+def _start_watchdog(idle, deadline):
+    _wd = threading.Thread(target=_watchdog, args=(idle, deadline), daemon=True)
+    _wd.start()
+
+
+def _install_signals():
+    def bye(signum, frame):
+        _drop_pidfile()
+        os._exit(0)
+    for s in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(s, bye)
+        except (ValueError, OSError):
+            pass
+
+
+def _silence_stdio():
+    fd = os.open(os.devnull, os.O_RDWR)
+    for target in (0, 1, 2):
+        try:
+            os.dup2(fd, target)
+        except OSError:
+            pass
+    if fd > 2:
+        os.close(fd)
+
+
+def _raise_on_desktop(url):
+    """Hand the address to the Mac's default browser.
+
+    Verified 2026-08-07 through a real NON-INTERACTIVE ssh exec channel (the
+    same shape the phone uses): `open` reaches the GUI session and the page
+    appears. `-g` keeps the browser from stealing focus — you asked for the
+    report, not for your foreground app to change.
+
+    Best-effort by design: the JSON line with the url is printed either way, so
+    a machine where this fails (a Linux server, a locked screen) still gives the
+    phone something to show. Never raises.
+    """
+    if sys.platform != "darwin":
+        return False, "not macOS"
+    try:
+        p = subprocess.run(["open", "-g", url], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.PIPE, timeout=10)
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, str(e)[:120]
+    if p.returncode != 0:
+        return False, (p.stderr or b"").decode("utf-8", "replace").strip()[:120]
+    return True, ""
+
+
+# ---------------------------------------------------------------- cli
+def parse_args(argv):
+    o = {"dir": "", "file": "", "latest": False, "idle": IDLE_DEFAULT,
+         "detach": False, "open": False}
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("--latest", "--detach", "--open"):
+            o[a[2:]] = True
+            i += 1
+        elif a in ("--dir", "--file", "--idle") and i + 1 < len(argv):
+            o[a[2:]] = argv[i + 1]
+            i += 2
+        else:
+            _die("unknown/malformed arg: %s" % a)
+    if not o["dir"].strip():
+        _die("--dir is required")
+    if o["file"] and o["latest"]:
+        _die("--file and --latest are mutually exclusive")
+    try:
+        o["idle"] = int(o["idle"])
+    except (TypeError, ValueError):
+        _die("--idle must be a whole number of seconds")
+    if o["idle"] < 1:
+        _die("--idle must be at least 1 second")
+    o["idle"] = min(o["idle"], HARD_CAP)
+    return o
+
+
+def resolve_issue(o):
+    d = os.path.realpath(os.path.expanduser(o["dir"]))
+    if not os.path.isdir(d):
+        _die("no such archive dir: %s" % o["dir"])
+    if o["file"]:
+        if not FILE_RE.match(o["file"]):
+            _die("--file must be a plain dated name like 2026-08-06.md")
+        path = os.path.join(d, o["file"])
+        if os.path.dirname(os.path.realpath(path)) != d or not os.path.isfile(path):
+            _die("no such issue in that dir: %s" % o["file"])
+        return d, path
+    names = []
+    for fn in os.listdir(d):
+        if not FILE_RE.match(fn):
+            continue
+        p = os.path.join(d, fn)
+        try:
+            # The SAME containment gate --file enforces. A symlink in the archive
+            # dir is a file from OUTSIDE it wearing an issue's name; --latest
+            # picking it by mtime would serve that file on a port, so whoever can
+            # write this directory must not be able to choose what is read.
+            if os.path.dirname(os.path.realpath(p)) != d or not os.path.isfile(p):
+                continue
+            names.append((os.path.getmtime(p), p))
+        except OSError:
+            continue
+    if not names:
+        _die("that archive dir has no issues yet: %s" % o["dir"])
+    names.sort(key=lambda x: (-x[0], x[1]))
+    return d, names[0][1]
+
+
+def read_report(path):
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(MAX_REPORT + 1)
+    except OSError as e:
+        _die("cannot read the issue: %s" % e)
+    truncated = len(raw) > MAX_REPORT
+    if truncated:
+        raw = raw[:MAX_REPORT]
+    text = raw.decode("utf-8", "replace")
+    if truncated:
+        text = text[:text.rfind("\n") + 1] if "\n" in text else text
+    return text, truncated
+
+
+def main(argv):
+    global TOKEN, PAGE, ACTIONS, CSP
+    o = parse_args(argv)
+    d, path = resolve_issue(o)
+    md, truncated = read_report(path)
+    ACTIONS = _load_actions(d)
+    TOKEN = secrets.token_urlsafe(32)
+    nonce = base64.b64encode(os.urandom(16)).decode("ascii")
+    CSP = ("default-src 'none'; script-src 'nonce-%s'; style-src 'nonce-%s'; "
+           "connect-src 'self'; img-src 'self' https://arxiv.org; "
+           "base-uri 'none'; form-action 'none'; "
+           "frame-ancestors 'none'" % (nonce, nonce))
+    keepalive = _keepalive_secs(o["idle"])
+    PAGE = render(md, truncated, os.path.basename(path), nonce,
+                  keepalive).encode("utf-8")
+
+    try:
+        srv = _LoopbackServer(("127.0.0.1", 0), Handler)
+    except OSError as e:
+        _die("cannot bind a loopback port: %s" % e)
+    srv.daemon_threads = True
+    port = srv.server_address[1]
+    line = {"url": "http://127.0.0.1:%d/?t=%s" % (port, TOKEN),
+            "pid": os.getpid(), "expiresIn": o["idle"],
+            # Advertised so a caller can reason about the window without reading
+            # the page: expiresIn is how long silence is tolerated, keepalive is
+            # how often an open page breaks it. Neither moves the 60-minute
+            # ceiling, which is the only number that is never negotiable.
+            "keepalive": keepalive}
+    LAST[0] = time.time()
+    deadline = time.time() + HARD_CAP
+
+    if not o["detach"]:
+        _claim(port)
+        _install_signals()
+        _start_watchdog(o["idle"], deadline)
+        if o["open"]:
+            ok, why = _raise_on_desktop(line["url"])
+            line["opened"] = ok
+            if not ok:
+                line["openError"] = why
+        sys.stdout.write(json.dumps(line) + "\n")
+        sys.stdout.flush()
+        try:
+            srv.serve_forever(poll_interval=0.2)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            _drop_pidfile()
+        return 0
+
+    # --detach: the launcher (an ssh exec channel, typically) must get its JSON
+    # line and exit, while the server lives on in its own session. The child
+    # signals readiness down a pipe first, so the caller can never be handed a
+    # url that nothing is listening on yet.
+    r_fd, w_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(r_fd)
+        try:
+            os.setsid()
+        except OSError:
+            pass
+        try:
+            signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        except (ValueError, OSError):
+            pass
+        _claim(port)
+        _install_signals()
+        _start_watchdog(o["idle"], deadline)
+        try:
+            os.write(w_fd, b"1")
+        except OSError:
+            pass
+        os.close(w_fd)
+        _silence_stdio()
+        try:
+            srv.serve_forever(poll_interval=0.2)
+        finally:
+            _drop_pidfile()
+        os._exit(0)
+
+    os.close(w_fd)
+    ready = b""
+    try:
+        if select.select([r_fd], [], [], 20)[0]:
+            ready = os.read(r_fd, 1)
+    except OSError:
+        ready = b""
+    os.close(r_fd)
+    if not ready:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+        _die("the detached server did not come up")
+    line["pid"] = pid
+    if o["open"]:
+        # After readiness, so the browser never races the listener; and from the
+        # PARENT, so the `open` subprocess belongs to a process that is about to
+        # exit rather than to the long-lived server.
+        ok, why = _raise_on_desktop(line["url"])
+        line["opened"] = ok
+        if not ok:
+            line["openError"] = why
+    sys.stdout.write(json.dumps(line) + "\n")
+    sys.stdout.flush()
+    os._exit(0)          # never run the parent's cleanup — the child owns it now
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

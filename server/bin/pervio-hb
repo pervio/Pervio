@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+"""pervio-hb — a stdin->stdout pass-through that injects a heartbeat line when the
+stream goes quiet, so the phone's SSH connection isn't judged dead during Codex's
+long silent "thinking" gaps (Codex doesn't stream output).
+
+Used in pervio-chat's Codex *chat* path:  codex exec --json … | pervio-hb
+(Run mode doesn't need it — pervio-run's tail emits its own heartbeats.)
+
+It forwards every byte verbatim and, only when idle AND at a line boundary (so it
+never splits a partial JSON line), emits `{"type":"heartbeat"}` — which the app
+parses as an ignored event. Heartbeats are injected into the live stream only.
+"""
+import os
+import select
+import signal
+import sys
+import time
+
+HEARTBEAT = b'{"type":"heartbeat"}\n'
+# Seconds of silence before a heartbeat. Env-tunable so the regression suite can
+# exercise the injection without waiting out real 10s idle windows.
+IDLE = float(os.environ.get("PERVIO_HB_IDLE", "10"))
+
+def main():
+    # A stop TERMs the turn's whole process group, us included. We must NOT
+    # die on it: the codex translator upstream answers that TERM with
+    # turn/interrupt and still has its closing line to write; a dead reader
+    # would turn that line into a broken pipe. We leave when upstream does (EOF).
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    out = sys.stdout.buffer
+    infd = sys.stdin.fileno()
+    last = time.time()
+    at_boundary = True            # nothing written yet == safe boundary
+    while True:
+        r, _, _ = select.select([infd], [], [], 1.0)
+        if r:
+            try:
+                data = os.read(infd, 65536)
+            except OSError:
+                break
+            if not data:           # EOF: upstream (codex) closed → done
+                break
+            out.write(data)
+            out.flush()
+            at_boundary = data.endswith(b"\n")
+            last = time.time()
+        elif at_boundary and time.time() - last >= IDLE:
+            out.write(HEARTBEAT)
+            out.flush()
+            last = time.time()
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (BrokenPipeError, KeyboardInterrupt):
+        pass

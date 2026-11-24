@@ -1,0 +1,113 @@
+<!doctype html>
+<!-- The README's two pictures, composed from what the website already shows.
+     ?scene=hero (1600 × 1000): three real screens of the app (the 720 px
+     captures scripts/site-shots.sh takes) in the site's phone frame, over the
+     site's photograph. ?scene=away (1600 × 520): the two notification banners
+     as iOS drew them and the Dynamic Island, on the site's two surfaces.
+     ?scene=how (1600 × 560): how the phone reaches the computer, the site's
+     own diagram laid on its side. ?scene=icon (256 × 256): the app icon with
+     its corners cut the way iOS cuts them, on nothing, so that it sits on
+     GitHub's light and dark pages alike. Nothing is drawn on a screen. Rendered by `bash scripts/site-crops.sh
+     readme`, once per language (&lang=en or &lang=zh), into docs/img/readme/. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>README hero</title>
+<link rel="stylesheet" href="../web/assets/fonts.css">
+<style>
+html,body{margin:0;width:1600px;height:1000px;overflow:hidden;background:#0E1017}
+.stage{position:relative;width:1600px;height:1000px;overflow:hidden;
+  background:#0E1017 url(../web/assets/photo/mattole-hero.jpg) 50% 34% / cover no-repeat}
+/* the photograph deepened towards the foot, as the site's hero does */
+.stage::before{content:"";position:absolute;inset:0;
+  background:linear-gradient(to bottom,rgba(14,16,23,.28) 0,rgba(14,16,23,.46) 55%,rgba(14,16,23,.86) 100%)}
+.phone{position:absolute;width:var(--w);padding:calc(var(--w) * .03);border-radius:calc(var(--w) * .165);
+  background:#020309;box-sizing:content-box;
+  box-shadow:inset 0 0 0 1px rgba(255,253,251,.16),0 0 0 1px rgba(2,3,9,.55),0 60px 100px -30px rgba(2,3,9,.8)}
+.phone img{display:block;width:100%;aspect-ratio:720/1564;object-fit:cover;border-radius:calc(var(--w) * .137)}
+.mid{--w:372px;left:calc(800px - var(--w) * .53);top:74px}
+.left{--w:330px;left:calc(372px - var(--w) * .53);top:150px}
+.right{--w:330px;left:calc(1228px - var(--w) * .53);top:150px}
+/* when the app is closed: the site's bone surface and its slate pane */
+.away{display:none;width:1600px;height:520px;box-sizing:border-box;padding:40px;gap:32px;background:#0E1017;
+  grid-template-columns:minmax(0,7fr) minmax(0,5fr)}
+.away > div{display:grid;place-items:center;border-radius:22px}
+.well{background:linear-gradient(160deg,#F3EFEA,#E9E4DD)}
+.well__stack{display:grid;gap:22px;width:640px}
+.well__stack img{display:block;width:100%;border-radius:999px;box-shadow:0 22px 40px -22px rgba(21,24,32,.42),0 0 0 1px #D9D5CF}
+.pane{background:#151820;box-shadow:inset 0 1px 0 rgba(255,253,251,.10),inset 0 0 0 1px rgba(255,253,251,.07)}
+.pane img{display:block;width:470px;border-radius:12.2% / 38.2%;box-shadow:0 30px 60px -24px rgba(2,3,9,.7)}
+body.away-scene,html.away-scene{height:520px}
+body.away-scene .stage{display:none}
+body.away-scene .away{display:grid}
+/* how it connects: two nodes, the one wire between them, and the other route below */
+.how{display:none;flex-direction:column;justify-content:center;width:1600px;height:560px;box-sizing:border-box;padding:0 64px;background:#0E1017;color:#CACED4;
+  font:400 23px/1.5 "Wix Madefor Text","PingFang SC","Hiragino Sans GB",system-ui,sans-serif}
+:lang(zh) .how{font-family:"Wix Madefor Text zh","PingFang SC","Hiragino Sans GB",system-ui,sans-serif}
+.how__row{display:grid;grid-template-columns:minmax(0,10fr) 220px minmax(0,13fr);align-items:stretch}
+.node{padding:30px 36px 32px;border-radius:22px;background:#151820;box-shadow:inset 0 1px 0 rgba(255,253,251,.10),inset 0 0 0 1px rgba(255,253,251,.07)}
+.node h3{display:flex;align-items:baseline;justify-content:space-between;gap:16px;margin:0;color:#F4F1ED;
+  font:600 31px/1.25 "Wix Madefor Display","PingFang SC",system-ui,sans-serif;letter-spacing:-.01em}
+.node h3 span{font:400 20px/1.4 "Wix Madefor Text","PingFang SC",system-ui,sans-serif;letter-spacing:0;color:#999FA9}
+.node ul{list-style:none;margin:20px 0 0;padding:0}
+.node li{padding:13px 0;border-top:1px solid rgba(255,253,251,.07)}
+.node li:last-child{padding-bottom:0}
+.how code{font:400 .9em ui-monospace,"SF Mono",Menlo,monospace;color:#F4F1ED}
+.wire{display:grid;grid-template-columns:1fr auto 1fr;align-items:center}
+.wire::before,.wire::after{content:"";height:1.5px;background:#A0B0F4}
+.wire span{padding:9px 22px;border-radius:999px;font:600 22px/1 "Wix Madefor Text",system-ui,sans-serif;color:#A0B0F4;box-shadow:inset 0 0 0 1.5px #A0B0F4}
+.aside{margin:34px 0 0;padding:20px 36px;border-radius:22px;box-shadow:inset 0 0 0 1px #3E424C;color:#999FA9}
+.aside b{font-weight:500;color:#F4BA87}
+body.how-scene,html.how-scene{height:560px}
+body.how-scene .stage{display:none}
+body.how-scene .how{display:flex}
+.icon{display:none;width:256px;height:256px;border-radius:22.37%}
+html.icon-scene,body.icon-scene{background:transparent;width:256px;height:256px}
+body.icon-scene .stage{display:none}
+body.icon-scene .icon{display:block}
+</style>
+</head>
+<body>
+<div class="stage">
+  <div class="phone left"><img src="../web/assets/shots/running-en.png" alt=""></div>
+  <div class="phone right"><img src="../web/assets/shots/approval-en.png" alt=""></div>
+  <div class="phone mid"><img src="../web/assets/shots/chat-en.png" alt=""></div>
+</div>
+<div class="away">
+  <div class="well"><div class="well__stack"><img src="../web/assets/shots/notif-approve-en.png" alt=""><img src="../web/assets/shots/notif-done-en.png" alt=""></div></div>
+  <div class="pane"><img src="../web/assets/shots/island-en.png" alt=""></div>
+</div>
+<img class="icon" src="../web/assets/icon-180.png" alt="">
+<div class="how">
+  <div class="how__row">
+    <div class="node"><h3><i data-t="p" style="font-style:normal"></i><span data-t="pt"></span></h3><ul><li data-t="p1"></li><li data-t="p2"></li></ul></div>
+    <div class="wire"><span>SSH</span></div>
+    <div class="node"><h3><i data-t="m" style="font-style:normal"></i><span data-t="mt"></span></h3><ul><li data-t="m1"></li><li data-t="m2"></li><li data-t="m3"></li></ul></div>
+  </div>
+  <p class="aside" data-t="a"></p>
+</div>
+<script>
+var q = new URLSearchParams(location.search), l = q.get("lang") === "zh" ? "zh" : "en";
+if (q.get("scene") === "away") { document.documentElement.className = "away-scene"; document.body.className = "away-scene"; }
+if (q.get("scene") === "icon") { document.documentElement.className = "icon-scene"; document.body.className = "icon-scene"; }
+if (q.get("scene") === "how") { document.documentElement.className = "how-scene"; document.body.className = "how-scene"; }
+document.documentElement.lang = l === "zh" ? "zh-CN" : "en";
+var T = {
+  en: { p: "Pervio on the phone", pt: "iPhone app", p1: "Chat, background tasks, approvals, terminal", p2: "Keys in the iOS Keychain, host key pinned",
+        m: "Your computer", mt: "sshd", m1: "<code>~/.pervio/bin/pervio-*</code>, bundled with the app, copied over on connect",
+        m2: "<code>claude</code> · <code>codex</code> · <code>agent</code>, with your own logins", m3: "No service keeps running, and no port is opened",
+        a: "<b>Push</b> takes another route: from the computer to <code>push.pervio.dev</code>, then through Apple to the phone. It carries only the text of the notification, and it can be turned off." },
+  zh: { p: "手机上的 Pervio", pt: "iPhone app", p1: "对话、后台任务、审批、终端", p2: "密钥在 iOS 钥匙串，主机密钥已固定",
+        m: "你的电脑", mt: "sshd", m1: "<code>~/.pervio/bin/pervio-*</code>，app 自带，连上时放好",
+        m2: "<code>claude</code> · <code>codex</code> · <code>agent</code>，用你自己的登录", m3: "没有常驻服务，也不用对外开端口",
+        a: "<b>推送</b>走另一条路：从电脑到 <code>push.pervio.dev</code>，再经 Apple 到手机。带的只有通知上的文字，可以关掉。" }
+}[l];
+document.querySelectorAll("[data-t]").forEach(function (e) { e.innerHTML = T[e.getAttribute("data-t")]; });
+// The markup names the English captures, so that a link check can see them;
+// the Chinese ones sit beside them under the same names.
+if (l === "zh") document.querySelectorAll("img").forEach(function (e) {
+  e.setAttribute("src", e.getAttribute("src").replace("-en.", "-zh."));
+});
+</script>
+</body>
+</html>

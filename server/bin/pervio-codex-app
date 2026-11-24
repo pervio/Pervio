@@ -1,0 +1,794 @@
+#!/usr/bin/env python3
+"""pervio-codex-app — one Codex turn over `codex app-server`, spoken as the
+`codex exec --json` events the phone already reads (2026-10-18).
+
+Why app-server and not exec: exec is headless — it cannot ask, cannot be
+interrupted short of killing it, and resumes by replaying files. app-server is
+what the Codex desktop/VS Code clients speak: a JSON-RPC stream over stdio with
+real approval requests (answered from the phone through the same FIFO channel
+Claude Code's pervio-approve uses), `turn/interrupt` for a real stop, and
+`thread/resume` by id. Same model, same instructions, same answers (compared
+side by side on 2026-10-18); the difference is the conversation.
+
+    pervio-codex-app --codex BIN --dir DIR [--resume THREAD] [--sandbox MODE] [--reviewer user|auto_review]
+                    [--input-fifo PATH]   # a living run: further user messages (stream-json lines) arrive here
+                    [--approval untrusted|on-request|never] [--model M] [--effort E]
+                    [--add-dir D]... [-c key=value]... [--sid SID] [--lang zh|en]
+                    [--prompt-b64 B64]          (else the prompt is read from stdin)
+
+Output, one JSON object per line, exactly the exec shapes:
+    thread.started {thread_id}  item.started/item.completed {item}  turn.completed {usage}
+    turn.failed {error}  error {message}
+plus, when --sid is set, the approval lines the phone answers:
+    permission_request {request_id, tool_use_id, tool_name, input}
+    permission_resolved {request_id, behavior}
+Decisions arrive on ~/.pervio/chat/<SID>/control.fifo as
+    {request_id, behavior: allow|deny, message?}     (written by `pervio-chat respond`)
+Exit: 0 completed · 1 failed · 143 interrupted (SIGTERM/SIGINT → turn/interrupt).
+"""
+import base64
+import json
+import os
+import signal
+import subprocess
+import sys
+import queue
+import threading
+import time
+
+SELF_DIR = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, SELF_DIR)
+try:
+    from _pervio_lib import push_lang   # noqa: E402
+except Exception:                       # the lib is a sibling on the Mac; tests may run bare
+    def push_lang():
+        return "zh"
+
+
+# ---------------------------------------------------------------- arguments
+def parse_args(argv):
+    o = {"add_dirs": [], "config": [], "sandbox": "workspace-write", "approval": "never", "reviewer": "", "service_tier": "", "input_fifo": "",
+         "input_stdin": False,
+         "codex": "codex", "dir": os.getcwd(), "resume": "", "model": "", "effort": "",
+         "sid": "", "lang": "", "prompt_b64": ""}
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        nxt = argv[i + 1] if i + 1 < len(argv) else None
+        if a == "--input-stdin":
+            o["input_stdin"] = True; i += 1
+        elif a == "--add-dir" and nxt is not None:
+            o["add_dirs"].append(nxt); i += 2
+        elif a == "-c" and nxt is not None:
+            o["config"].append(nxt); i += 2
+        elif a.startswith("--") and nxt is not None and a[2:].replace("-", "_") in o:
+            o[a[2:].replace("-", "_")] = nxt; i += 2
+        else:
+            i += 1
+    return o
+
+
+def toml_value(raw):
+    """A `-c key=value` value the way codex reads it: a quoted string, a number,
+    a bool, or a bare word kept as a string."""
+    s = raw.strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in "\"'":
+        return s[1:-1]
+    if s in ("true", "false"):
+        return s == "true"
+    try:
+        return json.loads(s)
+    except ValueError:
+        return s
+
+
+def config_overrides(pairs, add_dirs):
+    """`-c a.b.c=value` pairs → the nested `config` object thread/start takes;
+    attached folders become sandbox_workspace_write.writable_roots (exec's
+    --add-dir), so the agent may write there too."""
+    cfg = {}
+    for p in pairs:
+        key, sep, val = p.partition("=")
+        if not sep:
+            continue
+        node = cfg
+        parts = key.strip().split(".")
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+            if not isinstance(node, dict):
+                break
+        else:
+            node[parts[-1]] = toml_value(val)
+    if add_dirs:
+        cfg.setdefault("sandbox_workspace_write", {})["writable_roots"] = list(add_dirs)
+    return cfg
+
+
+# ---------------------------------------------------------------- the client
+class Client:
+    def __init__(self, opts):
+        self.o = opts
+        self.proc = None
+        self.next_id = 0
+        self.lock = threading.Lock()
+        self.responses = {}            # id -> message
+        self.resp_event = threading.Condition()
+        self.thread_id = opts["resume"] or ""
+        self.turn_id = ""
+        self.done = threading.Event()
+        self.status = ""               # completed | failed | interrupted
+        self.error = ""
+        self.usage = None
+        self.pending = {}              # approval request_id -> {"ev": Event, "decision": dict|None}
+        self.pushed = False
+        self.exit_code = 0
+        self.closed = False
+        self.inbox = queue.Queue()          # the living run's further messages
+        self.carry = []                     # taken mid-turn but not steerable: the next turn's (and the EOF sentinel)
+        # Messages fed through the living run's input that codex has been
+        # handed but has not yet made part of the turn. Codex says when it
+        # does: a `userMessage` item — at once on 0.169, only when the model
+        # gets to it on 0.160 (the running command first, or the answer being
+        # written; 22 s and 45 s measured, 2026-11-21). Until then the message
+        # is in nobody's record, so each one's taking is announced
+        # (`turn_taken`) for the phone to place the words where they belong.
+        self.untaken = []
+        self.untaken_lock = threading.Lock()
+        self.interrupted_flag = False
+        # Sub-agents (2026-11-22). Codex runs each as a THREAD OF ITS OWN and
+        # reports that thread's turns, items and token usage on this same
+        # connection, under its own threadId (0.169; a real turn's stream is
+        # server/tests/tasks/codex-subagents.appserver.jsonl). Read as the conversation's own, the first
+        # sub-agent to finish ended the whole turn — its turn/completed was
+        # taken for ours: the answer never came, and the sub-agent's last words
+        # stood in its place. Now only this thread's notifications drive the
+        # turn; a sub-agent's become the task events Claude Code speaks
+        # (background_tasks_changed / task_started / task_progress /
+        # task_notification), which the phone's task line and the keeper's
+        # ledger already read.
+        self.agents = {}               # sub-agent thread id -> what is known of it (see _agent_activity)
+        self.agent_items = set()       # (item id, kind) already acted on: item/started and item/completed both carry it
+
+    # ---- transport
+    def start(self):
+        env = dict(os.environ)
+        # Its own session: a stop is a TERM to the turn's process group (the
+        # phone's chat stop, pervio-run's first pass) and must reach US — we
+        # turn it into turn/interrupt so codex ends the turn as interrupted and
+        # writes it down — never codex itself, which would just die mid-turn.
+        # Codex still hangs off our ppid, so pervio-run's tree sweep sees it.
+        self.proc = subprocess.Popen([self.o["codex"], "app-server"], stdin=subprocess.PIPE,
+                                     stdout=subprocess.PIPE, stderr=None, cwd=self.o["dir"],
+                                     env=env, bufsize=1, universal_newlines=True,
+                                     start_new_session=True)
+        threading.Thread(target=self._reader, daemon=True).start()
+
+    def _write(self, msg):
+        try:
+            with self.lock:
+                self.proc.stdin.write(json.dumps(msg) + "\n")
+                self.proc.stdin.flush()
+        except (BrokenPipeError, ValueError, OSError):
+            pass
+
+    def request(self, method, params, timeout=120):
+        with self.lock:
+            self.next_id += 1
+            rid = self.next_id
+        self._write({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
+        end = time.time() + timeout
+        with self.resp_event:
+            while rid not in self.responses:
+                left = end - time.time()
+                if left <= 0 or self.closed:
+                    return {"error": {"message": "no answer from codex app-server to %s" % method}}
+                self.resp_event.wait(min(left, 1.0))
+            return self.responses.pop(rid)
+
+    def notify(self, method, params):
+        self._write({"jsonrpc": "2.0", "method": method, "params": params})
+
+    def _reader(self):
+        try:
+            for line in self.proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                self._dispatch(msg)
+        finally:
+            self.closed = True
+            with self.resp_event:
+                self.resp_event.notify_all()
+            self.done.set()
+
+    def _dispatch(self, msg):
+        if "id" in msg and "method" not in msg:          # a response to us
+            with self.resp_event:
+                self.responses[msg["id"]] = msg
+                self.resp_event.notify_all()
+            return
+        method = msg.get("method", "")
+        params = msg.get("params") or {}
+        if "id" in msg:                                     # a server REQUEST (approval etc.)
+            threading.Thread(target=self._serve_request, args=(msg["id"], method, params), daemon=True).start()
+            return
+        self._on_notification(method, params)
+
+    # ---- output to the phone
+    def emit(self, obj):
+        try:
+            sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+            sys.stdout.flush()
+        except (BrokenPipeError, ValueError):
+            pass
+
+    # ---- notifications → exec-style events
+    def _on_notification(self, method, p):
+        if method == "thread/started":
+            tid = ((p.get("thread") or {}).get("id")) or self.thread_id
+            if tid and not self.thread_id:
+                self.thread_id = tid
+            return
+        tid = p.get("threadId") or ""
+        if tid and self.thread_id and tid != self.thread_id:
+            self._on_agent_thread(tid, method, p)       # a sub-agent's thread: never this turn's business
+            return
+        if method == "turn/started":
+            self.turn_id = ((p.get("turn") or {}).get("id")) or self.turn_id
+            return
+        if method in ("item/started", "item/completed"):
+            item = p.get("item") or {}
+            if item.get("type") == "subAgentActivity":
+                self._agent_activity(item, parent="")
+                return
+            if item.get("type") == "userMessage":
+                if method == "item/completed":
+                    self._note_taken(item)
+                return
+            kind = "item.started" if method == "item/started" else "item.completed"
+            out = self._exec_item(item)
+            if out is not None:
+                self.emit({"type": kind, "item": out})
+            return
+        if method == "thread/tokenUsage/updated":
+            self.usage = p.get("tokenUsage") or p.get("usage") or p
+            return
+        if method == "turn/completed":
+            turn = p.get("turn") or {}
+            self.status = turn.get("status") or "completed"
+            err = turn.get("error") or {}
+            if isinstance(err, dict):
+                self.error = err.get("message") or ""
+            self.done.set()
+            return
+        if method == "error":
+            err = p.get("error") or {}
+            msg = err.get("message") if isinstance(err, dict) else str(err)
+            self.emit({"type": "error", "message": msg or "Codex error"})
+            if not p.get("willRetry"):
+                self.error = self.error or (msg or "Codex error")
+            return
+        # deltas, reasoning, plans, rate limits: nothing the exec stream carried
+        return
+
+    # ---- sub-agents → the task events the phone's task line reads
+    def _agent_activity(self, item, parent):
+        """A `subAgentActivity` item on the thread that owns the sub-agent:
+        started (it exists: its thread id, its path — /root/<name> — and the
+        model it runs on), interacted (it was given more to do), completed /
+        interrupted. `parent` is the sub-agent thread that spawned it, "" for
+        the conversation's own thread."""
+        key = (item.get("id"), item.get("kind"))
+        if key in self.agent_items:
+            return
+        self.agent_items.add(key)
+        tid, kind = item.get("agentThreadId") or "", item.get("kind") or ""
+        if not tid:
+            return
+        if kind == "started":
+            path = str(item.get("agentPath") or "")
+            name = path[len("/root/"):] if path.startswith("/root/") else path.strip("/")
+            self.agents[tid] = {"name": (name or "sub-agent")[:200],
+                                "type": " · ".join(str(x) for x in (item.get("model"), item.get("reasoningEffort")) if x)[:80],
+                                "parent": parent, "started": time.time(), "tools": 0, "tokens": 0,
+                                "doing": "", "last": "", "turn": "", "running": True}
+            self._agents_changed()
+            self.emit(dict(self._agent_row(tid), type="system", subtype="task_started", is_backgrounded=True))
+        elif kind == "interacted":
+            a = self.agents.get(tid)
+            if a is not None and not a["running"]:
+                a["running"] = True; a["started"] = time.time()
+                self._agents_changed()
+        elif kind in ("completed", "interrupted"):
+            self._agent_ended(tid, "completed" if kind == "completed" else "stopped")
+
+    def _on_agent_thread(self, tid, method, p):
+        """What a sub-agent's own thread reports. Only threads codex announced
+        as sub-agents are followed (its approval reviewer is a thread too)."""
+        a = self.agents.get(tid)
+        if a is None:
+            return
+        if method == "turn/started":
+            a["turn"] = ((p.get("turn") or {}).get("id")) or a["turn"]
+            if not a["running"]:
+                a["running"] = True; a["started"] = time.time()
+                self._agents_changed()
+        elif method in ("item/started", "item/completed"):
+            item = p.get("item") or {}
+            t = item.get("type") or ""
+            if t == "subAgentActivity":                # a sub-agent's own sub-agent
+                self._agent_activity(item, parent=tid)
+            elif t == "agentMessage":
+                if method == "item/completed" and item.get("text"):
+                    a["last"] = str(item["text"])
+            elif method == "item/started":
+                doing = self._doing(item)
+                if doing:
+                    a["tools"] += 1; a["doing"] = doing
+                    self._agent_progress(tid)
+        elif method == "thread/tokenUsage/updated":
+            u = p.get("tokenUsage") or {}
+            # "last" is the latest request — how much context the sub-agent
+            # holds, the figure Claude Code gives for its own; "total" adds up
+            # every request and doubles with each step.
+            src = u.get("last") if isinstance(u.get("last"), dict) else u.get("total") if isinstance(u.get("total"), dict) else {}
+            n = src.get("totalTokens")
+            if isinstance(n, int) and not isinstance(n, bool) and n != a["tokens"]:
+                a["tokens"] = n
+                self._agent_progress(tid)
+        elif method == "turn/completed":
+            turn = p.get("turn") or {}
+            if not a["last"]:
+                for it in reversed(turn.get("items") or []):
+                    if isinstance(it, dict) and it.get("type") == "agentMessage" and it.get("text"):
+                        a["last"] = str(it["text"]); break
+            self._agent_ended(tid, {"failed": "failed", "interrupted": "stopped"}.get(turn.get("status") or "", "completed"))
+
+    @staticmethod
+    def _doing(item):
+        """One line for what a sub-agent has just started doing."""
+        t = item.get("type") or ""
+        if t == "commandExecution":
+            cmd = str(item.get("command") or "").strip()
+            # codex runs a command through a login shell: say the command itself.
+            for shell in ("/bin/zsh -lc ", "/bin/bash -lc ", "zsh -lc ", "bash -lc ", "sh -c "):
+                if cmd.startswith(shell) and len(cmd) > len(shell) + 1 and cmd[len(shell)] in "'\"" and cmd[-1] == cmd[len(shell)]:
+                    cmd = cmd[len(shell) + 1:-1]
+                    break
+            return ("Running " + "; ".join(" ".join(l.split()) for l in cmd.splitlines() if l.strip()))[:200]
+        if t == "fileChange":
+            paths = [str(c.get("path") or "") for c in item.get("changes") or [] if isinstance(c, dict)]
+            return ("Editing " + os.path.basename(paths[0]) if paths and paths[0] else "Editing files")[:200]
+        if t == "mcpToolCall":
+            return ("Calling %s" % (item.get("tool") or "a tool"))[:200]
+        if t == "webSearch":
+            return ("Searching " + str(item.get("query") or "")).strip()[:200]
+        return ""
+
+    def _agent_row(self, tid):
+        a = self.agents[tid]
+        row = {"task_id": tid, "task_type": "local_agent", "description": a["name"]}
+        if a["type"]:
+            row["subagent_type"] = a["type"]
+        if a["parent"]:
+            row["parent_task_id"] = a["parent"]
+        return row
+
+    def _agent_usage(self, a):
+        return {"total_tokens": int(a["tokens"] or 0), "tool_uses": int(a["tools"]),
+                "duration_ms": int(max(0.0, time.time() - a["started"]) * 1000)}
+
+    def _agents_changed(self):
+        """The whole set still running, as Claude Code's background_tasks_changed
+        says its own — the keeper holds a living run open while it is not empty."""
+        self.emit({"type": "system", "subtype": "background_tasks_changed",
+                   "tasks": [self._agent_row(t) for t, a in self.agents.items() if a["running"]]})
+
+    def _agent_progress(self, tid):
+        a = self.agents[tid]
+        if a["running"]:
+            self.emit({"type": "system", "subtype": "task_progress", "task_id": tid, "description": a["doing"] or a["name"],
+                       "subagent_type": a["type"], "usage": self._agent_usage(a)})
+
+    def _agent_ended(self, tid, status):
+        a = self.agents.get(tid)
+        if a is None or not a["running"]:
+            return                                    # its turn/completed and its "completed" activity both say so
+        a["running"] = False
+        self.emit({"type": "system", "subtype": "task_notification", "task_id": tid, "status": status,
+                   "summary": a["last"][:2000], "usage": self._agent_usage(a)})
+        self._agents_changed()
+
+    def _expect_taking(self, text):
+        with self.untaken_lock:
+            self.untaken.append(text)
+
+    def _forget_taking(self, text):
+        with self.untaken_lock:
+            if text in self.untaken:
+                self.untaken.remove(text)
+
+    def _note_taken(self, item):
+        """Codex made a user message part of the turn. When it is one that was
+        fed in, say so on the stream — the first prompt of a run is not
+        announced, nobody is waiting to hear about it."""
+        text = item.get("text")
+        if not isinstance(text, str):
+            text = "".join(c.get("text") or "" for c in (item.get("content") or [])
+                           if isinstance(c, dict) and c.get("type") == "text")
+        hit = None
+        with self.untaken_lock:
+            for t in self.untaken:
+                if t.strip() == text.strip():
+                    hit = t
+                    break
+            if hit is not None:
+                self.untaken.remove(hit)
+        if hit is not None:
+            self.emit({"type": "pervio", "subtype": "turn_taken", "text": hit})
+
+    @staticmethod
+    def _exec_item(item):
+        t = item.get("type") or ""
+        if t == "agentMessage":
+            text = item.get("text") or ""
+            if not text:
+                return None
+            return {"type": "agent_message", "id": item.get("id"), "text": text}
+        if t == "commandExecution":
+            out = {"type": "command_execution", "id": item.get("id"), "command": item.get("command") or "",
+                   "status": item.get("status") or ""}
+            if item.get("exitCode") is not None:
+                out["exit_code"] = item.get("exitCode")
+            if item.get("aggregatedOutput"):
+                out["aggregated_output"] = item.get("aggregatedOutput")
+            return out
+        if t == "fileChange":
+            changes = []
+            for c in item.get("changes") or []:
+                if isinstance(c, dict):
+                    changes.append({"path": c.get("path") or "", "kind": c.get("kind") or "edit"})
+            return {"type": "file_change", "id": item.get("id"), "changes": changes,
+                    "status": item.get("status") or ""}
+        if t == "mcpToolCall":
+            return {"type": "mcp_tool_call", "id": item.get("id"), "server": item.get("server") or "",
+                    "tool": item.get("tool") or "", "status": item.get("status") or ""}
+        if t == "webSearch":
+            return {"type": "web_search", "id": item.get("id"), "query": item.get("query") or ""}
+        return None
+
+    # ---- server requests (approvals)
+    def _serve_request(self, rid, method, p):
+        if method in ("item/commandExecution/requestApproval", "item/fileChange/requestApproval",
+                      "execCommandApproval", "applyPatchApproval"):
+            decision = self._ask_phone(rid, method, p)
+            self._write({"jsonrpc": "2.0", "id": rid, "result": {"decision": decision}})
+            return
+        if method == "item/tool/requestUserInput":
+            self._write({"jsonrpc": "2.0", "id": rid, "result": {"answers": {}}})
+            return
+        if method == "mcpServer/elicitation/request":
+            self._write({"jsonrpc": "2.0", "id": rid, "result": {"action": "decline"}})
+            return
+        if method == "item/permissions/requestApproval":
+            self._write({"jsonrpc": "2.0", "id": rid, "result": {"decision": "decline"}})
+            return
+        self._write({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "unsupported request"}})
+
+    def _ask_phone(self, rid, method, p):
+        """Put the request on the phone (a permission_request line, the same shape
+        pervio-approve writes for Claude) and block for its decision on the FIFO.
+        No channel (no --sid) → decline: nobody could answer."""
+        sid = self.o["sid"]
+        if not sid:
+            return "decline"
+        if method in ("item/fileChange/requestApproval", "applyPatchApproval"):
+            tool, inp = "Edit", {"file_path": p.get("grantRoot") or "", "reason": p.get("reason") or ""}
+        else:
+            tool, inp = "Bash", {"command": p.get("command") or "", "cwd": p.get("cwd") or "",
+                                 "reason": p.get("reason") or ""}
+        request_id = "codex-%s" % rid
+        ev = threading.Event()
+        self.pending[request_id] = {"ev": ev, "decision": None}
+        self.emit({"type": "permission_request", "request_id": request_id,
+                   "tool_use_id": p.get("itemId") or request_id, "tool_name": tool, "input": inp})
+        self._push_once(tool)
+        ev.wait()
+        d = self.pending.pop(request_id, {}).get("decision") or {}
+        behavior = d.get("behavior") or "deny"
+        self.emit({"type": "permission_resolved", "request_id": request_id, "behavior": behavior})
+        return {"allow": "accept", "cancel": "cancel"}.get(behavior, "decline")
+
+    def _push_once(self, tool):
+        """One lock-screen ping per turn when the first approval blocks on the phone."""
+        if self.pushed:
+            return
+        self.pushed = True
+        push = os.path.join(SELF_DIR, "pervio-push")
+        if not os.path.exists(push):
+            return
+        zh = push_lang() != "en"
+        title = "Codex 在等你批准" if zh else "Codex is waiting for your approval"
+        body = ({"Bash": "跑命令", "Edit": "改文件"}.get(tool, "操作") if zh
+                else {"Bash": "run a command", "Edit": "edit a file"}.get(tool, "an action"))
+        try:
+            run_id = os.environ.get("PERVIO_RUN_ID", "")       # a detached run: the tap reopens it
+            dev = os.environ.get("PERVIO_PUSH_DEVICE", "")      # the phone driving this turn, nobody else
+            subprocess.Popen([sys.executable, push, "send", "--title", title, "--body", body,
+                              "--thread", "pervio-run-" + run_id if run_id else "pervio-approve"]
+                             + (["--device", dev] if dev else []),
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+        except (OSError, ValueError):
+            pass
+
+    def _fifo_reader(self):
+        """Decisions from `pervio-chat respond`: one JSON line each on the FIFO.
+        Opened O_RDWR so a writer connecting and leaving never reads as EOF."""
+        fifo = os.path.join(os.path.expanduser("~"), ".pervio", "chat", self.o["sid"], "control.fifo")
+        try:
+            if not os.path.exists(fifo):
+                os.makedirs(os.path.dirname(fifo), mode=0o700, exist_ok=True)
+                os.mkfifo(fifo, 0o600)
+            fd = os.open(fifo, os.O_RDWR)
+        except OSError:
+            return
+        buf = b""
+        while not self.done.is_set():
+            try:
+                chunk = os.read(fd, 4096)
+            except OSError:
+                break
+            if not chunk:
+                time.sleep(0.05)
+                continue
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                try:
+                    d = json.loads(line.decode("utf-8", "replace"))
+                except ValueError:
+                    continue
+                w = self.pending.get(str(d.get("request_id", "")))
+                if w and w["decision"] is None:
+                    w["decision"] = d
+                    w["ev"].set()
+
+    # ---- the turn
+    def interrupt(self):
+        self.interrupted_flag = True
+        if self.thread_id and self.turn_id and not self.done.is_set():
+            self.notify_interrupt()
+        # An approval still waiting on the phone is moot now: release it as a
+        # cancel (after the interrupt, so codex sees the stop first).
+        for w in list(self.pending.values()):
+            if w["decision"] is None:
+                w["decision"] = {"behavior": "cancel"}
+                w["ev"].set()
+        self.status = self.status or "interrupted"
+        self.done.set()
+
+    def notify_interrupt(self):
+        try:
+            self.request("turn/interrupt", {"threadId": self.thread_id, "turnId": self.turn_id}, timeout=5)
+        except Exception:
+            pass
+
+    def run(self, prompt):
+        o = self.o
+        self.start()
+        if o["sid"]:
+            threading.Thread(target=self._fifo_reader, daemon=True).start()
+        r = self.request("initialize", {"clientInfo": {"name": "pervio", "version": "1"}}, timeout=30)
+        if "error" in r:
+            return self._fail("codex app-server did not initialize: %s" % (r["error"].get("message") or r["error"]))
+        self.notify("initialized", {})
+        cfg = config_overrides(o["config"], o["add_dirs"])
+        common = {"cwd": o["dir"], "sandbox": o["sandbox"], "approvalPolicy": o["approval"]}
+        if o["reviewer"]:
+            # Who settles an approval: `user` puts it on the phone (or declines
+            # it when no phone is listening), `auto_review` is codex's own
+            # reviewing subagent — the desktop's "Approve for me".
+            common["approvalsReviewer"] = o["reviewer"]
+        if o["service_tier"]:
+            # The speed tier for this thread (the phone's Fast switch, 2026-10-19);
+            # unsaid, codex uses the Mac's config.toml service_tier.
+            common["serviceTier"] = o["service_tier"]
+        if o["model"]:
+            common["model"] = o["model"]
+        if cfg:
+            common["config"] = cfg
+        if o["resume"]:
+            r = self.request("thread/resume", dict(common, threadId=o["resume"]), timeout=60)
+        else:
+            r = self.request("thread/start", common, timeout=60)
+        if "error" in r:
+            return self._fail("codex could not %s the thread: %s" % ("resume" if o["resume"] else "start",
+                                                                     r["error"].get("message") or r["error"]))
+        res = r.get("result") or {}
+        self.thread_id = ((res.get("thread") or {}).get("id")) or self.thread_id
+        self.emit({"type": "thread.started", "thread_id": self.thread_id})
+        # The living run (2026-10-20): further user messages arrive on the input
+        # FIFO as stream-json lines; each becomes a turn on the SAME thread. The
+        # FIFO's EOF (pervio-run's keeper letting go) ends the process.
+        living = bool(o["input_fifo"] or o["input_stdin"])
+        if living:
+            threading.Thread(target=self._input_reader, args=(o["input_fifo"] or None,), daemon=True).start()
+        text = prompt
+        while True:
+            rc = self._turn(text)
+            if rc != 0 or not living:
+                return rc
+            text = self._next_message()
+            if text is None:                # EOF: the keeper closed the pipe
+                return 0
+            self.status = ""; self.error = ""; self.done.clear(); self.usage = None
+            self.emit({"type": "turn.started"})
+            self._expect_taking(text)       # a fed message: its taking is announced
+
+    def _turn(self, text):
+        o = self.o
+        turn = {"threadId": self.thread_id, "input": [{"type": "text", "text": text}]}
+        if o["effort"]:
+            turn["effort"] = o["effort"]
+        r = self.request("turn/start", turn, timeout=60)
+        if "error" in r:
+            return self._fail("codex refused the turn: %s" % (r["error"].get("message") or r["error"]))
+        self.turn_id = (((r.get("result") or {}).get("turn") or {}).get("id")) or self.turn_id
+        while not self.done.wait(0.5):      # a timed wait keeps SIGTERM deliverable mid-turn
+            self._steer_pending()
+        if self.closed and not self.status:
+            return self._fail(self.error or "codex app-server closed before the turn completed")
+        if self.status == "completed":
+            done = {"type": "turn.completed"}
+            usage = self._exec_usage()
+            if usage:
+                done["usage"] = usage
+            self.emit(done)
+            return 0
+        if self.status == "interrupted":
+            self.emit({"type": "turn.failed", "error": {"message": "interrupted"}})
+            return 143
+        return self._fail(self.error or "turn failed")
+
+    # ---- the living run's input
+    def _input_reader(self, fifo):
+        """Lines of stream-json user messages → the queue; EOF → a None sentinel.
+        From the FIFO itself, or (fifo None) from stdin — the keeper's pipe."""
+        try:
+            fd = os.open(fifo, os.O_RDONLY) if fifo else sys.stdin.fileno()
+        except OSError:
+            self.inbox.put(None); return
+        buf = b""
+        while True:
+            try:
+                chunk = os.read(fd, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break                           # every writer gone: the keeper let go
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                text = self._message_text(line)
+                if text is not None:
+                    self.inbox.put(text)
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        self.inbox.put(None)
+
+    @staticmethod
+    def _message_text(line):
+        try:
+            o = json.loads(line.decode("utf-8", "replace"))
+        except ValueError:
+            return None
+        if not isinstance(o, dict) or o.get("type") != "user":
+            return None
+        content = (o.get("message") or {}).get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return "\n".join(c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text")
+        return None
+
+    def _steer_pending(self):
+        """A message that lands while the turn runs is STEERED into it
+        (`turn/steer`, the desktop app's way, 2026-10-21): codex shows it to the
+        model at its next step and the running command is not cut — measured
+        on codex 0.160: `sleep 12` ran out, then the model took the new words,
+        one turn, one turn/completed. When codex refuses (the turn ended just
+        now), the message waits for the next turn/start as before."""
+        while True:
+            try:
+                item = self.inbox.get_nowait()
+            except queue.Empty:
+                return
+            if item is None or self.done.is_set():
+                self.carry.append(item)           # EOF, or a turn no longer running: after this turn
+                return
+            # Expected BEFORE the request: codex 0.169 reports the message as
+            # taken in the same breath as it answers the steer, and the reader
+            # thread may see that report first.
+            self._expect_taking(item)
+            r = self.request("turn/steer", {"threadId": self.thread_id, "expectedTurnId": self.turn_id,
+                                            "input": [{"type": "text", "text": item}]}, timeout=30)
+            if "error" in r:
+                self._forget_taking(item)         # it starts a turn of its own later, and is expected again then
+                self.carry.append(item)
+
+    def _next_message(self):
+        if self.carry:
+            return self.carry.pop(0)
+        while True:
+            try:
+                item = self.inbox.get(timeout=0.5)
+            except queue.Empty:
+                if self.interrupted_flag:
+                    return None
+                continue
+            return item
+
+    def _fail(self, message):
+        self.emit({"type": "turn.failed", "error": {"message": message}})
+        return 1
+
+    def _exec_usage(self):
+        u = self.usage
+        if not isinstance(u, dict):
+            return None
+        # thread/tokenUsage/updated carries totals; take the turn's "last" when present.
+        src = u.get("last") if isinstance(u.get("last"), dict) else u
+        def pick(*names):
+            for n in names:
+                v = src.get(n)
+                if isinstance(v, (int, float)):
+                    return int(v)
+            return 0
+        out = {"input_tokens": pick("inputTokens", "input_tokens"),
+               "cached_input_tokens": pick("cachedInputTokens", "cached_input_tokens"),
+               "output_tokens": pick("outputTokens", "output_tokens"),
+               "reasoning_output_tokens": pick("reasoningOutputTokens", "reasoning_output_tokens")}
+        return out if any(out.values()) else None
+
+    def shutdown(self):
+        try:
+            if self.proc and self.proc.poll() is None:
+                self.proc.stdin.close()
+                for _ in range(20):
+                    if self.proc.poll() is not None:
+                        break
+                    time.sleep(0.05)
+                if self.proc.poll() is None:
+                    self.proc.terminate()
+        except Exception:
+            pass
+
+
+def main():
+    o = parse_args(sys.argv[1:])
+    if o["prompt_b64"]:
+        prompt = base64.b64decode(o["prompt_b64"]).decode("utf-8", "replace")
+    else:
+        prompt = sys.stdin.read()
+    c = Client(o)
+
+    def on_signal(signum, frame):
+        c.interrupt()
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
+    try:
+        rc = c.run(prompt)
+    finally:
+        c.shutdown()
+    sys.exit(rc)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,242 @@
+#!/usr/bin/env python3
+"""pervio-dispatch — let a workflow step (an agent) spawn a CHILD agent turn, with
+hard guardrails. Roadmap P4 ("agent calls agent" + depth/concurrency/budget caps).
+
+A parent step reaches this ONLY when its spec sets `allowDispatch: true` (pervio-
+orchestrate then injects the PERVIO_* env below and scopes the parent's tools so it
+can call `pervio-dispatch`). SECURITY NOTE: the Bash allowlist is a convenience, NOT
+a boundary — a parent at acceptEdits/bypass can run any command. The real limits are
+enforced HERE, every call, in this order:
+
+  1. auth      — PERVIO_WF_ID present & well-formed (else not_authorized).
+  2. tier clamp— child tier = min(requested, parent tier); bypass / danger-full-access
+                 are NEVER granted to a child (tier_refused).
+  3. depth     — PERVIO_DISPATCH_DEPTH >= PERVIO_MAX_DEPTH (default 2) -> depth_cap.
+  4. codex+budget — codex turns carry no USD cost, so with a budget set we refuse
+                 codex children rather than count them free (codex_no_cost_field).
+  5. concurrency — grab one of K slot files via flock (LOCK_NB, fail-FAST not block;
+                 the kernel frees a slot even on SIGKILL, so a crash never leaks it).
+  6. budget+width — under one ledger lock: refuse if admitting this dispatch would
+                 exceed the budget or if total dispatches >= PERVIO_MAX_DISPATCHES.
+
+The child runs (via _pervio_lib.run_child) in an EPHEMERAL git worktree off HEAD:
+only its text answer + cost come back; its file writes die with the worktree.
+Output (one JSON line on stdout):
+  {"ok": true,  "text": "...", "costUSD": 0.01, "depth": 1}
+  {"ok": false, "error": "depth_cap|concurrency_cap|budget_cap|width_cap|
+                          codex_no_cost_field|tier_refused|not_authorized|
+                          not_a_repo|start_failed|timeout|child_error", "detail": "..."}
+"""
+import fcntl
+import json
+import os
+import sys
+import time
+import uuid
+
+SELF_DIR = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, SELF_DIR)
+from _pervio_lib import DispatchError, clamp_tier, run_child   # noqa: E402
+
+HOME = os.path.expanduser("~")
+CHAT = os.path.join(SELF_DIR, "pervio-chat")
+import re
+VALID_ID = re.compile(r"^[A-Za-z0-9_-]+$")
+
+WF_ID = os.environ.get("PERVIO_WF_ID", "")
+DEPTH = int(os.environ.get("PERVIO_DISPATCH_DEPTH", "0") or "0")
+MAX_DEPTH = int(os.environ.get("PERVIO_MAX_DEPTH", "2") or "2")
+MAX_CONC = int(os.environ.get("PERVIO_MAX_CONCURRENCY", "8") or "8")
+MAX_DISPATCHES = int(os.environ.get("PERVIO_MAX_DISPATCHES", "50") or "50")
+BUDGET = os.environ.get("PERVIO_BUDGET", "")            # "" = no budget gate
+ESTIMATE = float(os.environ.get("PERVIO_DISPATCH_ESTIMATE", "0.10") or "0.10")
+TIMEOUT = float(os.environ.get("PERVIO_CHILD_TIMEOUT", "180") or "180")
+PARENT_TIER = os.environ.get("PERVIO_PARENT_TIER", "")
+PARENT_BACKEND = os.environ.get("PERVIO_PARENT_BACKEND", "claude")
+REPO_TOP = os.environ.get("PERVIO_REPO_TOP", "")
+
+BASE = os.path.join(HOME, ".pervio", "wf", WF_ID, "dispatch") if VALID_ID.match(WF_ID or "") else ""
+
+
+def out(obj, code=0):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+    sys.exit(code)
+
+
+def refuse(error, detail="", code=1):
+    out({"ok": False, "error": error, "detail": detail}, code)
+
+
+def parse(argv):
+    o = {}
+    flags = {"backend", "prompt-b64", "perm", "sandbox", "model", "effort", "allow-tools"}
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--allow-network":
+            o["allow-network"] = "1"; i += 1
+        elif a.startswith("--") and a[2:] in flags:
+            if i + 1 >= len(argv):
+                refuse("bad_args", "missing value for %s" % a, 2)
+            o[a[2:]] = argv[i + 1]; i += 2
+        else:
+            refuse("bad_args", "unknown arg: %s" % a, 2)
+    return o
+
+
+# ---- ledger (spent + width), guarded by one lock; slots enforce concurrency ----
+
+def _read_ledger():
+    entries = {}
+    try:
+        with open(os.path.join(BASE, "ledger.ndjson"), "r", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                eid = e.get("id")
+                if eid is None:
+                    continue
+                if e.get("type") == "done" or eid not in entries:
+                    entries[eid] = e
+    except OSError:
+        pass
+    return entries
+
+
+def _spent_and_width(entries):
+    spent = 0.0
+    for e in entries.values():
+        if e.get("type") == "done":
+            spent += float(e.get("costUSD") or 0)
+        else:
+            spent += float(e.get("estimatedUSD") or 0)   # reserve conservatively in flight
+    return spent, len(entries)
+
+
+def _append(entry):
+    line = (json.dumps(entry) + "\n").encode()
+    fd = os.open(os.path.join(BASE, "ledger.ndjson"), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        os.write(fd, line)
+    finally:
+        os.close(fd)
+
+
+def reserve(backend):
+    """Under the ledger lock: refuse if admitting this dispatch (at its estimate)
+    would exceed the budget or the width cap; else reserve an id. Atomic — no TOCTOU."""
+    lock = open(os.path.join(BASE, "ledger.lock"), "w")
+    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+    try:
+        entries = _read_ledger()
+        spent, width = _spent_and_width(entries)
+        if width >= MAX_DISPATCHES:
+            refuse("width_cap", "%d dispatches already made (max %d)" % (width, MAX_DISPATCHES))
+        if BUDGET and (spent + ESTIMATE) > float(BUDGET):
+            refuse("budget_cap", "$%.4f reserved + $%.2f est would exceed budget $%s"
+                   % (spent, ESTIMATE, BUDGET))
+        eid = uuid.uuid4().hex[:12]
+        _append({"type": "pending", "id": eid, "ts": int(time.time()), "depth": DEPTH + 1,
+                 "backend": backend, "parent": os.environ.get("PERVIO_STEP_ID", ""),
+                 "estimatedUSD": ESTIMATE})
+        return eid
+    finally:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        lock.close()
+
+
+def acquire_slot():
+    """Grab one of K slot files via a non-blocking flock. Fail-FAST (never block) so
+    a parent step waiting here can't wedge the orchestrator's ThreadPool. The held fd
+    IS the slot; the kernel frees it on any process death, so a crash never leaks it."""
+    sem = os.path.join(BASE, "sem")
+    os.makedirs(sem, mode=0o700, exist_ok=True)
+    for i in range(MAX_CONC):
+        fd = open(os.path.join(sem, "slot_%d" % i), "w")
+        try:
+            fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except OSError:
+            fd.close()
+    return None
+
+
+def main():
+    o = parse(sys.argv[1:])
+    backend = o.get("backend", "claude")
+    if backend not in ("claude", "codex"):
+        refuse("bad_args", "backend must be claude|codex", 2)
+    if "prompt-b64" not in o:
+        refuse("bad_args", "need --prompt-b64", 2)
+
+    # 1. auth
+    if not BASE:
+        refuse("not_authorized", "no PERVIO_WF_ID — dispatch is only enabled for a step with allowDispatch:true")
+    os.makedirs(BASE, mode=0o700, exist_ok=True)
+
+    # 2. tier clamp (bypass/danger never granted; child <= parent write power)
+    requested = (o.get("sandbox") or "read-only") if backend == "codex" else (o.get("perm") or "plan")
+    try:
+        eff_tier = clamp_tier(backend, requested, PARENT_BACKEND, PARENT_TIER)
+    except DispatchError as de:
+        refuse(de.code, de.detail)
+
+    # 3. depth
+    if DEPTH >= MAX_DEPTH:
+        refuse("depth_cap", "already at depth %d (max %d)" % (DEPTH, MAX_DEPTH))
+
+    # 4. codex has no USD cost -> refuse under a budget instead of counting it free
+    if backend == "codex" and BUDGET:
+        refuse("codex_no_cost_field", "codex turns report no USD cost; can't honor a budget")
+
+    # 5. concurrency slot (fail-fast) — held for the whole child turn
+    slot = acquire_slot()
+    if slot is None:
+        refuse("concurrency_cap", "%d children already running (max %d)" % (MAX_CONC, MAX_CONC))
+
+    try:
+        # 6. budget + width reservation (atomic under the ledger lock)
+        eid = reserve(backend)
+
+        sid = os.environ.get("PERVIO_STEP_ID", "step") or "step"
+        cdir = os.path.join(BASE, sid, eid)
+        branch = "pervio/wf-%s/dispatch/%s/%s" % (WF_ID, sid, eid)
+        try:
+            ok, text, cost, err = run_child(
+                o["prompt-b64"], backend, eff_tier, REPO_TOP, cdir, branch, DEPTH,
+                TIMEOUT, CHAT, o.get("model"), o.get("effort"),
+                o.get("allow-tools"), bool(o.get("allow-network")))
+        except DispatchError as de:
+            refuse(de.code, de.detail)
+
+        # finalize cost in the ledger (done overrides the reservation estimate)
+        lock = open(os.path.join(BASE, "ledger.lock"), "w")
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            _append({"type": "done", "id": eid, "ts": int(time.time()), "depth": DEPTH + 1,
+                     "backend": backend, "parent": sid, "costUSD": cost})
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            lock.close()
+
+        if err == "timeout":
+            out({"ok": False, "error": "timeout", "detail": "child exceeded %ds" % int(TIMEOUT),
+                 "text": text, "costUSD": cost, "depth": DEPTH + 1}, 1)
+        out({"ok": ok, "text": text, "costUSD": cost, "depth": DEPTH + 1,
+             "error": err}, 0 if ok else 1)
+    finally:
+        try:
+            fcntl.flock(slot.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        slot.close()
+
+
+if __name__ == "__main__":
+    main()

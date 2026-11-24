@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# pervio-term — attach the iOS app's PTY channel to a persistent tmux session
+# running an interactive login shell. Because the session lives in tmux on the
+# server, a dropped mobile connection does NOT kill what's running: relaunching
+# re-attaches to the exact same live screen. Run `claude`, git, tests, etc. in it.
+#
+# The iOS client opens an SSH *PTY* channel and runs:
+#     pervio-term --session <name> --dir <project>
+#
+# First call creates the tmux session (a shell in <project>); later calls just
+# re-attach. List/kill helpers are provided for session management.
+set -euo pipefail
+
+session="main"
+dir="$HOME"
+action="attach"          # attach | list | kill
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --session) session="$2"; shift 2 ;;
+    --dir)     dir="$2"; shift 2 ;;
+    --list)    action="list"; shift ;;
+    --kill)    action="kill"; shift ;;
+    *) echo "pervio-term: unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+# The app's SSH shell is non-login: on macOS its PATH is the bare
+# /bin:/usr/bin:/usr/local/bin, so a Homebrew tmux (/opt/homebrew/bin) is
+# invisible to `command -v` — probe the usual install spots too (same lesson
+# as pervio-chat's find_cli for claude).
+# PERVIO_TMUX_DIRS (colon-separated) overrides the probe list — the test suite
+# uses it to exercise both the found and the not-found branch on any machine.
+TMUX_BIN="$(command -v tmux || true)"
+IFS=: read -ra _tmux_dirs <<< "${PERVIO_TMUX_DIRS:-$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin}"
+for d in "${_tmux_dirs[@]}"; do
+  [[ -z "$TMUX_BIN" && -x "$d/tmux" ]] && TMUX_BIN="$d/tmux"
+done
+if [[ -z "$TMUX_BIN" ]]; then
+  # The phone shows this line verbatim in the terminal, so make it the fix:
+  echo "pervio-term: 这台电脑没装 tmux(手机终端靠它保活)。在它上面跑一次: brew install tmux  /  tmux not found — run on this machine: brew install tmux" >&2
+  exit 4
+fi
+
+# Use an isolated server socket so these sessions never collide with any
+# tmux the user runs by hand on the desktop.
+TM=( "$TMUX_BIN" -L pervio )
+
+case "$action" in
+  list) exec "${TM[@]}" list-sessions ;;
+  kill) exec "${TM[@]}" kill-session -t "$session" ;;
+esac
+
+case "$dir" in
+  "~")    dir="$HOME" ;;
+  # ${dir#~/} is a trap: bash tilde-expands the ~/ PATTERN to "$HOME/", so the
+  # literal "~/" is never stripped and the dir becomes "$HOME/~/…". Strip by offset.
+  "~/"*)  dir="$HOME/${dir:2}" ;;
+esac
+if [[ ! -d "$dir" ]]; then echo "pervio-term: dir missing: $dir" >&2; exit 3; fi
+
+# Create the session detached if it doesn't exist yet, starting the user's
+# default login shell in it (no command = tmux runs $SHELL).
+if ! "${TM[@]}" has-session -t "$session" 2>/dev/null; then
+  "${TM[@]}" new-session -d -s "$session" -c "$dir"
+  # Resize to the attaching client and keep history generous for scrollback.
+  "${TM[@]}" set-option -t "$session" history-limit 20000 \; \
+             set-option -t "$session" status off >/dev/null 2>&1 || true
+else
+  # Existing session: if it's idle at a shell prompt, cd into the project dir so
+  # reopening always lands in the right place (the session only got `-c <dir>` at
+  # creation, and may have drifted). If a program is running (claude/vim/htop/…),
+  # leave it alone so we reattach to it instead of disrupting it.
+  cur="$("${TM[@]}" display-message -p -t "$session" '#{pane_current_command}' 2>/dev/null || true)"
+  case "$cur" in
+    zsh|-zsh|bash|-bash|sh|-sh|fish|-fish)
+      # cd only — no clear. Wiping the screen on every reattach threw away the
+      # previous visit's output, which is exactly what the user comes back for
+      # (the scrollback survives, but nobody should need PgUp to see what just
+      # happened). The leading space keeps the cd itself out of shell history.
+      "${TM[@]}" send-keys -t "$session" " cd $(printf %q "$dir")" Enter 2>/dev/null || true ;;
+  esac
+fi
+
+# Make PgUp scroll the shell's scrollback like a normal terminal: enter copy-mode
+# and page up. In a full-screen app (vim/less/claude TUI use the alternate screen)
+# forward PgUp to the app instead. Inside copy-mode, PgDn/arrows scroll, q exits.
+# Bound on the root key table of this -L pervio server (idempotent, set every attach
+# so already-running servers pick it up too).
+"${TM[@]}" bind-key -n PPage if-shell -F '#{alternate_on}' 'send-keys PPage' 'copy-mode -eu' >/dev/null 2>&1 || true
+
+# Attach. -d detaches any other client so the phone always gets a clean,
+# correctly-sized screen.
+exec "${TM[@]}" attach-session -d -t "$session"

@@ -1,0 +1,146 @@
+{
+ "name": "深度调研",
+ "slug": "deep_research",
+ "expose": true,
+ "summary": "双引擎会审:Claude 与 Codex(不同模型+不同搜索源)各自独立深查同一问题,汇总对表标出【双方印证】与真分歧,再挑至多 5 条承重结论逐条找反证复核,驳回的进存疑区,最终成文存档 ~/deep-research。适合热点词辨析、选型调查、「这数字可信吗」类问题。",
+ "spec": {
+  "name": "深度调研",
+  "steps": [
+   {
+    "id": "dig_claude",
+    "backend": "claude",
+    "model": "flagship",
+    "allowNetwork": true,
+    "retry": 1,
+    "dependsOn": [],
+    "prompt": "你是首席调研员,独立完成一次深度调研。问题:{{param.query}}\n\n放开用你的全部本领:可以自行拆解子问题、并行探查;有 WebSearch 工具就用,没有就用 WebFetch 打开 https://html.duckduckgo.com/html/?q=检索词(空格用+)当搜索页;学术题可用 Semantic Scholar 免 key 接口 https://api.semanticscholar.org/graph/v1/paper/search?query=QUERY&fields=title,year,abstract,citationCount&limit=20 。接口 429/超时就等几秒重试或换路。优先一手来源(官方文档、论文原文、issue 原帖、作者原话),少信转述。\n\n要求四条:\n- 广:独立来源尽量多个域名,别在一两个站里打转;\n- 深:每个关键结论都给出处链接和具体数字或原文短引;\n- 狠:主动找反面说法、独立复现、翻车案例,别只捡顺耳的;\n- 诚:查不到、被限流、来源存疑,一律如实标注——如实的空缺好过硬凑。\n输出完整中文调研简报(markdown):按题目自然分节,每节结论带来源;结尾附「来源清单」(只列真打开过的)与「未决问题」。\n\n【输出纪律 · 无人值守】这是无人值守运行,没有人会回答你或批准计划:不要提问,不要把成果写进计划文件、不要把成果当作「计划」提交——下游只保存你最后一条普通回复,最终回复必须就是完整成果本身,不加「我已完成」「报告如下」之类的前后缀;成果写进计划文件或中途消息里等于全部丢失。"
+   },
+   {
+    "id": "dig_codex",
+    "backend": "codex",
+    "model": "gpt-5.6-sol",
+    "optional": true,
+    "retry": 1,
+    "dependsOn": [],
+    "prompt": "你是独立调研员,独立完成一次深度调研(另有一名调研员在用不同的模型和搜索引擎查同一问题,你们互相看不见——你的独立性本身就是价值,照你自己的判断查)。问题:{{param.query}}\n\n你自带联网搜索,直接搜;优先一手来源(官方文档、论文原文、issue 原帖、作者原话),少信转述。\n\n要求四条:\n- 广:独立来源尽量多个域名,别在一两个站里打转;\n- 深:每个关键结论都给出处链接和具体数字或原文短引;\n- 狠:主动找反面说法、独立复现、翻车案例,别只捡顺耳的;\n- 诚:查不到、被限流、来源存疑,一律如实标注——如实的空缺好过硬凑。\n输出完整中文调研简报(markdown):按题目自然分节,每节结论带来源;结尾附「来源清单」(只列真打开过的)与「未决问题」。\n\n【输出纪律 · 无人值守】这是无人值守运行,没有人会回答你或批准计划:不要提问,不要把成果写进计划文件、不要把成果当作「计划」提交——下游只保存你最后一条普通回复,最终回复必须就是完整成果本身,不加「我已完成」「报告如下」之类的前后缀;成果写进计划文件或中途消息里等于全部丢失。"
+   },
+   {
+    "id": "merge",
+    "backend": "claude",
+    "model": "flagship",
+    "dependsOn": [
+     "dig_claude",
+     "dig_codex"
+    ],
+    "prompt": "两名调研员(甲用 Claude+其搜索,乙用 Codex+微软系搜索,模型与搜索引擎都不同)各自独立调研了同一个问题,互相没见过对方。问题:{{param.query}}\n\n甲的简报:\n{{dig_claude.output}}\n\n乙的简报:\n{{dig_codex.output}}\n\n乙可能缺席(上面空白)——那样就按单侧处理,并在开头声明「本次仅单侧调研,缺少跨引擎对照,置信整体降一档」。\n\n你的职责是对表与批判,不是转述:\n1) 两家都说的 → 标【双方印证】,这是最硬的结论;\n2) 打架的 → 原样摆出两说、各附来源,不许和稀泥;可以判断谁更可信,但必须说理由;\n3) 只有一家提的 → 标【单源】;\n4) 点评两家来源质量:谁在引一手,谁在抄转述。\n\n输出中文 markdown 整合报告,≤1500 字,保留关键链接。\n\n【输出纪律 · 无人值守】这是无人值守运行,没有人会回答你或批准计划:不要提问,不要把成果写进计划文件、不要把成果当作「计划」提交——下游只保存你最后一条普通回复,最终回复必须就是完整成果本身,不加「我已完成」「报告如下」之类的前后缀;成果写进计划文件或中途消息里等于全部丢失。"
+   },
+   {
+    "id": "vfyplan",
+    "backend": "claude",
+    "model": "balanced",
+    "dependsOn": [
+     "merge"
+    ],
+    "prompt": "下面是一份双引擎调研的整合报告。把里面「最承重」的结论挑出来,至多 5 条——报告的答案压在它们身上、带具体数字或硬断言、错了最丢人的那种。优先挑【单源】和有分歧的;附上报告里给的来源链接,没给就写「无」。没有值得核的就输出空数组 []。\n\n整合报告:\n{{merge.output}}\n\n输出一个 JSON 数组,除数组外一个字都不要(不要代码围栏):\n[{\"claim\": \"原结论\", \"source_url\": \"来源链接或「无」\"}]",
+    "outputSchema": {
+     "type": "array",
+     "maxItems": 5,
+     "items": {
+      "type": "object",
+      "required": [
+       "claim",
+       "source_url"
+      ],
+      "properties": {
+       "claim": {
+        "type": "string"
+       },
+       "source_url": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   },
+   {
+    "id": "vfy",
+    "backend": "claude",
+    "model": "balanced",
+    "optional": true,
+    "allowNetwork": true,
+    "dependsOn": [
+     "vfyplan"
+    ],
+    "fanout": {
+     "over": "{{vfyplan.json}}",
+     "max": 5,
+     "maxParallel": 3,
+     "timeoutSec": 600,
+     "tolerateAllFail": true
+    },
+    "prompt": "你是复核员,任务是推翻这条结论,推不翻它才算数:\n结论:{{item.claim}}\n声称的来源:{{item.source_url}}\n\n步骤:1) 来源不是「无」就用 WebFetch 打开它,核对是否真说了这话(找不到=造假);2) 再花至多 2 次抓取找反面证据(不同说法、更新的数据、方法质疑)。没有 WebSearch 工具就用 WebFetch 打开 https://html.duckduckgo.com/html/?q=检索词 搜。\n\n输出一个 JSON 对象,除对象外一个字都不要(不要代码围栏;字符串里别用英文双引号):\n{\"claim\": \"原结论\", \"verdict\": \"confirmed|refuted|unverified\", \"note\": \"一两句:来源核对结果+反证找到没有\"}",
+    "outputSchema": {
+     "type": "object",
+     "required": [
+      "claim",
+      "verdict",
+      "note"
+     ],
+     "properties": {
+      "claim": {
+       "type": "string"
+      },
+      "verdict": {
+       "type": "string",
+       "enum": [
+        "confirmed",
+        "refuted",
+        "unverified"
+       ]
+      },
+      "note": {
+       "type": "string"
+      }
+     }
+    }
+   },
+   {
+    "id": "write",
+    "backend": "claude",
+    "model": "flagship",
+    "dependsOn": [
+     "merge",
+     "vfy"
+    ],
+    "prompt": "你是资深研究员,为中文读者写最终深度调研报告,直接回答:{{param.query}}\n\n材料一 · 甲(Claude)原始简报:\n{{dig_claude.output}}\n\n材料二 · 乙(Codex)原始简报(可能缺席):\n{{dig_codex.output}}\n\n材料三 · 双引擎整合报告:\n{{merge.output}}\n\n材料四 · 复核记录(JSON,可能为空;verdict=refuted 的结论绝不许写成事实,unverified 的必须标「未核实」):\n{{vfy.json}}\n\n结构:\n# 一句话答案 —— 先直答;\n## 展开 —— 分节讲清,带数字与来源链接(从原始简报里把关键链接捞回来,别让它们死在中间环节);\n## 两家分歧对照 —— 甲乙真分歧如实写两说;乙缺席就把本节改为「单侧声明」;\n## 存疑区 —— 被复核驳回或未核实的说法列这里,写明为什么;\n## 复核记录 —— 表:结论|裁定|一句话说明;\n## 来源 —— 只列材料里真出现过的链接。\n规则:只许用材料里的事实与链接;引入材料外背景必须标注「(背景,非本批材料)」;覆盖不足就在开头如实声明。全文中文,术语保英文。\n\n【输出纪律 · 无人值守】这是无人值守运行,没有人会回答你或批准计划:不要提问,不要把成果写进计划文件、不要把成果当作「计划」提交——下游只保存你最后一条普通回复,最终回复必须就是完整成果本身,不加「我已完成」「报告如下」之类的前后缀;成果写进计划文件或中途消息里等于全部丢失。"
+   },
+   {
+    "id": "prep",
+    "backend": "claude",
+    "dependsOn": [],
+    "command": "mkdir -p \"$HOME/deep-research\" && echo \"REPORT_DATE: $(date +%F)\"",
+    "prompt": ""
+   },
+   {
+    "id": "save",
+    "backend": "claude",
+    "perm": "acceptEdits",
+    "model": "fast",
+    "dir": "~/deep-research",
+    "dependsOn": [
+     "write",
+     "prep"
+    ],
+    "prompt": "把下面的报告原样保存为一个 markdown 文件。日期信息:{{prep.output}}。文件名:日期-主题短名.md(主题短名自拟,小写英文或拼音连字符,≤24 字符),存到当前目录(~/deep-research)。不许改动报告内容一个字。保存后,最终回复只写这个文件的绝对路径,别的什么都不要说。\n\n报告全文:\n{{write.output}}"
+   }
+  ]
+ },
+ "params": [
+  {
+   "name": "query",
+   "label": "调研问题",
+   "type": "string",
+   "required": true
+  }
+ ]
+}

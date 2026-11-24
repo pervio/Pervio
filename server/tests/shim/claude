@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+"""Committed test shim for `claude`. pervio-chat invokes it in --text mode with the
+prompt on stdin; a `SHIM:{json}` line in that prompt drives behavior:
+  {"write":[{"file":"a.txt","content":"x"}], "sleep":0, "rc":0,
+   "text":"reply", "sid":"sess-1", "is_error":false}
+Emits claude-style stream-json (an init line carrying session_id, then a terminal
+result), so pervio-run/pervio-chat see a realistic turn with NO model call."""
+import json
+import os
+import sys
+import time
+
+if os.environ.get("SHIM_ENV_LOG"):         # lets tests see the env the child got (provider exports)
+    try:
+        with open(os.environ["SHIM_ENV_LOG"], "a") as _f:
+            _f.write(json.dumps({k: v for k, v in os.environ.items()
+                                 if k.startswith("ANTHROPIC_") or k.startswith("PERVIO_PROVIDER")}) + "\n")
+    except OSError:
+        pass
+
+if os.environ.get("SHIM_ARGV_LOG"):        # lets tests inspect the child's real argv
+    try:
+        with open(os.environ["SHIM_ARGV_LOG"], "a") as _f:
+            _f.write(json.dumps(sys.argv) + "\n")
+    except OSError:
+        pass
+
+_lock = __import__("threading").Lock()
+def _out(line):
+    with _lock:
+        sys.stdout.write(line)
+        sys.stdout.flush()
+
+_bg_threads = []
+_last_ins = {}     # the latest turn's instructions (stream mode: `linger` is read after EOF)
+
+_pending = {}      # task_id -> its row in background_tasks_changed (the whole pending set is sent each time)
+_stops = {}        # task_id -> an Event: set by a control_request stop_task (see _control)
+
+def _start_background(ins, sid):
+    """{"bg": {"id": "t1", "desc": "…", "secs": 2, "text": "…"}}: the engine's own
+    background task, as the real Claude Code announces it (2026-10-20 probe):
+    a Bash tool_use with run_in_background, background_tasks_changed with the
+    task, task_started, the tool_result that names it — and, `secs` later from
+    a thread, task_updated / task_notification / background_tasks_changed and
+    a continuation turn of the engine's own (init, text, result).
+
+    A LIST of them starts several at once, and one may be a sub-agent
+    (2026-11-22, the fields of the real 2.1.322 stream): "agent": its
+    subagent_type (an Agent tool_use, task_type local_agent, usage on its
+    notification), "parent": the task id of the sub-agent that launched it,
+    "progress": [{"after": secs, "desc": "Running pytest", "tokens": n,
+    "tools": k}] its task_progress reports, "status": how it ends
+    (completed | failed | stopped)."""
+    bgs = ins.get("bg")
+    if not bgs:
+        return
+    if isinstance(bgs, dict):
+        bgs = [bgs]
+    for bg in bgs:
+        _start_one(bg, sid)
+
+_set_lock = __import__("threading").Lock()
+def _set_pending(tid, row, sid):
+    """Add (row) or drop (None) one task and announce the whole set — one step,
+    so two tasks ending together cannot announce their sets out of order."""
+    with _set_lock:
+        if row is None:
+            _pending.pop(tid, None)
+        else:
+            _pending[tid] = row
+        _out(json.dumps({"type": "system", "subtype": "background_tasks_changed", "tasks": list(_pending.values()), "session_id": sid}) + "\n")
+
+def _start_one(bg, sid):
+    tid = str(bg.get("id", "bg1")); desc = str(bg.get("desc", "background work"))
+    agent = bg.get("agent"); parent = bg.get("parent")
+    if agent:
+        _out(json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "tu-" + tid, "name": "Agent",
+                         "input": {"subagent_type": agent, "description": desc, "prompt": desc, "run_in_background": True}}]}}) + "\n")
+    else:
+        _out(json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "tu-" + tid, "name": "Bash",
+                         "input": {"command": bg.get("command", "sleep"), "run_in_background": True, "description": desc}}]}}) + "\n")
+    row = {"task_id": tid, "task_type": "local_agent" if agent else "local_bash", "description": desc}
+    if agent: row["subagent_type"] = agent
+    if parent: row["parent_task_id"] = parent
+    _set_pending(tid, row, sid)
+    started = {"type": "system", "subtype": "task_started", "task_id": tid, "tool_use_id": "tu-" + tid,
+               "description": desc, "is_backgrounded": True, "task_type": row["task_type"], "session_id": sid}
+    if agent: started["subagent_type"] = agent; started["spawn_depth"] = 1
+    if parent: started["parent_task_id"] = parent; started["owned_by_subagent"] = True
+    _out(json.dumps(started) + "\n")
+    _out(json.dumps({"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "tu-" + tid,
+                     "content": ("Async agent launched successfully." if agent else "Command running in background with ID: %s" % tid)}]}}) + "\n")
+    stop = _stops.setdefault(tid, __import__("threading").Event())
+    def finish():
+        t0 = time.time(); secs = float(bg.get("secs", 1)); last = {}
+        for step in sorted(bg.get("progress") or [], key=lambda p: float(p.get("after", 0))):
+            if stop.wait(max(0.0, float(step.get("after", 0)) - (time.time() - t0))):
+                break
+            last = {"total_tokens": int(step.get("tokens", 0)), "tool_uses": int(step.get("tools", 0)), "duration_ms": int((time.time() - t0) * 1000)}
+            _out(json.dumps({"type": "system", "subtype": "task_progress", "task_id": tid, "tool_use_id": "tu-" + tid,
+                             "description": str(step.get("desc", "")), "subagent_type": agent, "usage": last,
+                             "last_tool_name": "Bash", "session_id": sid}) + "\n")
+        stopped = stop.wait(max(0.0, secs - (time.time() - t0)))
+        # Stopped from outside (stop_task): it ends as stopped, and — the real
+        # engine — a sub-agent's own tasks end with it.
+        status = "stopped" if stopped else str(bg.get("status", "completed"))
+        if stopped:
+            for other, row in list(_pending.items()):
+                if row.get("parent_task_id") == tid and other in _stops:
+                    _stops[other].set()
+        _out(json.dumps({"type": "system", "subtype": "task_updated", "task_id": tid,
+                         "patch": {"status": "killed" if status == "stopped" else status}, "session_id": sid}) + "\n")
+        note = {"type": "system", "subtype": "task_notification", "task_id": tid, "tool_use_id": "tu-" + tid,
+                "status": status, "summary": bg.get("text", "background done"), "session_id": sid}
+        if agent:
+            note["usage"] = dict(last or {"total_tokens": 0, "tool_uses": 0}, duration_ms=int((time.time() - t0) * 1000))
+        _out(json.dumps(note) + "\n")
+        _set_pending(tid, None, sid)
+        # the engine speaks again on its own: a turn of its own making
+        _out(json.dumps({"type": "system", "subtype": "init", "session_id": sid}) + "\n")
+        _out(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": bg.get("text", "background done")}]}}) + "\n")
+        _out(json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": bg.get("text", "background done"),
+                         "session_id": sid}) + "\n")
+    t = __import__("threading").Thread(target=finish, daemon=True)
+    _bg_threads.append(t); t.start()
+
+def _control(line):
+    """A control_request on stdin, as Claude Code 2.1.322 takes it (measured
+    2026-11-22): stop_task ends that task as stopped and is answered success —
+    an id nobody has is answered success too, and changes nothing."""
+    try:
+        o = json.loads(line)
+    except ValueError:
+        return
+    if not isinstance(o, dict) or o.get("type") != "control_request":
+        return
+    req = o.get("request") if isinstance(o.get("request"), dict) else {}
+    if req.get("subtype") == "stop_task" and req.get("task_id") in _stops:
+        _stops[req["task_id"]].set()
+    _out(json.dumps({"type": "control_response", "response": {"subtype": "success", "request_id": o.get("request_id"), "response": {}}}) + "\n")
+
+def run_turn(prompt):
+    """One turn, exactly the one-shot shim's behaviour; returns the rc."""
+    if os.environ.get("SHIM_PROMPT_LOG"):      # lets tests see the FULL prompt (meta keeps 140 chars)
+        try:
+            with open(os.environ["SHIM_PROMPT_LOG"], "a") as _f:
+                _f.write(prompt + "\n===PROMPT-END===\n")
+        except OSError:
+            pass
+    ins = {}
+    for line in prompt.splitlines():
+        line = line.strip()
+        if line.startswith("SHIM:"):
+            try:
+                ins = json.loads(line[5:])
+            except ValueError:
+                pass
+    global _last_ins
+    _last_ins = ins
+
+    # One-shot failure for retry tests: {"fail_once": {"flag": "/abs/marker",
+    # "text": "…"}} — the FIRST invocation (no marker yet) drops the marker and
+    # replies with an is_error result carrying that text; later invocations run
+    # the normal ins verbatim.
+    fo = ins.get("fail_once")
+    if fo and fo.get("flag") and not os.path.exists(fo["flag"]):
+        with open(fo["flag"], "w") as f:
+            f.write("1")
+        ins = dict(ins, is_error=True, text=fo.get("text", "transient"))
+
+    # One-shot WRONG ANSWER for outputSchema corrective-retry tests: {"text_once":
+    # {"flag": "/abs/marker", "text": "not json at all"}} — the first invocation
+    # SUCCEEDS (rc 0, no error) but replies with that text; later invocations run
+    # the normal ins verbatim. Distinct from fail_once: the turn is fine, the
+    # CONTENT is wrong — exactly the case the format-fix retry exists for.
+    to = ins.get("text_once")
+    if to and to.get("flag") and not os.path.exists(to["flag"]):
+        with open(to["flag"], "w") as f:
+            f.write("1")
+        ins = dict(ins, text=to.get("text", "wrong"), sid=to.get("sid", ins.get("sid", "shimsess")))
+
+    # Env default reply (watch-mode tests drive the WATCHER's words through the
+    # environment, since its prompt is composed by pervio-group, not the test).
+    if not ins and os.environ.get("SHIM_CLAUDE_JSON"):     # whole instruction set from the env
+        try:
+            ins = json.loads(os.environ["SHIM_CLAUDE_JSON"])
+        except ValueError:
+            pass
+    if "text" not in ins and os.environ.get("SHIM_CLAUDE_TEXT"):
+        ins["text"] = os.environ["SHIM_CLAUDE_TEXT"]
+
+    sid = ins.get("sid", "shimsess")
+    _out(json.dumps({"type": "system", "subtype": "init", "session_id": sid}) + "\n")
+    _start_background(ins, sid)
+
+    # Streamed PROGRESS for watch-mode tests: {"trace": [{"say": "…"}, {"tool":
+    # "Bash", "command": "ls"}], "trace_gap": 0.2} — assistant text / tool_use
+    # events spaced out in time, so a watcher can be woken mid-run.
+    for step in ins.get("trace", []):
+        if "tool" in step:
+            blk = {"type": "tool_use", "id": "tu", "name": step["tool"],
+                   "input": {k: v for k, v in step.items() if k != "tool"}}
+        else:
+            blk = {"type": "text", "text": step.get("say", "")}
+        _out(json.dumps({"type": "assistant", "message": {"content": [blk]}}) + "\n")
+        pass
+        time.sleep(float(ins.get("trace_gap", 0.2)))
+
+    for w in ins.get("write", []):
+        d = os.path.dirname(w["file"])
+        if d:
+            os.makedirs(d, exist_ok=True)
+        with open(w["file"], "w") as f:
+            f.write(w["content"])
+
+    # Spawn a GRANDCHILD (a plain child of this shim, inheriting the shim's process
+    # group) and record its pid — lets a test prove a timeout kills the whole GROUP
+    # (killpg) and not merely this leader: {"spawn": {"pidfile": "/abs", "secs": 60}}.
+    sp = ins.get("spawn")
+    if sp:
+        import subprocess as _subp
+        gc = _subp.Popen(["sleep", str(sp.get("secs", 60))], stdin=_subp.DEVNULL,
+                         stdout=_subp.DEVNULL, stderr=_subp.DEVNULL)
+        try:
+            with open(sp["pidfile"], "w") as pf:
+                pf.write(str(gc.pid))
+        except OSError:
+            pass
+
+    if ins.get("sleep"):
+        time.sleep(float(ins["sleep"]))
+
+    if ins.get("stderr"):                   # let failed-run autopsy tests plant a stderr line
+        sys.stderr.write(str(ins["stderr"]) + "\n")
+        sys.stderr.flush()
+
+    is_err = bool(ins.get("is_error", False))
+    result = {"type": "result", "subtype": "success", "is_error": is_err,
+              "result": ins.get("text", "ok"), "session_id": sid}
+    if "cost" in ins:                       # let dispatch budget tests control the USD cost
+        result["total_cost_usd"] = ins["cost"]
+    if "usage" in ins:                      # let token-ledger tests control the usage counts
+        result["usage"] = ins["usage"]
+    _out(json.dumps(result) + "\n")
+    pass
+    return int(ins.get("rc", 0))
+
+
+def _message_text(line):
+    try:
+        o = json.loads(line)
+    except ValueError:
+        return None
+    if not isinstance(o, dict) or o.get("type") != "user":
+        return None
+    c = (o.get("message") or {}).get("content")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        return "\n".join(x.get("text", "") for x in c if isinstance(x, dict) and x.get("type") == "text")
+    return None
+
+first = sys.stdin.readline()
+if "--input-format" in sys.argv and "stream-json" in sys.argv and _message_text(first.strip()) is not None:
+    # A living run (2026-10-20): user messages arrive as stream-json lines, one
+    # turn each, until stdin closes; a pending background task is waited for
+    # (its continuation turn included) before leaving, as the real engine does.
+    rc = 0
+    line = first
+    while line:
+        text = _message_text(line.strip())
+        if text is not None:
+            rc = run_turn(text)
+        else:
+            _control(line.strip())
+        line = sys.stdin.readline()
+    for t in _bg_threads:
+        t.join()
+    # {"linger": secs}: stay a moment after EOF before leaving, the way codex's
+    # app-server takes a beat to release its thread lock after stdin closes.
+    try:
+        time.sleep(float(_last_ins.get("linger") or 0))
+    except (TypeError, ValueError):
+        pass
+    sys.exit(rc)
+else:
+    # One prompt as plain text — the one-shot CLI, and callers that pass the
+    # app's stream-json argv through but feed plain text themselves (the e2e
+    # sandbox's agent double): the first line is part of the prompt.
+    sys.exit(run_turn(first + sys.stdin.read()))

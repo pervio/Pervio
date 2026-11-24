@@ -1,0 +1,960 @@
+#!/usr/bin/env bash
+# pervio-chat — thin wrapper that the iOS app runs over an SSH exec channel.
+#
+# It launches Claude Code in bidirectional stream-json mode: it reads
+# newline-delimited JSON user messages from STDIN and writes JSON events to
+# STDOUT. One process serves a whole multi-turn conversation, so the ~24k-token
+# system prompt is cached once instead of per message.
+#
+# The iOS client just opens an SSH channel and runs:
+#     pervio-chat --dir <project> [--resume <session_id>] [--perm <mode>]
+#
+# This is NOT a daemon. It is started on demand by sshd and exits when the
+# SSH channel closes (or, with --resume, can be relaunched to continue).
+set -euo pipefail
+
+# Dir of this script (and its siblings like pervio-codex-index), resolving symlinks.
+SELF_DIR="$(dirname "$(readlink -f "$0")")"
+
+# Owner-only by default: the approval session dir carries the per-turn sid (in
+# mcp.json), the control FIFO, and the events log — on a shared host none of that
+# should be world-readable. This also makes Chat mode match Run mode, where
+# pervio-run already sets umask 077 before spawning us, so an agent's file writes
+# are private by default either way.
+umask 077
+
+# Claude Code — especially with workflows / `--effort ultracode`, which fan out many
+# concurrent subprocesses — opens a LOT of file descriptors. A non-interactive SSH
+# shell defaults to a soft limit of 256 (macOS), so claude dies at startup with
+# "An unknown error occurred, possibly due to low max file descriptors (Current
+# limit: 256)". The hard limit is unlimited, so raise the soft limit (no sudo).
+# Harmless where it's already high (e.g. Linux servers).
+ulimit -n 65536 2>/dev/null || true
+
+# Load LOCAL, non-synced secrets if present — e.g. CLAUDE_CODE_OAUTH_TOKEN from
+# `claude setup-token` (a ~1-year token that works over SSH without the keychain).
+# Lives in ~/.pervio (NOT the repo), so the secret is never synced to git/the server;
+# on a host without this file, claude just uses its normal auth (keychain / file).
+[ -f "$HOME/.pervio/credentials.env" ] && . "$HOME/.pervio/credentials.env"
+
+dir="$HOME"
+resume=""
+perm="default"          # default | acceptEdits | plan | bypassPermissions
+model=""
+effort=""               # low | medium | high | xhigh | max (empty = session default)
+mode="stream"           # stream = persistent bidirectional stream-json (multi-turn)
+                        # text   = one plain-text prompt, one turn, exit
+prompt_b64=""           # when set (text mode): base64 of the user prompt, fed via stdin
+backend="claude"        # claude (claude -p) | codex (codex exec --json) | cursor (agent -p)
+provider=""             # a third-party provider by name (pervio-provider): claude/codex only
+sandbox_arg=""          # codex only: --sandbox value sent straight by the app (no mapping)
+reviewer_arg=""         # codex only: who settles approvals — auto (default) | user
+push_device=""          # the phone this turn belongs to: an approval ping goes to it alone
+service_tier=""         # codex only: "priority" = codex's Fast, "default" = standard, "" = the Mac's config
+input_fifo=""           # a living run (pervio-run): further user messages arrive on this FIFO
+input_keeper=""         # …relayed into the engine's stdin by `pervio-run keep --run <run-id>` (the path to pervio-run)
+run_id=""
+disallow_tools=""       # claude only: tools stripped from the model's view (see below)
+allow_tools=""          # claude only: scoped tool allow-list (e.g. "WebFetch") so a
+                        # step can fetch the network WITHOUT bypassPermissions
+stop_tag=""             # app's kill handle for THIS turn (see the block below)
+extra_dirs=()          # --extra-dir: folders the agent may also edit (see the parser)
+approve_sid=""          # per-turn nonce: when set on an ask-tier chat, run claude with
+                        # the pervio-approve permission-prompt tool so the phone can
+                        # Allow/Deny each tool in-turn (see the approval block below).
+pervio_ctx=""           # set by --pervio-context: the app opted THIS conversation in to
+                        # the Pervio tool layer (composer chip, or a chat born from a wf
+                        # context): claude mounts the perviotools MCP server; codex
+                        # mounts it READ-ONLY (server-enforced PERVIO_MCP_RO) plus a
+                        # per-turn discovery prefix. Empty = the default = ZERO
+                        # injection/attachment, fully native.
+lang="zh"               # --lang zh|en: language of the injected POINTER PROSE only —
+                        # tool names, allowlists and mounts are language-free and do
+                        # not move. The app sends --lang en only when its Settings
+                        # switched the prompt language; absent = the shipped Chinese,
+                        # verbatim (so older apps change nothing).
+
+# `pervio-chat respond …` — the phone's Allow/Deny answer, delivered as a SEPARATE
+# one-shot SSH command. Writes ONE decision line to the per-session FIFO that the
+# blocked pervio-approve is reading, then exits. Non-blocking + non-fatal (the turn may
+# already be over). This verb returns immediately; it never touches claude/the CLI.
+if [[ "${1:-}" == "respond" ]]; then
+  shift
+  r_sid=""; r_rid=""; r_behavior="deny"; r_message=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --sid)        r_sid="$2"; shift 2 ;;
+      --request-id) r_rid="$2"; shift 2 ;;
+      --behavior)   r_behavior="$2"; shift 2 ;;
+      --message)    r_message="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  PERVIO_FIFO="$HOME/.pervio/chat/$r_sid/control.fifo" \
+  PERVIO_RID="$r_rid" PERVIO_BEH="$r_behavior" PERVIO_MSG="$r_message" python3 -I - <<'PY'
+import os, json
+fifo = os.environ.get("PERVIO_FIFO","")
+d = {"request_id": os.environ.get("PERVIO_RID",""), "behavior": os.environ.get("PERVIO_BEH","deny")}
+msg = os.environ.get("PERVIO_MSG","")
+if msg: d["message"] = msg
+try:
+    fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)   # ENXIO if no reader, ENOENT if gone
+except OSError:
+    raise SystemExit(0)                                # late/orphan answer -> harmless no-op
+try:
+    os.write(fd, (json.dumps(d) + "\n").encode())
+finally:
+    os.close(fd)
+PY
+  exit 0
+fi
+
+# `pervio-chat engines` (below) — which engines (and tmux, for the phone
+# terminal) this Mac has, resolved exactly like a turn resolves them. The app
+# runs it on connect: a codex-only Mac gets codex as its default engine instead
+# of a "claude not found" on the first message, and the market greys out
+# templates whose engine is missing here.
+#
+# Locate a CLI even under a non-interactive SSH shell, which often lacks the
+# interactive login PATH (e.g. macOS keeps /opt/homebrew/bin out of it). Tries PATH
+# first, then the common install locations across package managers — official
+# installer (~/.local/bin), Homebrew, /usr/local, npm-global, bun, snap — so it
+# works no matter how claude/codex was installed, not just one machine's layout.
+# Pervio adapts to the Mac, not the other way round: the CLIs run with the PATH
+# the person's own Terminal has. An SSH exec channel gets a bare shell that
+# never reads .zshrc, so anything a version manager put on PATH there (nvm,
+# volta, fnm, pnpm, pyenv, uv…) is invisible here — a tester's npm-installed
+# codex could not be found, then could not find node (2026-10-15). So once an
+# hour we start their login shell the way a Terminal would, take ONLY its
+# PATH string (no other variable), cache it, and put it first. Our own scripts
+# are always called by absolute path, so nothing of ours can be shadowed.
+# Skipped under the hermetic test seams.
+# Cursor's file credential store, when the person logged in through it (see the
+# cursor branch below): exported for the agent, and the fact itself for `engines`.
+# The approval channel a live chat turn asks over: an owner-only dir keyed by
+# the phone's per-turn sid and a FIFO the phone's `respond` writes decisions
+# into. Claude (pervio-approve) and Codex over app-server (pervio-codex-app)
+# both ask through it. umask 077 (top of file) already makes these owner-only
+# from birth — no create-then-chmod TOCTOU window; the explicit modes are
+# belt-and-suspenders. Sets $sess.
+approval_session() {
+  sess="$HOME/.pervio/chat/$1"
+  mkdir -p "$sess"; chmod 700 "$sess" 2>/dev/null || true
+  [[ -p "$sess/control.fifo" ]] || mkfifo -m 600 "$sess/control.fifo"
+}
+cursor_file_login() { [[ -s "$HOME/.cursor/auth.json" ]]; }
+cursor_store_env() { if cursor_file_login; then export AGENT_CLI_CREDENTIAL_STORE=file; fi; }
+
+borrow_login_path() {
+  [[ -n "${PERVIO_CHAT_PATH_ONLY:-}" || -n "${PERVIO_E2E:-}" ]] && return
+  local cache="$HOME/.pervio/cache/login-path" lp=""
+  if [[ -f "$cache" && -z "$(find "$cache" -mmin +60 2>/dev/null)" ]]; then
+    lp="$(cat "$cache" 2>/dev/null)"
+  else
+    lp="$(${SHELL:-/bin/zsh} -lic 'printf %s "$PATH"' 2>/dev/null </dev/null | tail -n 1)"
+    if [[ "$lp" == */* ]]; then
+      mkdir -p "$HOME/.pervio/cache" && printf '%s' "$lp" > "$cache"
+    fi
+  fi
+  [[ "$lp" == */* ]] && export PATH="$lp:$PATH"
+}
+borrow_login_path
+
+find_cli() {
+  local name="$1" p c
+  p="$(command -v "$name" || true)"
+  # Test seam: the absolute-dir fallbacks below defeat a hermetic PATH (a suite
+  # cannot simulate "claude absent" on a dev box that has it in /opt/homebrew).
+  # With this set, resolution is PATH-only. Never set in production.
+  if [[ -z "$p" && -n "${PERVIO_CHAT_PATH_ONLY:-}" ]]; then
+    printf '%s' ""
+    return
+  fi
+  if [[ -z "$p" ]]; then
+    # Pervio arrives over SSH in a non-login shell: nothing from .zshrc is on
+    # PATH. The usual homes first, then the node version managers people
+    # install `codex` through (nvm/volta/fnm/pnpm/yarn — a tester's Mac had
+    # codex only under nvm, 2026-10-15), newest version last so it wins.
+    for c in "$HOME/.local/bin/$name" /opt/homebrew/bin/"$name" /usr/local/bin/"$name" \
+             "$HOME/.npm-global/bin/$name" "$HOME/.bun/bin/$name" /snap/bin/"$name" \
+             "$HOME/.volta/bin/$name" "$HOME/.yarn/bin/$name" "$HOME/.cargo/bin/$name" \
+             "$HOME/Library/pnpm/$name" /opt/local/bin/"$name" \
+             "$HOME"/.nvm/versions/node/*/bin/"$name" "$HOME"/.local/share/fnm/node-versions/*/installation/bin/"$name" \
+             "$HOME"/.fnm/node-versions/*/installation/bin/"$name"; do
+      [[ -x "$c" ]] && p="$c"
+    done
+  fi
+  if [[ -z "$p" ]]; then
+    # Last resort: ask the person's own login shell, which runs their rc files
+    # (nvm init, custom PATH). Bounded by the shell itself; stdin closed so an
+    # rc that prompts cannot hang us.
+    p="$(${SHELL:-/bin/zsh} -lic "command -v $name" 2>/dev/null </dev/null | tail -n 1)"
+    [[ "$p" == /* && -x "$p" ]] || p=""
+  fi
+  printf '%s' "$p"
+}
+
+# A CLI found off PATH is, more often than not, a node script (`#!/usr/bin/env
+# node` — anything npm installs): launching it by absolute path still needs
+# `node` on PATH, which an SSH exec channel does not have. Its own folder holds
+# that node (nvm/volta/fnm/pnpm keep them side by side), so put the folder
+# first; when node is still missing, borrow the person's login-shell PATH once
+# (their .zshrc is where nvm lives). A tester's second Codex turn died with
+# "env: node: No such file or directory" exactly here (2026-10-15).
+prime_path_for() {
+  local bin="$1" lp
+  [[ -n "$bin" ]] && export PATH="$(dirname "$bin"):$PATH"
+  if ! command -v node >/dev/null 2>&1; then
+    lp="$(${SHELL:-/bin/zsh} -lic 'printf %s "$PATH"' 2>/dev/null </dev/null | tail -n 1)"
+    [[ -n "$lp" ]] && export PATH="$lp:$PATH"
+  fi
+}
+
+if [[ "${1:-}" == "engines" ]]; then
+  # Cursor ships as `agent` (its older name `cursor-agent` still works).
+  cur="$(find_cli agent)"; [[ -z "$cur" ]] && cur="$(find_cli cursor-agent)"
+  # The roster and the vendor table; when either read fails the phone is told
+  # WHY (probeError) instead of being handed a silent empty menu — a tester's
+  # add-provider sheet offered only "Custom" and nobody could tell why.
+  providers="[]"; presets="[]"; perr=""
+  if [[ -x "$SELF_DIR/pervio-provider" ]]; then
+    perr_file="$(mktemp)"
+    if ! providers="$(python3 "$SELF_DIR/pervio-provider" list 2>"$perr_file")"; then
+      providers="[]"; perr="$(tail -n 1 "$perr_file")"
+    fi
+    if ! presets="$(python3 "$SELF_DIR/pervio-provider" presets 2>"$perr_file")"; then
+      presets="[]"; perr="$(tail -n 1 "$perr_file")"
+    fi
+    rm -f "$perr_file"
+  else
+    perr="pervio-provider is missing in $SELF_DIR (server scripts not updated)"
+  fi
+  perr_json="$(printf '%s' "$perr" | python3 -I -c 'import json,sys; print(json.dumps(sys.stdin.read()[-200:]))')"
+  cursor_key=false; [[ -n "${CURSOR_API_KEY:-}" ]] && cursor_key=true   # credentials.env was sourced above
+  cursor_login=false; cursor_file_login && cursor_login=true                # ~/.cursor/auth.json: the file-store login
+  printf '{"claude": "%s", "codex": "%s", "cursor": "%s", "tmux": "%s", "providers": %s, "presets": %s, "probeError": %s, "cursorKey": %s, "cursorLogin": %s}\n' \
+    "$(find_cli claude)" "$(find_cli codex)" "$cur" "$(find_cli tmux)" "$providers" "$presets" "$perr_json" "$cursor_key" "$cursor_login"
+  exit 0
+fi
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dir)        dir="$2"; shift 2 ;;
+    --resume)     resume="$2"; shift 2 ;;
+    --perm)       perm="$2"; shift 2 ;;
+    --model)      model="$2"; shift 2 ;;
+    --effort)     effort="$2"; shift 2 ;;
+    --text)       mode="text"; shift ;;
+    --prompt-b64) prompt_b64="$2"; mode="text"; shift 2 ;;
+    --backend)    backend="$2"; shift 2 ;;
+    --sandbox)    sandbox_arg="$2"; shift 2 ;;
+    --reviewer)   reviewer_arg="$2"; shift 2 ;;
+    --device)     push_device="$2"; shift 2 ;;
+    --service-tier) service_tier="$2"; shift 2 ;;
+    --input-fifo) input_fifo="$2"; shift 2 ;;
+    --input-keeper) input_keeper="$2"; shift 2 ;;
+    --run-id) run_id="$2"; shift 2 ;;
+    --provider)   provider="$2"; shift 2 ;;
+    --allow)      allow_tools="$2"; shift 2 ;;
+    --disallow)   disallow_tools="$2"; shift 2 ;;
+    --approve-sid) approve_sid="$2"; shift 2 ;;
+    --pervio-context) pervio_ctx=1; shift ;;
+    --lang)       lang="$2"; shift 2 ;;
+    --stop-tag)   stop_tag="$2"; shift 2 ;;
+    # A folder the person attached from the phone: an ADDITIONAL working
+    # directory the agent may edit in, not just read (2026-10-17 — "+" folders
+    # were read-only: claude asked permission for every write outside its cwd,
+    # codex's sandbox refused them). Repeatable. ~ is expanded; a path that is
+    # not a directory is dropped with a note, never passed on.
+    --extra-dir)  extra_dirs+=("$2"); shift 2 ;;
+    *) echo "pervio-chat: unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+# The approval sid becomes a DIRECTORY under ~/.pervio/chat that pervio-chat-stream
+# rmtree's at the end of the turn, and it is also interpolated into mcp.json.
+# Both make it a security boundary, so it is an allowlist, not a sanitization:
+# proven 2026-08-06 in a hermetic HOME — `--approve-sid ../..` resolved the
+# session dir to $HOME and the end-of-turn cleanup deleted the home directory's
+# contents. The same unquoted interpolation could also inject JSON keys into
+# mcp.json (later keys win in common parsers) and rewrite the approval server's
+# command. A fixed charset kills both: no dots, no slashes, no quotes/braces.
+# --device: the push device id of the phone driving this turn. pervio-approve
+# and pervio-codex-app read it from the environment when an approval blocks, so
+# the "waiting for your approval" ping reaches that phone and no other on this
+# Mac (2026-10-19). A detached run gets it from pervio-run the same way.
+if [[ -n "$push_device" ]]; then
+  if [[ ! "$push_device" =~ ^[A-Za-z0-9_-]{1,80}$ ]]; then
+    echo "pervio-chat: invalid --device" >&2
+    exit 2
+  fi
+  export PERVIO_PUSH_DEVICE="$push_device"
+fi
+if [[ -n "$approve_sid" && ! "$approve_sid" =~ ^[A-Za-z0-9_-]{1,64}$ ]]; then
+  echo "pervio-chat: invalid --approve-sid (allowed: 1-64 of A-Za-z0-9_-)" >&2
+  exit 2
+fi
+
+# --stop-tag: the app's handle for stopping THIS turn for real. Hanging up the
+# channel does NOT stop a turn (empirically confirmed 2026-08-22: the turn runs
+# to completion after the reader is gone — deliberate, that's what lets a
+# backgrounded phone walk away). So an explicit stop needs an explicit handle:
+# we record our pid under the tag; the app's stop resolves the pid to its
+# process GROUP and TERMs it (claude and its tools live in that group). Same
+# charset story as --approve-sid: the tag becomes a filename.
+if [[ -n "$stop_tag" ]]; then
+  if [[ ! "$stop_tag" =~ ^[A-Za-z0-9_-]{1,64}$ ]]; then
+    echo "pervio-chat: invalid --stop-tag (allowed: 1-64 of A-Za-z0-9_-)" >&2
+    exit 2
+  fi
+  live_dir="$HOME/.pervio/chat-live"
+  mkdir -p "$live_dir"
+  # exec'd turns never fire an EXIT trap, so sweep stale tags opportunistically.
+  find "$live_dir" -name '*.pid' -mmin +720 -delete 2>/dev/null || true
+  printf '%s' "$$" > "$live_dir/$stop_tag.pid"
+  trap 'rm -f "$HOME/.pervio/chat-live/'"$stop_tag"'.pid"' EXIT
+fi
+
+# Expand a leading ~ ourselves: the client passes --dir as a single-quoted
+# argument, so the shell does not expand it for us. NOTE: ${dir#~/} is a trap —
+# bash tilde-expands the ~/ PATTERN itself (to "$HOME/"), which never matches the
+# literal leading "~/", so nothing got stripped and the dir became "$HOME/~/…"
+# (exit 3). Strip by offset instead.
+case "$dir" in
+  "~")    dir="$HOME" ;;
+  "~/"*)  dir="$HOME/${dir:2}" ;;
+esac
+
+if [[ ! -d "$dir" ]]; then
+  echo "pervio-chat: working dir does not exist: $dir" >&2
+  exit 3
+fi
+cd "$dir"
+# From here on the working directory is the PROJECT — possibly someone else's
+# repository. Every inline python below runs with -I: without it `python3 -c`
+# and `python3 -` put the current directory first on sys.path, and a json.py
+# or base64.py planted in the repository would run as the person, on their
+# first message, before any tool approval (a reviewer's find, 2026-11-18).
+
+# ---- Provider overlay (--provider <name>): a third-party endpoint for Claude or
+# Codex, kept on the Mac by pervio-provider. Claude takes it as ANTHROPIC_* env
+# (the way GLM / Kimi / MiniMax document it); codex as -c model_provider overrides.
+# A turn that names no model gets the provider's default, so a provider whose
+# model names differ from the engine's own never runs an unknown model.
+PERVIO_CODEX_PROVIDER_ARGS=( )
+PERVIO_PROVIDER_DEFAULT_MODEL=""
+if [[ -n "$provider" ]]; then
+  if [[ "$backend" == "cursor" ]]; then
+    echo "pervio-chat: cursor has no providers (it only speaks to its own account)" >&2
+    exit 4
+  fi
+  if [[ ! "$provider" =~ ^[A-Za-z0-9:_-]{1,48}$ ]]; then
+    echo "pervio-chat: bad provider name" >&2
+    exit 4
+  fi
+  if ! provider_sh="$(python3 "$SELF_DIR/pervio-provider" shell --name "$provider" --engine "$backend" 2>&1)"; then
+    echo "pervio-chat: $provider_sh" >&2
+    exit 4
+  fi
+  eval "$provider_sh"
+  [[ -z "$model" ]] && model="$PERVIO_PROVIDER_DEFAULT_MODEL"
+fi
+
+# Files the user uploads from the phone land here — photos, server files, and
+# the 背景 transcript the app exports. BOTH backends read them by path: claude
+# needs the --add-dir below (its Read tool is confined to the project dir);
+# codex needs NOTHING — its sandbox constrains write and network, not read
+# (实测 2026-08-06 on Linux 0.139/0.140 and macOS 0.142, in read-only and
+# workspace-write alike; docs/codex-event-schema.md §7), and `codex exec` has
+# no --add-dir to give it anyway. pervio-upload creates the dir with the same
+# 0700 on every upload, so the codex branch below needs no setup of its own.
+uploads="$HOME/.pervio/uploads"
+mkdir -p "$uploads"
+chmod 700 "$uploads" 2>/dev/null || true   # owner-only — phone files may be private (shared host)
+
+# Where pervio-mcp (the perviotools MCP server) lives: repo/dev checkout (this
+# script's own dir) first, deployed layout (~/.pervio/bin) second — one
+# resolution, shared by BOTH backends' Pervio mounts below.
+MCP_BIN_DIR="$SELF_DIR"
+[[ -e "$MCP_BIN_DIR/pervio-mcp" ]] || MCP_BIN_DIR="$HOME/.pervio/bin"
+
+# ---- OpenAI Codex backend (codex exec --json) ----
+# Event schema + flag quirks are verified live; see docs/codex-event-schema.md.
+# We branch here and exec codex, so the Claude args below run only for claude.
+# The attached folders, resolved: ~ expanded, must exist as directories; the
+# rest are named on stderr and dropped (a typo must not fail the whole turn).
+add_dirs=()
+for d in ${extra_dirs[@]+"${extra_dirs[@]}"}; do
+  case "$d" in "~"|"~/"*) d="$HOME${d#\~}" ;; esac
+  if [[ -d "$d" ]]; then add_dirs+=("$d"); else echo "pervio-chat: --extra-dir not a directory, skipped: $d" >&2; fi
+done
+
+if [[ "$backend" == "codex" ]]; then
+  CODEX_BIN="$(find_cli codex)"
+  prime_path_for "$CODEX_BIN"
+  if [[ -z "$CODEX_BIN" ]]; then
+    echo "pervio-chat: codex not found (checked PATH, ~/.local/bin, Homebrew, nvm/volta/fnm/pnpm/yarn, and your login shell) — run `which codex` in the Mac's own Terminal and symlink it into ~/.local/bin" >&2
+    exit 4
+  fi
+
+  # Codex's permission axis is its OWN --sandbox, sent straight by the app (no
+  # mapping). Approvals must be non-interactive headless (no approval channel on
+  # the phone), so always approval_policy=never; the sandbox is what constrains it.
+  # Fall back to mapping the Claude --perm only for an OLDER app that didn't send
+  # --sandbox, then guard to codex's valid enum so a bad value can't error the run.
+  if [[ -n "$sandbox_arg" ]]; then
+    sandbox="$sandbox_arg"
+  else
+    case "$perm" in
+      plan)              sandbox="read-only" ;;
+      bypassPermissions) sandbox="danger-full-access" ;;
+      *)                 sandbox="workspace-write" ;;   # default | acceptEdits | auto
+    esac
+  fi
+  case "$sandbox" in
+    read-only|workspace-write|danger-full-access) ;;
+    *) sandbox="workspace-write" ;;
+  esac
+
+  # Codex's sandbox refuses a writable root with a symlink component
+  # ("symlinked writable roots are not supported", openai/codex#45485; reproduced
+  # on the real codex 2026-10-17): OneDrive's Known Folder Move makes ~/Documents
+  # a link into ~/Library/CloudStorage, so every folder under it was refused.
+  # Codex gets the RESOLVED paths (pervio-sessions lists its threads under the
+  # person's spelling again). A folder that resolves into a cloud-synced
+  # location gets a note: if macOS itself still denies the process, that is a
+  # Mac permission (Remote Login → full disk access, or the sync app), not ours.
+  codex_dir="$(pwd -P)"
+  if [[ ${#add_dirs[@]} -gt 0 ]]; then
+    for i in "${!add_dirs[@]}"; do add_dirs[$i]="$(cd "${add_dirs[$i]}" && pwd -P)"; done
+  fi
+  for d in "$codex_dir" ${add_dirs[@]+"${add_dirs[@]}"}; do
+    case "$d" in *"/Library/CloudStorage/"*|*"/Library/Mobile Documents/"*)
+      echo "pervio-chat: $d is cloud-synced (OneDrive/iCloud); codex runs on its resolved path — if macOS still denies writes there, allow full disk access for Remote Login or use a local folder" >&2 ;;
+    esac
+  done
+  cargs=( exec --json --sandbox "$sandbox" -c approval_policy="never" -C "$codex_dir" )
+  # Attached folders become writable alongside the workspace: codex's own
+  # --add-dir (present since 0.15x; an older codex gets a note and keeps them
+  # read-only rather than a refused flag).
+  if [[ ${#add_dirs[@]} -gt 0 ]]; then
+    if "$CODEX_BIN" exec --help 2>/dev/null | grep -q -- "--add-dir"; then
+      for d in "${add_dirs[@]}"; do cargs+=( --add-dir "$d" ); done
+    else
+      echo "pervio-chat: this codex has no --add-dir; attached folders stay read-only" >&2
+    fi
+  fi
+  [[ ${#PERVIO_CODEX_PROVIDER_ARGS[@]} -gt 0 ]] && cargs+=( "${PERVIO_CODEX_PROVIDER_ARGS[@]}" )
+  # profile.model defaults to a Claude id; never hand that to codex. Only pass a
+  # model that isn't a Claude one (lets a user pin a real codex model later).
+  if [[ -n "$model" && "$model" != claude* ]]; then
+    cargs+=( --model "$model" )
+  fi
+  # codex reasoning effort, passed straight through (codex's own term, no mapping).
+  # Full enum verified from codex's own error: none|minimal|low|medium|high|xhigh.
+  # The guard keeps a stale Claude value (max/ultracode) from 400-ing the turn.
+  case "$effort" in
+    none|minimal|low|medium|high|xhigh) cargs+=( -c model_reasoning_effort="$effort" ) ;;
+  esac
+  # The speed tier (the phone's Fast switch, 2026-10-19): codex's own config key.
+  case "$service_tier" in
+    "") ;;
+    *[!A-Za-z0-9_-]*) echo "pervio-chat: invalid --service-tier" >&2; exit 2 ;;
+    *) cargs+=( -c service_tier="\"$service_tier\"" ) ;;
+  esac
+  # Pervio READ-ONLY MCP mount (same opt-in + machine gates as the claude
+  # branch below). codex takes per-invocation MCP servers via -c overrides
+  # (verified live 2026-08-03: tools land as mcp__<server>.<tool>, all listed
+  # at init, no lazy loading) — but codex has NO approval mechanism
+  # (--permission-prompt-tool / allowlists don't exist), so every mounted tool
+  # is callable un-confirmed. Write/spend tools must therefore be unreachable
+  # AT THE SERVER, not merely unlisted: PERVIO_MCP_RO=1 makes pervio-mcp serve
+  # ONLY the seven read-only tools and refuse the rest ("read-only mount: …
+  # unavailable"). The \" keeps literal quotes IN the argv element, so codex
+  # parses each value as a TOML string/array — which is also what makes a
+  # MCP_BIN_DIR containing spaces survive intact.
+  # DISABLED pending upstream: `codex exec` (this whole pipe is non-interactive)
+  # auto-cancels EVERY MCP tool call — "user cancelled MCP tool call" — and no
+  # config suppresses the approval (approval_policy="never" and a trusted flag
+  # both probed dead 2026-08-04; the only bypass is
+  # --dangerously-bypass-approvals-and-sandbox, which is not an option).
+  # openai/codex#24135 + #16685 track it. Mounting anyway would show the model
+  # seven tools that fail on first touch — worse than no tools. Flip
+  # CODEX_MCP_READY=1 below when a fixed codex ships; the RO server mode
+  # (PERVIO_MCP_RO) is tested and waiting.
+  CODEX_MCP_READY=""
+  codex_pervio_mcp=""
+  if [[ -n "$CODEX_MCP_READY" && -n "$pervio_ctx" && -z "${PERVIO_WF_ID:-}" \
+        && -e "$MCP_BIN_DIR/pervio-mcp" ]]; then
+    codex_pervio_mcp=1
+    cargs+=( -c "mcp_servers.perviotools.command=\"python3\""
+             -c "mcp_servers.perviotools.args=[\"$MCP_BIN_DIR/pervio-mcp\"]"
+             -c "mcp_servers.perviotools.env.PERVIO_MCP_RO=\"1\"" )
+  fi
+  # Global flags MUST precede the `resume` subcommand; only --skip-git-repo-check
+  # and the positional SESSION_ID/PROMPT belong to it (verified: misordering = exit 2).
+  if [[ -n "$resume" ]]; then
+    cargs+=( resume "$resume" --skip-git-repo-check )
+  else
+    cargs+=( --skip-git-repo-check )
+  fi
+
+  # Prompt is a positional arg (the verified form). Decoding into a quoted bash
+  # variable is injection-safe (no eval). stdin -> /dev/null so codex doesn't block
+  # on "Reading additional input from stdin...".
+  if [[ -n "$prompt_b64" ]]; then
+    CODEX_PROMPT="$(printf '%s' "$prompt_b64" | base64 -d)"
+    # One-line Pervio pointer, codex flavor: codex has no system-prompt channel,
+    # so the pointer rides the MESSAGE, re-prefixed every turn (each turn is a
+    # fresh invocation), which makes it compaction-proof the deterministic way.
+    if [[ -n "$codex_pervio_mcp" ]]; then
+      # Discovery pointer for the read-only mount above. codex lists MCP tools
+      # at init (no ToolSearch deferral like claude), so this line only ROUTES:
+      # orchestration queries go to the tools instead of shell archaeology,
+      # writes live in the App — plus the same narration suppressor the claude
+      # pointer carries (the D+E lesson). --lang en swaps the prose only.
+      if [[ "$lang" == "en" ]]; then
+        CODEX_PROMPT="[env] Pervio orchestration layer, read-only mount: query workflows/templates/ledgers/archives/schedules with the mcp__perviotools.* tools; do not guess paths with the shell. Start/modify operations are unavailable here — when needed, ask the user to do it in the Pervio App. When none of this is relevant, do not bring up this note or Pervio.
+$CODEX_PROMPT"
+      else
+        CODEX_PROMPT="[env] Pervio 编排层只读挂载:查询工作流/模板/账本/归档/定时用 mcp__perviotools.* 工具,不要用 shell 猜路径。启动/修改类操作此处不可用——需要时请用户去 Pervio App 操作。与这些无关时,不要主动提及本说明或 Pervio。
+$CODEX_PROMPT"
+      fi
+    elif [[ -n "$pervio_ctx" && -z "${PERVIO_WF_ID:-}" && -f "$SELF_DIR/pervio-brief.md" ]]; then
+      # Graceful degradation: an OLD deployment with no pervio-mcp anywhere
+      # (neither sibling nor ~/.pervio/bin) has nothing to mount — keep the
+      # legacy brief pointer VERBATIM so those hosts lose nothing (English
+      # variant only when the app explicitly asked with --lang en).
+      if [[ "$lang" == "en" ]]; then
+        CODEX_PROMPT="[env] This server runs the Pervio orchestration layer (workflows, morning reports/publications, schedules and run records all belong to it); when the conversation touches these, first read ~/.pervio/bin/pervio-brief.md for how to operate, then act. When none of this is relevant, do not bring up this note or Pervio.
+$CODEX_PROMPT"
+      else
+        CODEX_PROMPT="[env] 本服务器装有 Pervio 编排层(workflow、晨报/出版物、定时任务、运行记录等均归它管);对话涉及这些时,先读 ~/.pervio/bin/pervio-brief.md 获取操作方式,再行动。与这些无关时,不要主动提及本说明或 Pervio。
+$CODEX_PROMPT"
+      fi
+    fi
+    cargs+=( "$CODEX_PROMPT" )
+  fi
+
+  # In CHAT mode stdout is the live SSH channel (not a regular file), so pipe codex
+  # through pervio-hb: it injects heartbeat lines during codex's silent thinking so
+  # the phone doesn't judge the connection dead. In RUN mode stdout is redirected to
+  # out.jsonl (a regular file) and pervio-run's tail heartbeats instead — skip it.
+  # NOT `exec`: we run codex, then patch the rollout so it shows in `codex resume`.
+  # ---- app-server: the conversation the desktop/VS Code clients have (2026-10-18)
+  # A codex with `app-server` runs the turn through pervio-codex-app instead of
+  # exec: same model, same instructions, same answers (compared side by side),
+  # but it can ASK — approvals reach the phone's Allow/Deny over the same
+  # FIFO channel Claude Code uses — stop is a real turn/interrupt, and a
+  # resume is by thread id. PERVIO_CODEX_EXEC=1 forces the exec path (and an
+  # older codex without the subcommand simply takes it).
+  if [[ -z "${PERVIO_CODEX_EXEC:-}" && -e "$SELF_DIR/pervio-codex-app" ]] \
+     && "$CODEX_BIN" app-server --help >/dev/null 2>&1; then
+    appargs=( --codex "$CODEX_BIN" --dir "$codex_dir" --sandbox "$sandbox" )
+    # Who settles an approval (a sandbox escape, blocked network, an MCP prompt):
+    #   auto (default, the desktop's "Approve for me" / `codex --approve-for-me`):
+    #        codex's own reviewing subagent decides, chat and run alike — the
+    #        person asked for this to be the default (2026-10-18);
+    #   user ("Ask for approval"): the phone's Allow/Deny over the approval sid,
+    #        and only where someone can answer — a turn that handed us a sid: a
+    #        live chat, or a detached run (the phone is pinged and reopens it,
+    #        2026-10-19); a turn with no sid (workflow, probe) has nobody, so it
+    #        never asks.
+    # Full access has nothing to ask under either; read-only is the person's
+    # hard line (a reviewer lifting it would make "read-only" a suggestion), so
+    # it never asks either — what codex can't do there it reports.
+    reviewer="${reviewer_arg:-auto}"
+    approval="never"
+    if [[ "$sandbox" == "workspace-write" ]]; then
+      if [[ "$reviewer" == "user" ]]; then
+        if [[ -n "$approve_sid" ]]; then
+          approval="on-request"
+          approval_session "$approve_sid"
+          appargs+=( --sid "$approve_sid" --reviewer user )
+        fi
+      else
+        approval="on-request"
+        appargs+=( --reviewer auto_review )
+        # a phone that handed us a sid still gets anything codex insists on asking
+        if [[ -n "$approve_sid" ]]; then
+          approval_session "$approve_sid"
+          appargs+=( --sid "$approve_sid" )
+        fi
+      fi
+    fi
+    appargs+=( --approval "$approval" )
+    [[ -n "$resume" ]] && appargs+=( --resume "$resume" )
+    if [[ -n "$model" && "$model" != claude* ]]; then appargs+=( --model "$model" ); fi
+    [[ -n "$effort" ]] && appargs+=( --effort "$effort" )
+    case "$service_tier" in
+      "") ;;
+      *[!A-Za-z0-9_-]*) echo "pervio-chat: invalid --service-tier" >&2; exit 2 ;;
+      *) appargs+=( --service-tier "$service_tier" ) ;;
+    esac
+    for d in ${add_dirs[@]+"${add_dirs[@]}"}; do appargs+=( --add-dir "$d" ); done
+    [[ ${#PERVIO_CODEX_PROVIDER_ARGS[@]} -gt 0 ]] && appargs+=( "${PERVIO_CODEX_PROVIDER_ARGS[@]}" )
+    [[ -n "$lang" ]] && appargs+=( --lang "$lang" )
+    rc=0
+    if [[ -n "$input_fifo" && -n "$input_keeper" && -n "$run_id" ]]; then
+      # The living run: the keeper relays the FIFO into the translator's stdin
+      # and closes it when the run has gone idle; the translator turns each
+      # line into a turn on the same thread and leaves at EOF.
+      # the first prompt rides as an argument here: stdin is the keeper's pipe
+      set +e; python3 "$input_keeper" keep --run "$run_id" | python3 "$SELF_DIR/pervio-codex-app" "${appargs[@]}" --input-stdin --prompt-b64 "$(printf '%s' "${CODEX_PROMPT:-}" | base64 | tr -d '\n')"; rc=${PIPESTATUS[1]}; set -e
+      [[ -n "${sess:-}" ]] && rm -rf "$sess" 2>/dev/null
+      [[ -x "$SELF_DIR/pervio-codex-index" ]] && "$SELF_DIR/pervio-codex-index" sync >/dev/null 2>&1 || true
+      exit $rc
+    fi
+    [[ -n "$input_fifo" ]] && appargs+=( --input-fifo "$input_fifo" )
+    # A stop TERMs our process group; the translator answers it with
+    # turn/interrupt and exits 143 once codex has ended the turn. We ignore
+    # the signal ourselves (ignore, not a handler: a handler is a command and
+    # would wipe PIPESTATUS) so we outlive the pipeline just long enough to
+    # clean up and hand that 143 on, as the exec path's exit code would be.
+    # The python children set their own TERM handlers, inherited ignore or not.
+    trap '' TERM
+    if [[ ! -f /dev/stdout && -x "$SELF_DIR/pervio-hb" ]]; then
+      set +e; printf '%s' "${CODEX_PROMPT:-}" | python3 "$SELF_DIR/pervio-codex-app" "${appargs[@]}" | "$SELF_DIR/pervio-hb"; rc=${PIPESTATUS[1]}; set -e
+    else
+      printf '%s' "${CODEX_PROMPT:-}" | python3 "$SELF_DIR/pervio-codex-app" "${appargs[@]}" || rc=$?
+    fi
+    trap - TERM
+    [[ -n "${sess:-}" ]] && rm -rf "$sess" 2>/dev/null
+    [[ -x "$SELF_DIR/pervio-codex-index" ]] && "$SELF_DIR/pervio-codex-index" sync >/dev/null 2>&1 || true
+    exit $rc
+  fi
+  rc=0
+  if [[ ! -f /dev/stdout && -x "$SELF_DIR/pervio-hb" ]]; then
+    set +e; "$CODEX_BIN" "${cargs[@]}" < /dev/null | "$SELF_DIR/pervio-hb"; rc=${PIPESTATUS[0]}; set -e
+  else
+    "$CODEX_BIN" "${cargs[@]}" < /dev/null || rc=$?
+  fi
+  [[ -x "$SELF_DIR/pervio-codex-index" ]] && "$SELF_DIR/pervio-codex-index" sync >/dev/null 2>&1 || true
+  exit $rc
+fi
+
+# ---- Cursor: `agent -p`, one turn per process (like codex). Its stream-json is
+# nearly Claude's; pervio-cursor-stream makes it exactly Claude's, so the phone,
+# pervio-run and pervio-group never learn a third vocabulary. Facts probed on
+# agent 2026.10.14 (2026-10-14): --resume works across processes; plan mode
+# only proposes; the default edits files but runs only allowlisted shell
+# commands; --force runs everything; chats live under ~/.cursor.
+if [[ "$backend" == "cursor" ]]; then
+  if [[ "$mode" != "text" ]]; then
+    echo "pervio-chat: cursor supports --text turns only" >&2
+    exit 2
+  fi
+  AGENT_BIN="$(find_cli agent)"; [[ -z "$AGENT_BIN" ]] && AGENT_BIN="$(find_cli cursor-agent)"
+  prime_path_for "$AGENT_BIN"
+  if [[ -z "$AGENT_BIN" ]]; then
+    echo "pervio-chat: cursor agent not found (install: curl https://cursor.com/install -fsS | bash; then: agent login)" >&2
+    exit 4
+  fi
+  CURSOR_PROMPT="$(printf '%s' "$prompt_b64" | base64 -d 2>/dev/null || true)"
+  # Cursor's `agent login` keeps its tokens in the macOS keychain, which an SSH
+  # session finds locked ("Run security unlock-keychain and try again" — this
+  # Mac, all day, 2026-10-16). The agent also has a FILE credential store
+  # (AGENT_CLI_CREDENTIAL_STORE=file → ~/.cursor/auth.json, 0600), filled by a
+  # login whose link the person opens on the phone. When that file exists the
+  # agent runs on it — no keychain; without it the default store stays, so a
+  # Mac whose keychain does work over SSH keeps working.
+  cursor_store_env
+  cargs=( -p --output-format stream-json --trust )
+  # Pervio's permission axis → Cursor's: plan = read-only (--mode plan);
+  # bypassPermissions = run everything (--force); everything else = Cursor's
+  # default (edits files, shell only from its allowlist, nobody to ask).
+  case "$perm" in
+    plan)              cargs+=( --mode plan ) ;;
+    bypassPermissions) cargs+=( --force ) ;;
+  esac
+  [[ -n "$resume" ]] && cargs+=( --resume "$resume" )
+  # Cursor's own model names (auto, gpt-5.3-codex, claude-opus-5-thinking-high…)
+  # sent straight through — and ALWAYS sent: without --model the agent uses the
+  # model it last persisted in ~/.cursor/cli-config.json (whatever Cursor's app
+  # or an earlier turn picked), so "Auto" on the phone must say --model auto
+  # (a Free plan was refused a named model it never chose, 2026-10-16).
+  cargs+=( --model "${model:-auto}" )
+  cargs+=( "$CURSOR_PROMPT" )
+  # The agent's stderr is kept in a file and replayed to stderr afterwards (so a
+  # detached run's err file still gets it). When the agent dies WITHOUT ever
+  # answering (rc≠0 and the translator saw no result — its exit 3), its last
+  # stderr line goes on the channel as an error result: the live chat drops
+  # non-JSON lines, so a tester's "Run security unlock-keychain and try again"
+  # (Cursor's keychain login, locked for an SSH session; 2026-10-16) had reached
+  # the phone only as "connection dropped". Colour codes are stripped.
+  cur_err="$(mktemp "${TMPDIR:-/tmp}/pervio-cursor-err.XXXXXX")"
+  rc=0; trc=0
+  if [[ ! -f /dev/stdout && -x "$SELF_DIR/pervio-hb" ]]; then
+    set +e
+    "$AGENT_BIN" "${cargs[@]}" < /dev/null 2> "$cur_err" | python3 "$SELF_DIR/pervio-cursor-stream" | "$SELF_DIR/pervio-hb"
+    ps=("${PIPESTATUS[@]}"); rc=${ps[0]}; trc=${ps[1]:-0}   # one read: PIPESTATUS is reset by the next command
+    set -e
+  else
+    set +e
+    "$AGENT_BIN" "${cargs[@]}" < /dev/null 2> "$cur_err" | python3 "$SELF_DIR/pervio-cursor-stream"
+    ps=("${PIPESTATUS[@]}"); rc=${ps[0]}; trc=${ps[1]:-0}   # one read: PIPESTATUS is reset by the next command
+    set -e
+  fi
+  cat "$cur_err" >&2 2>/dev/null || true
+  if [[ "$rc" -ne 0 && "$trc" -eq 3 ]]; then
+    python3 -I - "$cur_err" <<'PY'
+import json, re, sys
+raw = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+raw = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", raw)
+lines = [l.strip() for l in raw.splitlines() if l.strip()]
+why = lines[-1][:300] if lines else "cursor agent exited without an answer"
+print(json.dumps({"type": "result", "subtype": "error", "is_error": True, "result": why}))
+PY
+  fi
+  rm -f "$cur_err"
+  exit $rc
+fi
+
+# Claude is looked up only on the claude path — a codex-only host must not die
+# at a claude check it never needed (2026-08-22 audit P1: the check sat above
+# the codex branch and bricked --backend codex wholesale on such hosts).
+CLAUDE_BIN="$(find_cli claude)"
+prime_path_for "$CLAUDE_BIN"
+if [[ -z "$CLAUDE_BIN" ]]; then
+  echo "pervio-chat: claude not found (checked PATH, ~/.local/bin, Homebrew, nvm/volta/fnm/pnpm/yarn, and your login shell) — run `which claude` in the Mac's own Terminal and symlink it into ~/.local/bin" >&2
+  exit 4
+fi
+
+args=( --print
+       --output-format stream-json
+       --verbose
+       --include-partial-messages
+       --permission-mode "$perm"
+       --add-dir "$uploads" )
+# Attached folders: additional working directories claude may edit in under the
+# same permission mode as the project (acceptEdits applies there too).
+for d in ${add_dirs[@]+"${add_dirs[@]}"}; do args+=( --add-dir "$d" ); done
+
+# Pervio context is OPT-IN per conversation: the default chat gets ZERO
+# attachment — fully native claude, which roots out the observed self-narration
+# leak (the model volunteering "this server has an orchestration layer…" in
+# unrelated chats). The app sends --pervio-context only when the user chose it:
+# the composer chip, or a conversation born from a workflow context (Monitor /
+# reader discuss, Build-with-Claude). When on, the claude branch mounts the
+# perviotools MCP server (server/bin/pervio-mcp) PLUS a one-line discovery
+# pointer. The pointer is load-bearing, not a nicety: claude 2.1.x defers MCP
+# tools behind ToolSearch (probed 2026-08-04: init lists 24 native tools,
+# mcp_servers status "pending", zero perviotools entries), so a bare mount
+# leaves the verbs invisible unless the user happens to type "pervio" — a
+# probe asking to run "深度代码审计那个工作流" went hunting ~/.claude/workflows
+# instead. Real, typed tools still carry the semantics; the pointer only says
+# they exist. The SEVEN read-only ones ride --allowedTools so browsing runs/ledgers/
+# templates/archives/schedules/sessions is friction-free, while the write/spend ones
+# (pervio_start, pervio_feedback) deliberately stay OFF the allowlist so they
+# fall into the existing approval flow — the phone's Allow/Deny sheet is the
+# built-in confirmation. (The codex branch mounts the SAME server per
+# invocation via -c overrides, but read-only — PERVIO_MCP_RO=1, enforced by
+# the server, because codex has no approval channel; see that branch.) The
+# PERVIO_WF_ID gate stays as defense in depth: machine turns (workflow steps /
+# fan-out / dispatch all carry it) get neither pointer nor MCP even with the
+# flag — unattended runs must not grow user-facing tool surface.
+pervio_mcp=""
+if [[ -n "$pervio_ctx" && -z "${PERVIO_WF_ID:-}" && -e "$MCP_BIN_DIR/pervio-mcp" ]]; then
+  pervio_mcp=1
+  # Read-only tool allowlist. Merged into any app-sent --allow so claude sees
+  # exactly ONE --allowedTools flag (same comma-joined form pervio-orchestrate
+  # already uses for its ",".join(allow) — and the same flag pervio-chat already
+  # forwards below).
+  pervio_ro_tools="mcp__perviotools__pervio_list_runs,mcp__perviotools__pervio_ledger,mcp__perviotools__pervio_templates,mcp__perviotools__pervio_archives,mcp__perviotools__pervio_schedules,mcp__perviotools__pervio_sessions,mcp__perviotools__pervio_transcript"
+  allow_tools="${allow_tools:+$allow_tools,}$pervio_ro_tools"
+  # One line, three jobs: route wf-talk to the tools (not Bash archaeology, not
+  # CC's own .claude/workflows), tell the model the tools may need a ToolSearch
+  # load, and suppress narration in unrelated turns (the D+E lesson).
+  if [[ "$lang" == "en" ]]; then
+    # English variant of the same three-job line (route to the tools + ToolSearch
+    # hint + narration suppressor) — prose only, tool names identical.
+    PERVIO_MCP_POINTER="The Pervio workflow orchestration layer is mounted: for templates/runs/ledgers/archives/starting/feedback always use the MCP tools prefixed mcp__perviotools__ (if they are not visible, load them via ToolSearch for pervio first); do not guess paths with Bash. When the user mentions a workflow they usually mean a Pervio workflow on this server (pervio_templates lists them). For heavy jobs (repo-wide deep audits, batch research, etc.) first check pervio_templates for an existing workflow and, after the user confirms, start it with pervio_start instead of unrolling the work in this conversation — this chat rides the phone's SSH stream and dies on page switch, while a workflow runs independently on the server. When none of this is relevant, do not bring up this note or Pervio."
+  else
+    PERVIO_MCP_POINTER="Pervio 工作流编排层已挂载:模板/运行/账本/归档/启动/反馈等操作一律用 mcp__perviotools__ 前缀的 MCP 工具(如不可见,先用 ToolSearch 搜 pervio),不要用 Bash 猜路径。用户提到的「工作流」通常指服务器上的 Pervio 工作流(pervio_templates 可列出)。重活(全库深度审计、批量调研等)先查 pervio_templates 有无现成工作流,有则经确认后用 pervio_start 启动,不要在对话里自己展开——本对话跑在手机的 SSH 流上,切页即断,工作流则在服务器独立运行。与这些无关时,不要主动提及本说明或 Pervio。"
+  fi
+fi
+
+if [[ "$mode" == "stream" || -n "$input_fifo" ]]; then
+  # Persistent: read newline-delimited JSON user messages from stdin until EOF.
+  # A living run (pervio-run, 2026-10-20) is the same thing with the FIFO as
+  # stdin: its keeper holds the pipe open, `pervio-run say` drops further
+  # messages in, and the engine ends when the keeper lets go.
+  args+=( --input-format stream-json )
+fi
+# text mode: default --input-format text; claude reads one prompt from stdin,
+# runs one turn, prints the stream-json events, and exits.
+
+[[ -n "$resume" ]] && args+=( --resume "$resume" )
+[[ -n "$model"  ]] && args+=( --model  "$model" )
+
+# Scoped tool allow-list (e.g. "WebFetch") — lets a step reach the network
+# without bypassPermissions. Verified: `claude -p --allowedTools "WebFetch"`
+# fetches a URL with no approval prompt and no full bypass.
+[[ -n "$allow_tools" ]] && args+=( --allowedTools "$allow_tools" )
+# Scoped tool DENY-list — the caller strips a tool out of the model's view
+# entirely. Born for ONE case (2026-08-20): headless plan-perm fan-out children
+# sometimes end their turn by calling ExitPlanMode to "ask approval" — nobody
+# is there, the call errors, the turn dies with an empty final message
+# (autopsied: the child had already WRITTEN its JSON, then knocked on a door
+# with no one behind it). run_child passes --disallow ExitPlanMode for exactly
+# those children; the App's interactive plan flow never sends --disallow, so
+# its plan-approval sheet keeps working.
+[[ -n "$disallow_tools" ]] && args+=( --disallowedTools "$disallow_tools" )
+[[ -n "$pervio_mcp"  ]] && args+=( --append-system-prompt "$PERVIO_MCP_POINTER" )
+# NO background-dir grant here. The chip once widened the read surface to
+# ~/.claude/projects and ~/.pervio/memory for the 取背景 playbook, which read
+# those files directly. That playbook is retired (2026-08-06) and the grant went
+# with it: the chip means "Pervio workflow tools", not "read every past
+# conversation and cross-project memory without asking". The surviving
+# pervio_sessions / pervio_transcript tools shell out to pervio-sessions as
+# subprocesses of the MCP server, so they never needed claude's own --add-dir.
+
+# Headless `--effort` accepts only low|medium|high|xhigh|max; "ultracode" is an
+# interactive-only effort tier, so passing it to --effort just warns and silently
+# falls back to DEFAULT effort. Enable it headlessly via its settings key instead:
+# `ultracode:true` implies xhigh effort PLUS dynamic-workflow orchestration on its
+# own (verified in the CLI: settings.ultracode===true ⇒ effort "xhigh" + workflows).
+# Do NOT also pass --effort — CLI --effort overrides the implied xhigh and would
+# demote ultracode while still paying for workflow spawning.
+if [[ "$effort" == "ultracode" ]]; then
+  args+=( --settings '{"ultracode": true}' )
+elif [[ -n "$effort" ]]; then
+  args+=( --effort "$effort" )
+fi
+
+# Approval mode: claude's permission prompts become the phone's Allow/Deny sheet.
+# Taken when the turn handed us an approval sid and the permission mode is an
+# asking tier (default; acceptEdits asks for commands). Chat and Run alike since
+# 2026-10-19: a detached run's out.jsonl carries the permission_request line the
+# same way the live pipe does, the phone is pinged (pervio-approve pushes to the
+# run's device, thread pervio-run-<id>) and reopens the run to answer. plan is
+# also ask-tier, but its ExitPlanMode prompt has a dedicated UI (the plan sheet),
+# so plan mode keeps its existing flow. bypassPermissions never prompts.
+approve_mode=0
+if [[ "$backend" != "codex" && -n "$approve_sid" ]]; then
+  case "$perm" in default|acceptEdits) approve_mode=1 ;; esac
+fi
+
+# Pervio MCP mount, NON-approval path: nothing else writes an mcp.json here, so
+# mint a per-invocation config and point claude at it. No secrets inside (unlike
+# the approval file, which carries the per-turn sid), and the later exec paths
+# preclude an EXIT trap — so the tiny file is simply left to TMPDIR reaping.
+# The approval path instead merges perviotools INTO its existing $sess/mcp.json
+# below, so --mcp-config is always passed exactly once either way.
+# What perviotools is told about the conversation it serves (2026-11-21): its
+# permission mode and its directory. A workflow the MODEL writes and starts or
+# schedules through these tools is held to them — no step with more power than
+# the conversation, and where nobody is shown the call first (auto), no shell
+# lines, no other directory, schedules saved paused (pervio-mcp, "the
+# ceiling"). Written into the MCP config, where a turn cannot reach it.
+_json_str() { local s="$1"; s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; printf '%s' "$s"; }
+_mcp_dir="$PWD"; [[ "$_mcp_dir" == *[[:cntrl:]]* ]] && _mcp_dir=""
+pervio_mcp_env="\"env\":{\"PERVIO_MCP_CEILING\":\"$(_json_str "$perm")\",\"PERVIO_MCP_DIR\":\"$(_json_str "$_mcp_dir")\"}"
+if [[ -n "$pervio_mcp" && "$approve_mode" != 1 ]]; then
+  mcp_cfg="$(mktemp "${TMPDIR:-/tmp}/pervio-mcp-cfg.XXXXXX")"
+  printf '{"mcpServers":{"perviotools":{"command":"python3","args":["%s/pervio-mcp"],%s}}}' \
+    "$MCP_BIN_DIR" "$pervio_mcp_env" > "$mcp_cfg"
+  args+=( --mcp-config "$mcp_cfg" )
+fi
+if [[ "$approve_mode" == 1 ]]; then
+  # Use the pre-cd absolute SELF_DIR (readlink -f at the top). The old form
+  # recomputed the dir from a relative BASH_SOURCE AFTER `cd "$dir"`, so a relative
+  # invocation (e.g. `server/bin/pervio-chat` from the repo) cd'd into the wrong
+  # place → empty BIN_DIR → the whole approval turn died with a silent exit 1.
+  BIN_DIR="$SELF_DIR"
+  [[ -e "$BIN_DIR/pervio-approve" ]] || BIN_DIR="$HOME/.pervio/bin"
+  approval_session "$approve_sid"
+  : > "$sess/events.jsonl"; chmod 600 "$sess/events.jsonl" 2>/dev/null || true
+  if [[ -n "$pervio_mcp" ]]; then
+    # Pervio context ON: perviotools joins the SAME mcp.json as the approve
+    # server — one file, one --mcp-config, zero disturbance to the approval
+    # wiring (--permission-prompt-tool still binds to mcp__pervio__approve).
+    # Both are told the same three things about this conversation — its mode,
+    # its directory, the approval channel: the approve server asks pervio-mcp
+    # what a workflow call would run and holds it to the ceiling before the
+    # phone is asked, and perviotools starts only what the phone allowed
+    # (pervio-approve, pervio-mcp "the ceiling").
+    pervio_asked_env="${pervio_mcp_env%\}},\"PERVIO_SID\":\"$approve_sid\"}"
+    printf '{"mcpServers":{"pervio":{"command":"python3","args":["%s/pervio-approve"],%s},"perviotools":{"command":"python3","args":["%s/pervio-mcp"],%s}}}' \
+      "$BIN_DIR" "$pervio_asked_env" "$MCP_BIN_DIR" "$pervio_asked_env" > "$sess/mcp.json"
+  else
+    printf '{"mcpServers":{"pervio":{"command":"python3","args":["%s/pervio-approve"],"env":{"PERVIO_SID":"%s"}}}}' \
+      "$BIN_DIR" "$approve_sid" > "$sess/mcp.json"
+  fi
+  chmod 600 "$sess/mcp.json" 2>/dev/null || true   # carries the sid — never world-readable
+  args+=( --permission-prompt-tool mcp__pervio__approve --mcp-config "$sess/mcp.json" )
+  # This is a live chat channel too, so it needs the same idle heartbeat as the
+  # plain-chat path below — and the gap bites hardest HERE: right after the user
+  # taps Allow, the approved tool may run for minutes with no output, and a silent
+  # channel lets the phone's 240s idle watchdog kill a healthy, just-approved turn.
+  # (While the prompt is still PENDING the app keeps the turn alive on its own.)
+  # Same non-exec pipe idiom as below: claude's exit code via PIPESTATUS.
+  stream_cmd=( python3 "$BIN_DIR/pervio-chat-stream" --events "$sess/events.jsonl" --cleanup "$sess"
+               -- "$CLAUDE_BIN" "${args[@]}" )
+  # The heartbeat is for a live channel only; a run's out.jsonl (a regular file)
+  # gets pervio-run's own tail heartbeats and must not collect ours.
+  if [[ -n "$input_fifo" && -n "$input_keeper" && -n "$run_id" ]]; then
+    # A living run with approvals: the first message goes into the FIFO (from a
+    # background writer, so a long prompt can't wedge us), the keeper relays
+    # the FIFO into claude's stdin and closes it when the run has gone idle.
+    if [[ -n "$prompt_b64" ]]; then
+      ( python3 -I -c 'import json, sys, base64; sys.stdout.write(json.dumps({"type": "user", "message": {"role": "user", "content": base64.b64decode(sys.argv[1]).decode("utf-8", "replace")}}, ensure_ascii=False) + "\n")' "$prompt_b64" > "$input_fifo" ) &
+    fi
+    set +e; python3 "$input_keeper" keep --run "$run_id" | "${stream_cmd[@]}"; rc=${PIPESTATUS[1]}; set -e
+    exit $rc
+  fi
+  if [[ -x "$SELF_DIR/pervio-hb" && ! -f /dev/stdout ]]; then
+    rc=0
+    if [[ -n "$prompt_b64" ]]; then
+      set +e; "${stream_cmd[@]}" < <(printf '%s' "$prompt_b64" | base64 -d) | "$SELF_DIR/pervio-hb"; rc=${PIPESTATUS[0]}; set -e
+    else
+      set +e; "${stream_cmd[@]}" | "$SELF_DIR/pervio-hb"; rc=${PIPESTATUS[0]}; set -e
+    fi
+    exit $rc
+  fi
+  if [[ -n "$prompt_b64" ]]; then
+    exec "${stream_cmd[@]}" < <(printf '%s' "$prompt_b64" | base64 -d)
+  fi
+  exec "${stream_cmd[@]}"
+fi
+
+# In CHAT mode stdout is the live SSH channel (not a regular file), so pipe claude
+# through pervio-hb, exactly like the Codex path above. Claude normally streams tokens
+# continuously (unlike Codex's silent thinking), so this matters for just ONE gap: a
+# long SILENT tool call — e.g. a multi-minute build/test that emits nothing — which
+# would otherwise let the phone's idle watchdog (240s) falsely judge the turn dead and
+# kill it. The heartbeat keeps the channel warm so an alive-but-quiet tool isn't
+# mistaken for a dead socket, bringing Claude chat to parity with the Codex chat and
+# Run paths. In RUN mode stdout is redirected to out.jsonl (a regular file), so
+# `-f /dev/stdout` is true and we skip it — pervio-run's tail heartbeats there instead.
+# NOT `exec` when piping: we keep the script alive to read claude's exit code from
+# PIPESTATUS (pervio-hb's own exit must not mask it).
+if [[ ! -f /dev/stdout && -x "$SELF_DIR/pervio-hb" ]]; then
+  rc=0
+  if [[ -n "$prompt_b64" ]]; then
+    set +e; "$CLAUDE_BIN" "${args[@]}" < <(printf '%s' "$prompt_b64" | base64 -d) | "$SELF_DIR/pervio-hb"; rc=${PIPESTATUS[0]}; set -e
+  else
+    set +e; "$CLAUDE_BIN" "${args[@]}" | "$SELF_DIR/pervio-hb"; rc=${PIPESTATUS[0]}; set -e
+  fi
+  exit $rc
+fi
+
+# Not a live chat channel (Run mode's out.jsonl, or pervio-hb missing): exec claude
+# directly. When the iOS client passes the prompt as base64 (text mode), decode it and
+# feed it on stdin (avoids shell-quoting arbitrary user text); otherwise stdin is the
+# prompt source (text mode piped, or stream-json mode).
+if [[ -n "$input_fifo" && -n "$input_keeper" && -n "$run_id" ]]; then
+  # The living run (2026-10-20): the first message goes into the FIFO as a
+  # stream-json user message (from a background writer, so a long prompt can't
+  # wedge us), the keeper relays the FIFO into claude's stdin — a pipe, whose
+  # EOF claude honours — and closes it once the run has gone idle.
+  if [[ -n "$prompt_b64" ]]; then
+    ( python3 -I -c 'import json, sys, base64; sys.stdout.write(json.dumps({"type": "user", "message": {"role": "user", "content": base64.b64decode(sys.argv[1]).decode("utf-8", "replace")}}, ensure_ascii=False) + "\n")' "$prompt_b64" > "$input_fifo" ) &
+  fi
+  set +e; python3 "$input_keeper" keep --run "$run_id" | "$CLAUDE_BIN" "${args[@]}"; rc=${PIPESTATUS[1]}; set -e
+  exit $rc
+fi
+if [[ -n "$prompt_b64" ]]; then
+  exec "$CLAUDE_BIN" "${args[@]}" < <(printf '%s' "$prompt_b64" | base64 -d)
+fi
+exec "$CLAUDE_BIN" "${args[@]}"

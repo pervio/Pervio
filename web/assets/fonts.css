@@ -1,0 +1,9 @@
+/* Wix Madefor, Latin subset, served from this site. SIL Open Font License 1.1: fonts/OFL.txt */
+@font-face{font-family:"Wix Madefor Display";src:url(fonts/WixMadeforDisplay-latin.woff2) format("woff2");font-weight:400 800;font-style:normal;font-display:swap;
+  unicode-range:U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+2000-206F,U+20AC,U+2122,U+2212,U+2215}
+@font-face{font-family:"Wix Madefor Text";src:url(fonts/WixMadeforText-latin.woff2) format("woff2");font-weight:400 800;font-style:normal;font-display:swap;
+  unicode-range:U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+2000-206F,U+20AC,U+2122,U+2212,U+2215}
+/* On a Chinese page the Latin face lends its letters and digits only; dashes,
+   quotes and ellipses stay with the Chinese face, at its width. */
+@font-face{font-family:"Wix Madefor Display zh";src:url(fonts/WixMadeforDisplay-latin.woff2) format("woff2");font-weight:400 800;font-style:normal;font-display:swap;unicode-range:U+0020-007E,U+00A0-00FF}
+@font-face{font-family:"Wix Madefor Text zh";src:url(fonts/WixMadeforText-latin.woff2) format("woff2");font-weight:400 800;font-style:normal;font-display:swap;unicode-range:U+0020-007E,U+00A0-00FF}

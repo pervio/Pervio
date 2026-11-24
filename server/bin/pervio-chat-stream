@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""pervio-chat-stream — run claude for an approval-enabled chat turn and TEE two
+sources onto OUR stdout (the phone's read channel) at line boundaries:
+  - claude's own stdout (the stream-json the app already parses), and
+  - the per-session EVENT file, to which pervio-approve appends permission_request /
+    permission_resolved lines while it blocks waiting for the phone's decision.
+
+This merge is the whole point: pervio-approve's stdout is its JSON-RPC pipe to claude,
+NOT the channel, so without teeing the event file the phone would never see the prompts.
+Each line is written whole (split only on '\\n'), so the app's LineAssembler never sees
+a torn line. The user prompt arrives on OUR stdin and is passed straight to claude.
+Exits with claude's exit code; optionally rmtree's the session dir on the way out.
+
+Usage: pervio-chat-stream --events <path> [--cleanup <dir>] -- <claude> <args...>
+"""
+import sys, os, json, subprocess, threading, time, shutil
+
+def main():
+    argv = sys.argv[1:]
+    events_path = None
+    cleanup_dir = None
+    while argv and argv[0] != "--":
+        if argv[0] == "--events":
+            events_path = argv[1]; argv = argv[2:]
+        elif argv[0] == "--cleanup":
+            cleanup_dir = argv[1]; argv = argv[2:]
+        else:
+            argv = argv[1:]
+    if argv and argv[0] == "--":
+        argv = argv[1:]
+    if not argv:
+        sys.stderr.write("pervio-chat-stream: no claude command after --\n")
+        sys.exit(2)
+
+    out = sys.stdout.buffer
+    out_lock = threading.Lock()
+    def emit(line_bytes):
+        # one whole, newline-terminated line at a time -> never tears a stream-json line
+        with out_lock:
+            try:
+                out.write(line_bytes if line_bytes.endswith(b"\n") else line_bytes + b"\n")
+                out.flush()
+            except (BrokenPipeError, ValueError):
+                pass
+
+    # Create the event file BEFORE claude (and thus pervio-approve) can write, and open it
+    # at offset 0, so no early permission_request is missed.
+    if events_path:
+        open(events_path, "a").close()
+
+    proc = subprocess.Popen(argv, stdin=sys.stdin, stdout=subprocess.PIPE)
+    done = threading.Event()
+
+    def pump_claude():
+        try:
+            for line in proc.stdout:
+                emit(line.rstrip(b"\n"))
+        finally:
+            done.set()
+
+    def tail_events():
+        if not events_path:
+            return
+        f = open(events_path, "rb")
+        buf = b""
+        try:
+            while True:
+                chunk = f.read()
+                if chunk:
+                    buf += chunk
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        if line.strip():
+                            emit(line)
+                    continue
+                if done.is_set():
+                    break            # claude gone and nothing left to read
+                time.sleep(0.05)
+        finally:
+            f.close()
+
+    t1 = threading.Thread(target=pump_claude, daemon=True)
+    t2 = threading.Thread(target=tail_events, daemon=True)
+    t1.start(); t2.start()
+    rc = proc.wait()
+    done.set()
+    t1.join(timeout=2); t2.join(timeout=2)
+
+    if cleanup_dir:
+        # Defense in depth on a RECURSIVE DELETE: only ever remove a direct
+        # child of ~/.pervio/chat. pervio-chat validates the sid that builds this
+        # path, but this process must not depend on its caller getting that
+        # right — a traversing path once wiped a home directory in testing.
+        root = os.path.realpath(os.path.join(os.path.expanduser("~"), ".pervio", "chat"))
+        target = os.path.realpath(cleanup_dir)
+        if os.path.dirname(target) == root and os.path.basename(target) not in ("", ".", ".."):
+            shutil.rmtree(target, ignore_errors=True)
+        else:
+            sys.stderr.write("pervio-chat-stream: refusing to clean up %r "
+                             "(not a session dir under %s)\n" % (cleanup_dir, root))
+    sys.exit(rc if rc is not None else 0)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,347 @@
+#!/usr/bin/env python3
+"""pervio-approve — stdio MCP server that turns Claude Code's --permission-prompt-tool
+into a phone-answerable Allow/Deny.
+
+Claude (launched by pervio-chat with `--permission-prompt-tool mcp__pervio__approve`)
+calls this server's single `approve` tool for every ASK-TIER tool use (Edit/Write/Bash/…;
+read-only tools like Read are auto-allowed by Claude and never reach us — verified live).
+For each call we:
+  1. append one  {type:"permission_request", request_id, tool_name, input, tool_use_id}
+     line to the per-session EVENT file (pervio-chat tees it out to the phone),
+  2. BLOCK until a decision for that request_id arrives on the per-session RESPONSE FIFO
+     (written by `pervio-chat respond` from a one-shot SSH command), and
+  3. return  {behavior:"allow",updatedInput:…}  or  {behavior:"deny",message:…}  to Claude,
+     so the turn continues IN PLACE (verified: allow applies the edit in-turn,
+     deny lands in result.permission_denials with is_error:false).
+
+Concurrency: Claude can hold several ask-tier calls open at once, all multiplexed over
+this ONE stdio process. Each tools/call runs on its own worker thread; a single FIFO
+reader thread dispatches decisions by request_id (== Claude's tool_use_id) to the matching
+waiter. First decision per id wins; late/unknown ids are dropped.
+
+A call to the workflow tools (mcp__perviotools__…) is asked about in the words of
+what it would RUN, not of what the model typed (security review 2026-11-22, #1/#2):
+`pervio-mcp --resolve` looks the template up, fills the parameters in and holds the
+result to the conversation's ceiling. A call it refuses is denied here, unasked, in
+the same words. Otherwise the request carries the resolved workflow for the phone's
+sheet (`shown.spec_b64`), and on Allow a one-use token named by its hash is left in
+shown/ — pervio-mcp starts the workflow only on that token, so what was allowed is
+what runs.
+
+Layout (created here if absent; normally pre-created by pervio-chat):
+    ~/.pervio/chat/<PERVIO_SID>/
+        events.jsonl   # permission_request / permission_resolved lines (tee -> phone)
+        control.fifo   # decisions in:  {request_id, behavior, message?, updatedInput?}
+        shown/<sha256> # one per allowed workflow call, used up by pervio-mcp
+
+Env: PERVIO_SID (required) — the per-turn nonce keying the session dir.
+     PERVIO_MCP_CEILING / PERVIO_MCP_DIR — passed on to `pervio-mcp --resolve`.
+"""
+import subprocess
+import sys, os, json, threading, time
+
+SID = os.environ.get("PERVIO_SID", "")
+BASE = os.path.join(os.path.expanduser("~"), ".pervio", "chat", SID)
+EVENTS = os.path.join(BASE, "events.jsonl")
+FIFO = os.path.join(BASE, "control.fifo")
+
+# Siblings on-disk, in the same bin dir as this script: the APNs push sender,
+# and the shared lib whose push_lang() says which language the PHONE is set to.
+SELF_DIR = os.path.dirname(os.path.realpath(__file__))
+PUSH = os.path.join(SELF_DIR, "pervio-push")
+
+
+def _push_target():
+    """Who the ping goes to and where a tap lands (2026-10-19): the phone that
+    drives this turn (PERVIO_PUSH_DEVICE, set by pervio-chat --device / pervio-run
+    from the run's record) and, for a detached run, the run's own thread so the
+    tap reopens that conversation (PERVIO_RUN_ID, set by pervio-run). Without a
+    device every phone on this Mac is pinged, as before."""
+    run_id = os.environ.get("PERVIO_RUN_ID", "")
+    args = ["--thread", "pervio-run-" + run_id if run_id else "pervio-approve"]
+    dev = os.environ.get("PERVIO_PUSH_DEVICE", "")
+    if dev:
+        args += ["--device", dev]
+    return args
+sys.path.insert(0, SELF_DIR)
+from _pervio_lib import push_lang   # noqa: E402
+
+# Ask-tier tool -> a short human verb for the lock-screen line "Claude 在等你批准:<动词>".
+_APPROVE_VERB = {
+    "Edit": "改文件", "MultiEdit": "改文件", "Write": "写文件", "NotebookEdit": "改笔记本",
+    "Bash": "跑命令", "Read": "读文件", "WebFetch": "抓网页", "WebSearch": "搜网页",
+}
+_APPROVE_VERB_EN = {
+    "Edit": "edit a file", "MultiEdit": "edit a file", "Write": "write a file",
+    "NotebookEdit": "edit a notebook", "Bash": "run a command", "Read": "read a file",
+    "WebFetch": "fetch a page", "WebSearch": "search the web",
+}
+
+
+def _approve_copy(tool_name):
+    """(title, body) of the approval push, in the phone's synced language —
+    read at push time, like every other server-authored push body. An unfamiliar
+    tool falls back to its own name in either language; zh strings are the
+    shipped ones, byte-for-byte."""
+    if push_lang() == "en":
+        return ("Claude is waiting for your approval",
+                _APPROVE_VERB_EN.get(tool_name, tool_name or "an action"))
+    return ("Claude 在等你批准", _APPROVE_VERB.get(tool_name, tool_name or "操作"))
+
+
+def _push_approval(tool_name):
+    """Fire ONE lock-screen push when a tool call starts blocking on the phone's
+    Allow/Deny. Fully detached and every error swallowed — pervio-push already
+    no-ops without a key, and this must never disturb the approval turn itself.
+    (Only the FIRST pending request per turn pings; see _push_seen below.)"""
+    title, verb = _approve_copy(tool_name)
+    try:
+        subprocess.Popen(
+            [sys.executable, PUSH, "send",
+             "--title", title, "--body", verb]
+            + _push_target(),
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True)
+    except (OSError, ValueError):
+        pass
+
+
+# The phone is already watching a live approval turn on the SSH channel, so a
+# push per pending tool would double-notify. Ping only ONCE per session (the first
+# time a tool actually blocks) — that is the "your turn is waiting" nudge for a
+# user who has since locked the phone; subsequent tools in the same turn are seen
+# in-app when they return.
+_push_lock = threading.Lock()
+_push_seen = False
+
+_stdout_lock = threading.Lock()
+_pending_lock = threading.Lock()
+_pending = {}                 # request_id -> {"ev":Event, "decision":dict|None, "input":any}
+_shutdown = threading.Event()
+
+
+def _send(obj):
+    """Write one JSON-RPC message to Claude (our stdout). Serialized; tolerant of a
+    closed pipe (Claude exited mid-wait)."""
+    try:
+        with _stdout_lock:
+            sys.stdout.write(json.dumps(obj) + "\n")
+            sys.stdout.flush()
+    except (BrokenPipeError, ValueError):
+        pass
+
+
+def _append_event(obj):
+    """Atomic single-line append to the EVENT file (pervio-chat tails it). One complete
+    newline-terminated line per write so the downstream line-boundary tee never splits."""
+    try:
+        line = (json.dumps(obj) + "\n").encode()
+        fd = os.open(EVENTS, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(fd, line)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+def _ensure_layout():
+    os.makedirs(BASE, mode=0o700, exist_ok=True)
+    if not os.path.exists(EVENTS):
+        open(EVENTS, "a").close()
+        try: os.chmod(EVENTS, 0o600)
+        except OSError: pass
+    if not os.path.exists(FIFO):
+        try: os.mkfifo(FIFO, 0o600)
+        except FileExistsError: pass
+
+
+def _fifo_reader():
+    """Single reader for all decisions. Opens O_RDWR so it NEVER sees EOF when a
+    `respond` writer connects-then-disconnects (the #1 FIFO gotcha). Dispatches each
+    decision line to the waiter keyed by request_id/tool_use_id; first one wins."""
+    fd = os.open(FIFO, os.O_RDWR)
+    buf = b""
+    while True:
+        try:
+            chunk = os.read(fd, 65536)      # blocks until a writer writes
+        except OSError:
+            return
+        if not chunk:                        # not expected under O_RDWR; guard anyway
+            time.sleep(0.05); continue
+        buf += chunk
+        while b"\n" in buf:
+            raw, buf = buf.split(b"\n", 1)
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                msg = json.loads(raw.decode())
+            except Exception:
+                continue
+            rid = msg.get("request_id") or msg.get("tool_use_id")
+            with _pending_lock:
+                h = _pending.get(rid)
+                if h and h["decision"] is None:
+                    h["decision"] = msg
+                    h["ev"].set()
+
+
+WORKFLOW_TOOLS = "mcp__perviotools__"
+SHOWN = os.path.join(BASE, "shown")
+RESOLVE_TIMEOUT = 90.0
+
+
+def _what_it_would_run(tool_name, tinput):
+    """For a call to the workflow tools: ask pervio-mcp what it would run.
+    Returns (shown, refusal): `shown` is {"spec_b64", "sha"} when the call
+    carries a workflow and None when it carries none; `refusal` is the words
+    to deny with, unasked, when the call would be turned down anyway — or when
+    nobody could say what it would run."""
+    if not isinstance(tool_name, str) or not tool_name.startswith(WORKFLOW_TOOLS):
+        return None, None
+    mcp = os.path.join(SELF_DIR, "pervio-mcp")
+    if not os.path.exists(mcp):
+        mcp = os.path.join(os.path.expanduser("~"), ".pervio", "bin", "pervio-mcp")
+    ask = json.dumps({"tool": tool_name[len(WORKFLOW_TOOLS):], "input": tinput})
+    try:
+        p = subprocess.run([sys.executable, mcp, "--resolve"], input=ask.encode("utf-8"),
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                           timeout=RESOLVE_TIMEOUT)
+        lines = p.stdout.decode("utf-8", "replace").strip().splitlines()
+        ans = json.loads(lines[-1]) if lines else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        ans = None
+    if not isinstance(ans, dict):
+        return None, ("Pervio could not work out what this call would run on the Mac, so the "
+                      "person was not asked to allow it. Nothing was started.")
+    if ans.get("ok") is not True:
+        return None, str(ans.get("error") or "refused")
+    if isinstance(ans.get("spec_b64"), str) and isinstance(ans.get("sha"), str):
+        return {"spec_b64": ans["spec_b64"], "sha": ans["sha"]}, None
+    return None, None
+
+
+def _leave_token(sha):
+    """An Allow for one exact workflow: pervio-mcp looks for this file and uses it up."""
+    if not sha or any(c not in "0123456789abcdef" for c in sha) or len(sha) != 64:
+        return
+    try:
+        os.makedirs(SHOWN, mode=0o700, exist_ok=True)
+        now = time.time()
+        for old in os.listdir(SHOWN):                 # an Allow nobody used does not pile up
+            path = os.path.join(SHOWN, old)
+            try:
+                if now - os.lstat(path).st_mtime > 600:
+                    os.unlink(path)
+            except OSError:
+                pass
+        fd = os.open(os.path.join(SHOWN, sha),
+                     os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        os.close(fd)
+    except OSError:
+        pass                                          # no token: pervio-mcp refuses, and says so
+
+
+def _handle_call(rpc_id, args):
+    """One worker per tools/call: surface the request, block for the decision, reply."""
+    tool_name = args.get("tool_name")
+    tool_use_id = args.get("tool_use_id") or str(rpc_id)
+    tinput = args.get("input", {})
+    shown, refusal = _what_it_would_run(tool_name, tinput)
+    if refusal is not None:
+        # Turned down before anyone is asked — and before any push: the phone
+        # is not rung for a sheet that could only be denied.
+        _send({"jsonrpc": "2.0", "id": rpc_id, "result": {"content": [{"type": "text", "text": json.dumps(
+            {"behavior": "deny", "message": refusal})}]}})
+        return
+    holder = {"ev": threading.Event(), "decision": None, "input": tinput}
+    with _pending_lock:
+        _pending[tool_use_id] = holder
+    request = {"type": "permission_request", "request_id": tool_use_id,
+               "tool_use_id": tool_use_id, "tool_name": tool_name, "input": tinput}
+    if shown is not None:
+        request["shown"] = {"spec_b64": shown["spec_b64"]}
+    _append_event(request)
+
+    # Lock-screen nudge: "Claude 在等你批准:<动词>". Once per session (first blocker).
+    global _push_seen
+    with _push_lock:
+        first = not _push_seen
+        _push_seen = True
+    if first:
+        _push_approval(tool_name)
+
+    holder["ev"].wait()                      # decision arrives, or shutdown wakes us
+
+    with _pending_lock:
+        _pending.pop(tool_use_id, None)
+    dec = holder["decision"]
+    if dec is None or _shutdown.is_set():
+        result = {"behavior": "deny", "message": "Approval channel closed."}
+    elif dec.get("behavior") == "allow":
+        if shown is not None:
+            # The call goes on exactly as it was asked about: the token is for
+            # that input, and an edited one would only be refused by pervio-mcp.
+            _leave_token(shown["sha"])
+            result = {"behavior": "allow", "updatedInput": tinput}
+        else:
+            result = {"behavior": "allow", "updatedInput": dec.get("updatedInput", tinput)}
+    else:
+        result = {"behavior": "deny", "message": dec.get("message", "Denied.")}
+
+    _append_event({"type": "permission_resolved", "request_id": tool_use_id,
+                   "behavior": result["behavior"]})
+    _send({"jsonrpc": "2.0", "id": rpc_id,
+           "result": {"content": [{"type": "text", "text": json.dumps(result)}]}})
+
+
+def main():
+    if not SID:
+        sys.stderr.write("pervio-approve: PERVIO_SID not set\n")
+        sys.exit(2)
+    _ensure_layout()
+    threading.Thread(target=_fifo_reader, daemon=True).start()
+
+    while True:
+        line = sys.stdin.readline()
+        if line == "":                       # EOF: Claude gone
+            break
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except Exception:
+            continue
+        mid = msg.get("id")
+        method = msg.get("method")
+        if method == "initialize":
+            _send({"jsonrpc": "2.0", "id": mid, "result": {
+                "protocolVersion": (msg.get("params") or {}).get("protocolVersion", "2024-11-05"),
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "pervio", "version": "1.0.0"}}})
+        elif method == "tools/list":
+            _send({"jsonrpc": "2.0", "id": mid, "result": {"tools": [{
+                "name": "approve",
+                "description": "Approve or deny a tool call (answered from the phone).",
+                "inputSchema": {"type": "object", "additionalProperties": True}}]}})
+        elif method == "tools/call":
+            args = (msg.get("params") or {}).get("arguments", {}) or {}
+            threading.Thread(target=_handle_call, args=(mid, args), daemon=True).start()
+        elif method and method.startswith("notifications/"):
+            pass                              # notifications get no response
+        else:
+            if mid is not None:
+                _send({"jsonrpc": "2.0", "id": mid, "result": {}})
+
+    # Claude exited: wake every blocked worker (they reply deny to a now-dead pipe) and go.
+    _shutdown.set()
+    with _pending_lock:
+        for h in _pending.values():
+            h["ev"].set()
+    time.sleep(0.1)
+
+
+if __name__ == "__main__":
+    main()

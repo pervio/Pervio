@@ -1,0 +1,1284 @@
+#!/usr/bin/env python3
+"""pervio-run — detached background runs for the iOS app's "Run" mode.
+
+Chat mode (pervio-chat) ties one Claude turn to the live SSH channel: close the
+channel and the turn dies. Run mode launches the SAME pervio-chat turn DETACHED
+(its own session, no controlling tty) writing the stream-json to a file, so it
+survives the phone disconnecting/locking and can be reattached later.
+
+A "run" is ONE turn (one detached `pervio-chat --text … --resume <sid>` process):
+it ends when Claude emits its terminal `result` event and the process exits; the
+next turn starts a fresh run. Conversation continuity comes from --resume +
+Claude's own on-disk history, NOT from keeping a process alive between turns.
+
+Layout, one dir per run:
+    ~/.pervio/runs/<runId>/
+        meta.json   # runId, dir, resume, perm, model, effort, started, preview
+        out.jsonl   # pervio-chat stdout (stream-json) — the live event stream
+        err         # stderr
+        status      # "running" -> "exited:<code>"
+        pgid        # process-group id (== session leader pid) for `stop`
+
+out.jsonl is a DISPOSABLE buffer: the durable transcript is Claude's own session
+JSONL under ~/.claude/projects. GC prunes finished/orphaned run dirs.
+
+Commands:
+    pervio-run start  --dir D [--resume SID] [--perm M] [--model X] [--effort E] --prompt-b64 B64
+    pervio-run tail   --run R [--from BYTES]
+    pervio-run list   [--dir D]
+    pervio-run status --run R
+    pervio-run stop   --run R
+"""
+import base64
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import uuid
+
+# Run output (out.jsonl transcript, meta.json, err, status, pgid) is created
+# owner-only — the runs/ parent is already 0700, but on a shared host the files
+# themselves shouldn't be group/other-readable either (defense in depth).
+os.umask(0o077)
+
+HOME = os.path.expanduser("~")
+RUNS = os.path.join(HOME, ".pervio", "runs")
+SELF_DIR = os.path.dirname(os.path.realpath(__file__))
+CHAT = os.path.join(SELF_DIR, "pervio-chat")
+
+sys.path.insert(0, SELF_DIR)
+from _pervio_lib import push_lang   # noqa: E402  (same sibling-import idiom as pervio-orchestrate)
+
+DONE_TTL = 6 * 3600     # delete finished runs this long after they end
+STALE_SECS = 3600       # delete orphaned/never-finished runs idle this long
+
+# ---------- small helpers ----------
+
+def _runs_dir():
+    os.makedirs(RUNS, mode=0o700, exist_ok=True)
+    return RUNS
+
+def _run_path(run_id):
+    # run ids are bare hex; reject anything that could escape the runs dir.
+    if not run_id or "/" in run_id or ".." in run_id:
+        _die("bad run id")
+    return os.path.join(RUNS, run_id)
+
+def _read(path):
+    try:
+        with open(path, "r", errors="replace") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+def _read_json(path):
+    try:
+        with open(path, "r", errors="replace") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+def _filesize(path):
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+def _pgid_of(rd):
+    txt = _read(os.path.join(rd, "pgid")).strip()
+    return int(txt) if txt.isdigit() else 0
+
+def _alive(pgid):
+    if not pgid:
+        return False
+    try:
+        os.kill(pgid, 0)            # leader pid; bash waits on claude so leader-alive == run-alive
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+def _finished(rd):
+    return _read(os.path.join(rd, "status")).startswith("exited")
+
+def _exit_code(rd):
+    s = _read(os.path.join(rd, "status")).strip()
+    if s.startswith("exited:"):
+        try:
+            return int(s.split(":", 1)[1])
+        except ValueError:
+            return None
+    return None
+
+def _session_id(rd):
+    """Pull the resume id out of the stream-json. Claude carries session_id on
+    init/result; Codex carries thread_id on thread.started — both are the key
+    fed back as --resume to continue the conversation."""
+    sid = ""
+    try:
+        with open(os.path.join(rd, "out.jsonl"), "r", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(o, dict):
+                    v = o.get("session_id") or o.get("thread_id")
+                    if v:
+                        sid = v
+    except OSError:
+        pass
+    return sid
+
+def _result_is_error(rd):
+    """True/False from the terminal result event, or None if no result yet."""
+    val = None
+    try:
+        with open(os.path.join(rd, "out.jsonl"), "r", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(o, dict):
+                    t = o.get("type")
+                    if t == "result":            # Claude terminal event
+                        val = bool(o.get("is_error"))
+                    elif t == "error":           # Codex standalone error (may stand alone)
+                        val = True
+                    elif t == "turn.failed":     # Codex turn failed
+                        val = True
+                    elif t == "turn.completed":  # Codex turn succeeded
+                        val = False
+    except OSError:
+        pass
+    return val
+
+def _waiting(rd):
+    """Is this run blocked on the phone's Allow/Deny right now? True when the
+    tail of out.jsonl has a permission_request no permission_resolved answers
+    (both lines are the engines' — pervio-approve's and pervio-codex-app's).
+    The phone shows "waiting for you" instead of "working", and a reopened run
+    raises the sheet again from the replayed request."""
+    out = os.path.join(rd, "out.jsonl")
+    try:
+        with open(out, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 65536))
+            tail = f.read().decode("utf-8", "replace")
+    except OSError:
+        return False
+    asked, answered = [], set()
+    for line in tail.splitlines():
+        if '"permission_' not in line:
+            continue
+        try:
+            o = json.loads(line)
+        except ValueError:
+            continue
+        if o.get("type") == "permission_request":
+            asked.append(str(o.get("request_id", "")))
+        elif o.get("type") == "permission_resolved":
+            answered.add(str(o.get("request_id", "")))
+    return any(r and r not in answered for r in asked)
+
+def _replied(rd):
+    """Is the run between turns — its latest turn answered, no newer one open?
+    True for a process that lingers after answering (Claude Code waiting on a
+    background task of its own): the phone shows the reply as done instead of
+    "working" (2026-10-18). Since a living run takes further messages
+    (2026-10-20), a turn is OPEN again from the moment one is fed (`say`
+    writes a turn_sent marker; the engine's own system/init follows) or the
+    engine starts a continuation of its own after a background task, and
+    answered again at its next result. Only the tail of out.jsonl is read."""
+    out = os.path.join(rd, "out.jsonl")
+    try:
+        with open(out, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 65536))
+            tail = f.read().decode("utf-8", "replace")
+    except OSError:
+        return False
+    last = None
+    for line in tail.splitlines():
+        if not any(k in line for k in ('"result"', '"init"', '"turn_sent"', '"turn.', '"thread.started"')):
+            continue
+        try:
+            o = json.loads(line)
+        except ValueError:
+            continue
+        mark = _turn_mark(o)
+        if mark:
+            last = mark
+    return last == "answered"
+
+def _turn_mark(o):
+    """What an event says about the turn: "answered" at a result (Claude's
+    `result`, Codex's `turn.completed` / `turn.failed`), "open" when one starts
+    (Claude's system/init, Codex's thread.started / turn.started, our own
+    turn_sent marker), None for everything else."""
+    t = o.get("type")
+    if t in ("result", "turn.completed", "turn.failed"):
+        return "answered"
+    if (t == "system" and o.get("subtype") == "init") or (t == "pervio" and o.get("subtype") == "turn_sent") \
+            or t in ("thread.started", "turn.started"):
+        return "open"
+    return None
+
+def _is_taken(o):
+    """The engine's word that a fed message is in its record now (written by
+    the engine's adapter — pervio-codex-app, when codex reports the message
+    as an item of the turn). Not a turn mark: nothing opens or is answered."""
+    return isinstance(o, dict) and o.get("type") == "pervio" and o.get("subtype") == "turn_taken"
+
+def _last_taken(rd):
+    """The words of the last fed message the engine has taken in the turn now
+    open ("" when none, or between turns). The replay starts after that point
+    (_turn_from), so a phone whose copy of the conversation was read a moment
+    before it cannot learn of the message from the replay — it checks its copy
+    against this and reads the conversation again when the message is missing."""
+    out = os.path.join(rd, "out.jsonl")
+    last = ""
+    try:
+        with open(out, "rb") as f:
+            for raw in f:
+                if raw.startswith(b"{") and any(k in raw for k in (b'"result"', b'"turn_taken"', b'"turn.')):
+                    try:
+                        o = json.loads(raw.decode("utf-8", "replace"))
+                    except ValueError:
+                        continue
+                    if not isinstance(o, dict):
+                        continue
+                    if _turn_mark(o) == "answered":
+                        last = ""
+                    elif _is_taken(o):
+                        last = o.get("text") if isinstance(o.get("text"), str) else ""
+    except OSError:
+        return ""
+    return last
+
+def _turn_from(rd):
+    """Byte offset in out.jsonl where the CURRENT turn starts: after the last
+    answered mark when the run is between turns (a reopen then replays
+    nothing, the history already shows every reply), at the first open mark
+    after it while a turn is in flight (the reopen rebuilds just that reply),
+    0 for a run still on its first turn. The phone reattaches from here
+    instead of byte 0, so a living run's earlier turns are never replayed
+    onto the one bubble (2026-10-21).
+
+    Inside an open turn the start moves past each `turn_taken` mark — the
+    engine's word that it has written a message fed mid-turn into its own
+    record (2026-11-21). From there on the record holds that message and
+    everything before it, so the replay is only what came after; replaying
+    from the turn's start put the words from before the message into the
+    bubble after it."""
+    out = os.path.join(rd, "out.jsonl")
+    answered_end, open_start, pos = 0, None, 0
+    try:
+        with open(out, "rb") as f:
+            for raw in f:
+                n = len(raw)
+                if raw.startswith(b"{") and any(k in raw for k in (b'"result"', b'"init"', b'"turn_sent"', b'"turn_taken"', b'"turn.', b'"thread.started"')):
+                    try:
+                        o = json.loads(raw.decode("utf-8", "replace"))
+                    except ValueError:
+                        o = {}
+                    mark = _turn_mark(o) if isinstance(o, dict) else None
+                    if mark == "answered":
+                        answered_end, open_start = pos + n, None
+                    elif mark == "open" and open_start is None:
+                        open_start = pos
+                    elif _is_taken(o) and open_start is not None:
+                        open_start = pos + n
+                pos += n
+    except OSError:
+        return 0
+    return open_start if open_start is not None else answered_end
+
+# ---------- the living run: its input, its keeper, its background tasks ----------
+# A run is one engine process that stays alive while the conversation is warm
+# (2026-10-20, the person: "跟 app 一样"). Its stdin is a FIFO; a KEEPER
+# process holds the writing end open so the engine never sees EOF while a
+# background task of its own is pending or a follow-up may still arrive, and
+# closes it once the run has been idle for a grace period — the engine then
+# exits on its own. `say` writes further user messages into that FIFO, so one
+# process answers them all and the conversation file has ONE writer.
+# How long a living run stays after its reply with nothing pending: a SETTLE
+# of a second, not a warm wait (2026-11-11, the person's call). The 3-minute
+# wait it replaced bought only the engine's restart — 0.2 s for Claude Code,
+# 1.5 s for Codex on a 400 MB thread, measured — and cost a window in which a
+# phone that lost its tail started a second process on the conversation
+# (Codex: "already has an active writer"), and the terminal could not open it.
+# A run with a background task of its own still stays until the task is done.
+IDLE_GRACE = float(os.environ.get("PERVIO_RUN_IDLE_GRACE", "1.0"))
+
+def _fifo_path(rd):
+    return os.path.join(rd, "in.fifo")
+
+def _keeper_alive(rd):
+    try:
+        pid = int(_read(os.path.join(rd, "keeper.pid")).strip() or "0")
+    except ValueError:
+        pid = 0
+    return pid > 0 and _alive(pid)
+
+def _accepting(rd):
+    """Can a further message be fed into this run right now?"""
+    return os.path.exists(_fifo_path(rd)) and _keeper_alive(rd) and _alive(_pgid_of(rd))
+
+def _runs_on(session):
+    """Our living runs on `session` whose process is still here: (run id,
+    leaving) — leaving = the keeper has let go and the process is a beat from
+    exiting; not leaving = the keeper is there, idle or working."""
+    out = []
+    if not session or not os.path.isdir(RUNS):
+        return out
+    for rid in os.listdir(RUNS):
+        rd = os.path.join(RUNS, rid)
+        if not os.path.isdir(rd) or _finished(rd):
+            continue
+        meta = _read_json(os.path.join(rd, "meta.json"))
+        if not isinstance(meta, dict) or not meta.get("living"):
+            continue
+        if meta.get("resume") != session and _session_id(rd) != session:
+            continue
+        pgid = _pgid_of(rd)
+        if pgid and _alive(pgid):
+            out.append((rid, not _keeper_alive(rd)))
+    return sorted(out)
+
+def _idle(rd):
+    """Between turns with nothing pending — read off the stream itself, which
+    the keeper's ledger may trail by a tick (its loop wakes every 0.5 s): a
+    reply landed a moment ago still counts as idle. The keeper then honours a
+    `leave` only once its own reading agrees, so nothing in flight is cut."""
+    return _replied(rd) and not _background(rd)
+
+def _make_way(session):
+    """Before a fresh start on `session` (2026-11-11): a run of ours still on
+    that conversation is asked to leave when it is IDLE (its `leave` file — the
+    keeper ends its settle early, cutting no work) and waited for while it
+    goes, up to 3 s; a run still working or waiting on a task of its own is
+    left alone (the start then meets Codex's writer lock, as it should — that
+    conversation is busy). Returns the ids waited for."""
+    waited = set()
+    deadline = time.time() + 3.0
+    while time.time() < deadline:
+        pending = []
+        for rid, leaving in _runs_on(session):
+            rd = os.path.join(RUNS, rid)
+            if leaving:
+                pending.append(rid)
+            elif _idle(rd):
+                try:
+                    with open(os.path.join(rd, "leave"), "w") as f:
+                        f.write(str(int(time.time())))
+                except OSError:
+                    pass
+                pending.append(rid)
+        if not pending:
+            break
+        waited.update(pending)
+        time.sleep(0.1)
+    return sorted(waited)
+
+def _keeper_state(rd):
+    st = _read_json(os.path.join(rd, "keeper.json"))
+    return st if isinstance(st, dict) else {}
+
+def _background(rd):
+    """The engine's own background tasks still pending, as the keeper last saw
+    them: [{taskId, description, startedAt, taskType, agentType?, parent?,
+    ambient?, tokens?, toolUses?, activity?}] — see _task_row."""
+    return list(_keeper_state(rd).get("pending") or [])
+
+TASK_ID_MAX = 80        # a task id, its type, its sub-agent type
+TASK_TEXT_MAX = 300     # its description / what it is doing
+LEDGER_ROWS_MAX = 200   # rows the ledger hands to a phone (the run's life is decided on ALL that are pending)
+
+def _task_row(task, now):
+    """One pending task for the ledger, from a row of Claude Code's
+    background_tasks_changed: what it is (taskType as the engine names it —
+    local_agent is a sub-agent, local_bash a command), which sub-agent launched
+    it, and whether the engine calls it housekeeping (ambient: hosts leave it
+    out of what they show). A sub-agent's totals are added as it reports them
+    (_task_progress). A phone opening the run later draws its task line from
+    these rows, so they carry what the stream said and nothing is re-derived."""
+    # The words are a model's: each is kept to a length a row can show.
+    row = {"taskId": str(task["task_id"])[:TASK_ID_MAX],
+           "description": str(task.get("description") or task.get("task_type") or "")[:TASK_TEXT_MAX],
+           "startedAt": int(now), "taskType": str(task.get("task_type") or "")[:TASK_ID_MAX]}
+    if task.get("subagent_type"):
+        row["agentType"] = str(task["subagent_type"])[:TASK_ID_MAX]
+    if task.get("parent_task_id"):
+        row["parent"] = str(task["parent_task_id"])[:TASK_ID_MAX]
+    if task.get("ambient") is True:
+        row["ambient"] = True
+    return row
+
+def _task_progress(row, ev):
+    """Fold one task_progress into its ledger row; True when the row changed."""
+    before = dict(row)
+    usage = ev.get("usage")
+    if isinstance(usage, dict):
+        for src, dst in (("total_tokens", "tokens"), ("tool_uses", "toolUses")):
+            if isinstance(usage.get(src), int) and not isinstance(usage.get(src), bool):
+                row[dst] = usage[src]
+    if isinstance(ev.get("description"), str) and ev["description"]:
+        row["activity"] = ev["description"][:TASK_TEXT_MAX]
+    return row != before
+
+def _user_message_line(text):
+    """One stream-json user message, the shape Claude Code's --input-format
+    stream-json reads (and pervio-codex-app mirrors)."""
+    return json.dumps({"type": "user", "message": {"role": "user", "content": text}}, ensure_ascii=False) + "\n"
+
+def cmd_keep(argv):
+    """Internal, run by pervio-chat in FRONT of the engine (`keep | engine`):
+    relay the run's input FIFO into the engine's stdin, and decide when the
+    run may end. Holds the FIFO read-write (so it never sees EOF itself), tails
+    out.jsonl for turn boundaries and the engine's background-task events,
+    keeps a ledger (keeper.json) the status/list verbs read. Exits — closing
+    the engine's stdin pipe, the EOF that ends it — when the run's process is
+    gone, when the engine itself died (a hangup on its stdin pipe), or when no
+    turn is open, no background task is pending and IDLE_GRACE seconds have
+    passed since the last event. Leaving, it withdraws the FIFO first and takes
+    whatever a `say` dropped in meanwhile: words for the engine mean the person
+    spoke just now, so the pipe is put back and the turn goes on."""
+    import select
+    o = _parse(argv, {"run"})
+    rd = _run_path(o.get("run", ""))
+    fifo = _fifo_path(rd)
+    if not os.path.isdir(rd) or not os.path.exists(fifo):
+        _die("keep: no such run or no fifo", 3)
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))   # stop → cleanup below still runs
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)             # the engine gone mid-write: just die
+    fd = os.open(fifo, os.O_RDWR)               # the writer that never leaves (until it decides to)
+    engine_in = sys.stdout.buffer
+    with open(os.path.join(rd, "keeper.pid"), "w") as f:
+        f.write(str(os.getpid()))
+    out = os.path.join(rd, "out.jsonl")
+    pos = 0
+    pending = {}                                # task_id -> its ledger row (_task_row)
+    turn_open = True                            # the first turn is being fed as we start
+    last_event = time.time()
+    last_result = 0
+    started = time.time()
+    meta = _read_json(os.path.join(rd, "meta.json"))
+    run_id = os.path.basename(rd.rstrip("/"))
+    turn_preview = meta.get("preview", "")      # the words of the turn in flight (say's marker renames it)
+    announced = 0                               # replies this keeper has pushed (finish then adds none)
+    def ledger():
+        tmp = os.path.join(rd, "keeper.json.tmp")
+        try:
+            with open(tmp, "w") as f:
+                json.dump({"pending": list(pending.values())[:LEDGER_ROWS_MAX], "pendingCount": len(pending), "turnOpen": turn_open,
+                           "lastResultAt": int(last_result), "announced": announced,
+                           "updatedAt": int(time.time())}, f)
+            os.replace(tmp, os.path.join(rd, "keeper.json"))
+        except OSError:
+            pass
+    ledger()
+    # The engine's death reaches us as a hangup on its stdin pipe (macOS and
+    # Linux both report POLLHUP on a pipe's write end once the reader is gone),
+    # so a crashed or killed engine never leaves a run "running" until a stop.
+    hup = select.poll()
+    hup.register(engine_in.fileno(), select.POLLERR | select.POLLHUP)
+    def engine_gone():
+        try:
+            return bool(hup.poll(0))
+        except OSError:
+            return True
+    # `leave`: a fresh start on this very conversation asks an IDLE run to go
+    # now rather than at the end of its settle — honoured only between turns
+    # with nothing pending, so no work is ever cut (2026-11-11).
+    leave_path = os.path.join(rd, "leave")
+    def drain_fifo():
+        """Whatever a say dropped in up to this moment, without blocking."""
+        chunks = []
+        os.set_blocking(fd, False)
+        try:
+            while True:
+                try:
+                    b = os.read(fd, 65536)
+                except (BlockingIOError, OSError):
+                    break
+                if not b:
+                    break
+                chunks.append(b)
+        finally:
+            try:
+                os.set_blocking(fd, True)
+            except OSError:
+                pass
+        return b"".join(chunks)
+    try:
+        while True:
+            # relay whatever a say (or pervio-chat's first message) dropped in
+            ready, _, _ = select.select([fd], [], [], 0.5)
+            if ready:
+                try:
+                    data = os.read(fd, 65536)
+                except OSError:
+                    data = b""
+                if data:
+                    engine_in.write(data); engine_in.flush()
+            try:
+                with open(out, "rb") as f:
+                    f.seek(pos)
+                    chunk = f.read()
+                    # Whole lines only: what is read mid-write ends in half a
+                    # line, and a half line skipped here was an event lost for
+                    # good — the pending set with it, and the run then left
+                    # early or never (the 2026-11-22 review). The rest of the
+                    # line is read with its end, next time round.
+                    chunk = chunk[:chunk.rfind(b"\n") + 1]
+                    pos += len(chunk)
+            except OSError:
+                chunk = b""
+            changed = False
+            for line in chunk.decode("utf-8", "replace").splitlines():
+                if not line.startswith("{"):
+                    continue
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                t, st = ev.get("type"), ev.get("subtype")
+                mark = _turn_mark(ev)
+                if mark == "answered":
+                    turn_open = False; last_result = time.time(); last_event = last_result; changed = True
+                    # The reply is the moment the person waits for, and the process
+                    # stays on past it: the completion push and the island's end go
+                    # out NOW, per reply, not when the process finally exits.
+                    _notify_reply(run_id, meta, turn_preview, ok=not (ev.get("is_error") is True or t == "turn.failed"))
+                    announced += 1
+                elif mark == "open":
+                    # say's marker names a NEW turn; one written mid-turn (the person
+                    # spoke into the running turn, 2026-10-21) leaves the name alone.
+                    if t == "pervio" and ev.get("preview") and not turn_open:
+                        turn_preview = ev["preview"]
+                    turn_open = True; last_event = time.time(); changed = True
+                elif t == "system" and st == "background_tasks_changed" and isinstance(ev.get("tasks"), list):
+                    # (A line with no task list is not a set: it empties nothing.)
+                    now = {}
+                    for task in ev["tasks"]:
+                        if not isinstance(task, dict) or not task.get("task_id"):
+                            continue
+                        tid = str(task["task_id"])
+                        now[tid] = pending.get(tid) or _task_row(task, time.time())
+                    pending = now; last_event = time.time(); changed = True
+                elif t == "system" and st == "task_progress":
+                    # A sub-agent's running totals, after each tool it uses. The
+                    # ledger's business only: when the run may end is decided on
+                    # the same events as before.
+                    row = pending.get(str(ev.get("task_id") or ""))
+                    if row is not None and _task_progress(row, ev):
+                        changed = True
+                elif t == "system" and st in ("task_started", "task_notification", "task_updated"):
+                    last_event = time.time()
+                elif t == "assistant":
+                    last_event = time.time()
+            if changed:
+                ledger()
+            pgid = _pgid_of(rd)
+            if not pgid:
+                # start writes the pgid file after spawning the engine, which is
+                # after us: give it a moment before reading "no process" as gone.
+                if time.time() - started > 15:
+                    break
+            elif not _alive(pgid) or _finished(rd):
+                break                            # the engine is gone: nothing to keep open
+            if engine_gone():
+                break                            # the engine died mid-turn: nothing left to feed
+            if not turn_open and not pending and (time.time() - last_event > IDLE_GRACE or os.path.exists(leave_path)):
+                # Answered, nothing pending, settled: let the engine end. The FIFO
+                # is withdrawn FIRST, so no further say can open it; then whatever
+                # a say dropped in before that moment is taken — those words mean
+                # the person spoke just now, so the pipe is put back and the turn
+                # goes on in this process instead of being lost or refused.
+                try:
+                    os.remove(fifo)
+                except OSError:
+                    pass
+                late = drain_fifo()
+                if not late:
+                    break
+                engine_in.write(late); engine_in.flush()
+                turn_open = True; last_event = time.time()
+                try:
+                    os.mkfifo(fifo, 0o600)
+                    nfd = os.open(fifo, os.O_RDWR)
+                    os.close(fd); fd = nfd
+                except OSError:
+                    pass                         # no pipe to put back: this turn is the last one here
+                ledger()
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            engine_in.close()                    # EOF for the engine: it ends on its own
+        except OSError:
+            pass
+        for path in (os.path.join(rd, "keeper.pid"), fifo, leave_path):   # the pipe goes with its keeper
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        ledger()
+
+def _notify_reply(run_id, meta, preview, ok, exit_code=None):
+    """The completion push and the Live Activity's end for one reply — from
+    the keeper at each result, from `finish` at exit for a run that never
+    answered (or died mid-turn). Fire-and-forget, every fd closed: the
+    keeper's stdout is the engine's stdin pipe, and a child holding it would
+    keep the engine from ever seeing EOF."""
+    push = os.path.join(SELF_DIR, "pervio-push")
+    if not os.access(push, os.X_OK):
+        return
+    t_ok, t_bad, b_ok, b_bad = _push_text(meta, preview)
+    dev = meta.get("device") or ""
+    opts = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL, "close_fds": True}
+    try:
+        if not meta.get("group"):              # a group pushes once per round, not per run
+            body = b_ok if ok else (b_bad + ("" if exit_code is None else str(exit_code)))
+            subprocess.Popen([push, "send", "--title", t_ok if ok else t_bad, "--body", body,
+                              "--thread", "pervio-run-" + run_id] + (["--device", dev] if dev else []), **opts)
+        subprocess.Popen([push, "liveactivity", "--run", run_id, "--event", "end",
+                          "--status", "Done" if ok else "Ended"] + ([] if ok else ["--failed"]), **opts)
+    except OSError:
+        pass
+
+def cmd_finish(argv):
+    """Internal, called by start's wrapper once the process has exited and
+    `status` says so: the completion notice for a run the keeper did NOT
+    already announce — a one-shot run (Cursor, a group member, anything that
+    ran without a keeper), or a living run that ended without answering its
+    open turn. A living run whose last turn was answered has had its push and
+    its island's end at that reply (the keeper's ledger counts them): nothing
+    more to say."""
+    o = _parse(argv, {"run", "rc"})
+    rd = _run_path(o.get("run", ""))
+    if not os.path.isdir(rd):
+        _die("no such run: %s" % o.get("run", ""), 3)
+    meta = _read_json(os.path.join(rd, "meta.json"))
+    try:
+        rc = int(o.get("rc", "0") or 0)
+    except ValueError:
+        rc = 1
+    try:
+        announced = int(_keeper_state(rd).get("announced") or 0)
+    except (TypeError, ValueError):
+        announced = 0
+    if announced > 0 and _replied(rd):
+        return
+    _notify_reply(o["run"], meta, meta.get("preview", ""), ok=(rc == 0), exit_code=None if rc == 0 else rc)
+
+def cmd_say(argv):
+    """Feed a further message into a LIVING run — the same engine process, the
+    same conversation file, the agent that knows its own background task
+    (2026-10-20). Exit 4 when the run can take nothing (its process or keeper
+    is gone): the phone then starts a fresh run as it always did."""
+    o = _parse(argv, {"run", "prompt-b64"})
+    if "run" not in o or "prompt-b64" not in o:
+        _die("say needs --run and --prompt-b64")
+    rd = _run_path(o["run"])
+    if not os.path.isdir(rd):
+        _die("no such run: %s" % o["run"], 3)
+    try:
+        text = base64.b64decode(o["prompt-b64"]).decode("utf-8", "replace")
+    except Exception:
+        _die("bad --prompt-b64")
+    if not _accepting(rd):
+        sys.stdout.write(json.dumps({"accepted": False, "runId": o["run"], "reason": "not running"}) + "\n")
+        sys.exit(4)
+    try:
+        fd = os.open(_fifo_path(rd), os.O_WRONLY | os.O_NONBLOCK)
+    except OSError as e:
+        sys.stdout.write(json.dumps({"accepted": False, "runId": o["run"], "reason": "fifo: %s" % e}) + "\n")
+        sys.exit(4)
+    try:
+        # The marker FIRST, so status says "a turn is open" before the engine's
+        # own init line arrives; then the message itself.
+        with open(os.path.join(rd, "out.jsonl"), "a") as f:
+            # `text` is the message itself (2026-11-21): until the engine has
+            # written it into its own record — codex 0.160 only does when the
+            # model gets to it, tens of seconds later — this line is the one
+            # place a phone opening the conversation can learn that it exists.
+            f.write(json.dumps({"type": "pervio", "subtype": "turn_sent", "ts": int(time.time()),
+                                "preview": " ".join(text.split())[:140], "text": text},
+                               ensure_ascii=False) + "\n")
+        data = _user_message_line(text).encode("utf-8")
+        os.set_blocking(fd, True)
+        while data:
+            n = os.write(fd, data)
+            data = data[n:]
+    finally:
+        os.close(fd)
+    sys.stdout.write(json.dumps({"accepted": True, "runId": o["run"]}) + "\n")
+
+def cmd_stop_task(argv):
+    """Stop ONE task of a living run — a sub-agent (its own background commands
+    go with it) or a background command — and nothing else: the conversation's
+    process, its turn and its other tasks go on (2026-11-22, the stop key on a
+    row of the phone's task list). It is Claude Code's own control request,
+    written into the run's input the way `say` writes a message:
+        {"type": "control_request", "request": {"subtype": "stop_task", "task_id": …}}
+    Measured on 2.1.322: the task ends as task_updated (killed) +
+    task_notification (stopped), the engine then says so in a turn of its own;
+    an id it does not know is answered "success" and changes nothing. Claude
+    only: Codex stops a sub-agent when its thread's turn is interrupted, but
+    its main agent then goes on waiting for it (measured the same day), so
+    that key is not offered. Exit 4 when the run can take nothing."""
+    o = _parse(argv, {"run", "task"})
+    if "run" not in o or "task" not in o:
+        _die("stop-task needs --run and --task")
+    rd = _run_path(o["run"])
+    if not os.path.isdir(rd):
+        _die("no such run: %s" % o["run"], 3)
+    task = o["task"]
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", task):
+        _die("bad --task")
+    def refuse(reason):
+        sys.stdout.write(json.dumps({"accepted": False, "runId": o["run"], "reason": reason}) + "\n")
+        sys.exit(4)
+    meta = _read_json(os.path.join(rd, "meta.json"))
+    if ((meta.get("backend") if isinstance(meta, dict) else "") or "claude") != "claude":
+        refuse("engine")
+    if not _accepting(rd):
+        refuse("not running")
+    try:
+        fd = os.open(_fifo_path(rd), os.O_WRONLY | os.O_NONBLOCK)
+    except OSError as e:
+        refuse("fifo: %s" % e)
+    try:
+        data = (json.dumps({"type": "control_request", "request_id": "pervio-stop-" + os.urandom(4).hex(),
+                            "request": {"subtype": "stop_task", "task_id": task}}) + "\n").encode("utf-8")
+        os.set_blocking(fd, True)
+        while data:
+            n = os.write(fd, data)
+            data = data[n:]
+    finally:
+        os.close(fd)
+    sys.stdout.write(json.dumps({"accepted": True, "runId": o["run"], "task": task}) + "\n")
+
+def _state(rd):
+    """running | done | failed"""
+    if not _finished(rd):
+        return "running" if _alive(_pgid_of(rd)) else "failed"   # gone w/o status = crashed
+    code = _exit_code(rd)
+    err = _result_is_error(rd)
+    if code == 0 and err is not True:
+        return "done"
+    return "failed"
+
+def _ppid_map():
+    """{pid: ppid} for every live process. Fast path reads /proc (Linux); falls
+    back to `ps` on macOS/BSD, which have no /proc — without the fallback `stop`
+    would crash on os.listdir("/proc") and never signal anything."""
+    m = {}
+    if os.path.isdir("/proc"):
+        for d in os.listdir("/proc"):
+            if not d.isdigit():
+                continue
+            try:
+                s = open("/proc/%s/stat" % d).read()
+                m[int(d)] = int(s[s.rindex(")") + 2:].split()[1])   # ppid (comm may hold spaces)
+            except (OSError, ValueError, IndexError):
+                pass
+        return m
+    # No /proc (macOS/BSD): parse `ps`.
+    try:
+        out = subprocess.run(["ps", "-axo", "pid=,ppid="],
+                             capture_output=True, text=True).stdout
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 2:
+                try:
+                    m[int(parts[0])] = int(parts[1])
+                except ValueError:
+                    pass
+    except OSError:
+        pass
+    return m
+
+def _tree(root):
+    """All live pids descended from root (root included), by ppid chain.
+
+    Claude's Bash tool runs each command in its OWN session/process group, so a
+    plain killpg misses them — but while they're alive their ppid still chains
+    back to the run, so we collect the whole subtree and kill by explicit pid.
+    """
+    pm = _ppid_map()
+    members = {root}
+    changed = True
+    while changed:
+        changed = False
+        for pid, pp in pm.items():
+            if pp in members and pid not in members:
+                members.add(pid)
+                changed = True
+    return members
+
+def _die(msg, code=2):
+    sys.stderr.write("pervio-run: %s\n" % msg)
+    sys.exit(code)
+
+def _parse(argv, flags):
+    """Tiny flag parser: flags is a set of names that take a value."""
+    out = {}
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a.startswith("--") and a[2:] in flags:
+            if i + 1 >= len(argv):
+                _die("missing value for %s" % a)
+            out[a[2:]] = argv[i + 1]
+            i += 2
+        else:
+            _die("unknown/!malformed arg: %s" % a)
+    return out
+
+# ---------- garbage collection ----------
+
+def _gc():
+    if not os.path.isdir(RUNS):
+        return
+    now = time.time()
+    for rid in os.listdir(RUNS):
+        rd = os.path.join(RUNS, rid)
+        if not os.path.isdir(rd):
+            continue
+        finished = _finished(rd)
+        alive = _alive(_pgid_of(rd))
+        mtimes = [os.path.getmtime(p) for p in (
+            os.path.join(rd, "status"), os.path.join(rd, "out.jsonl")) if os.path.exists(p)]
+        age = now - (max(mtimes) if mtimes else os.path.getmtime(rd))
+        if finished and age > DONE_TTL:
+            shutil.rmtree(rd, ignore_errors=True)
+        elif (not alive) and (not finished) and age > STALE_SECS:
+            shutil.rmtree(rd, ignore_errors=True)   # orphaned / crashed without status
+
+# ---------- commands ----------
+
+def _push_text(o, preview):
+    """The words of the completion push, both outcomes, in the run's own language.
+
+    The first version said 「回答好了」 to every run in every project, so a phone
+    that had three tasks out could not tell WHICH one came back — and it read
+    identically to the app's own local banner, which is how the user ended up
+    with two notifications saying the same nothing. Now the title names the
+    project AND the outcome, and the body is the task's own opening words: the
+    preview pervio-run already computes for the run list, so no new state.
+
+    Returns (title_ok, title_fail, body_ok, body_fail). The failure body ENDS on
+    the exit-code label; the wrapper appends the number, because only bash knows
+    it. Keeping every word here (and none in the shell) is what makes the copy
+    testable without starting a run."""
+    d = (o.get("dir") or "").rstrip("/")
+    project = (os.path.basename(d) if d else "") or "Pervio"
+    task = " ".join((preview or "").split())[:80]
+    # The run's own --lang wins — it captured the phone's setting at send time.
+    # Most runs don't carry one (the flag rides only 背景-chip turns), and those
+    # fall back to the synced preference the app writes beside its push token.
+    lang = (o.get("lang") or "").strip().lower() or push_lang()
+    if lang.startswith("en"):
+        return ("%s · task finished" % project,
+                "%s · task failed" % project,
+                task or "This run is done.",
+                (task + " — exit code ") if task else "Exit code ")
+    return ("%s · 任务完成" % project,
+            "%s · 任务失败" % project,
+            task or "这一轮跑完了。",
+            (task + " —— 退出码 ") if task else "退出码 ")
+
+
+def cmd_start(argv):
+    # --pervio-context is the only VALUELESS flag; strip it before the k/v parser.
+    # It rides through to pervio-chat so a lit composer chip applies to detached
+    # runs exactly like live chat turns.
+    pervio_ctx = "--pervio-context" in argv
+    argv = [a for a in argv if a != "--pervio-context"]
+    # --extra-dir is the one REPEATABLE flag (folders attached from the phone,
+    # writable for the agent — pervio-chat turns each into --add-dir); pull them
+    # out before the single-value parser.
+    extra_dirs, rest, i = [], [], 0
+    while i < len(argv):
+        if argv[i] == "--extra-dir" and i + 1 < len(argv):
+            extra_dirs.append(argv[i + 1]); i += 2
+        else:
+            rest.append(argv[i]); i += 1
+    argv = rest
+    # --device / --origin: the phone (its push device id) and the server entry
+    # on it that started this run. The completion push goes to that device only,
+    # and a tapped notification reopens that entry (谁发的推给谁, 2026-10-15).
+    o = _parse(argv, {"dir", "resume", "perm", "model", "effort", "prompt-b64", "backend",
+                      "sandbox", "reviewer", "lang", "group", "provider", "device", "origin",
+                      "approve-sid", "service-tier"})
+    if "prompt-b64" not in o:
+        _die("start needs --prompt-b64")
+    _gc()
+    _runs_dir()
+    # A run of ours still on this very conversation — idle in its settle, or a
+    # beat from exiting — is let go first, so this one never meets its writer
+    # lock; a run still working is left alone (see _make_way).
+    waited = _make_way(o.get("resume")) if o.get("resume") else []
+    run_id = uuid.uuid4().hex[:12]
+    rd = os.path.join(RUNS, run_id)
+    os.makedirs(rd, mode=0o700)
+
+    try:
+        prompt_text = base64.b64decode(o["prompt-b64"]).decode("utf-8", "replace")
+    except Exception:
+        prompt_text = ""
+    # A group message opens with pervio-group's hidden header; the title the
+    # phone shows (run list, island, push) is the words after it.
+    shown = prompt_text
+    if shown.startswith("<pervio-group"):
+        end = shown.find("</pervio-group>")
+        if end >= 0:
+            shown = shown[end + len("</pervio-group>"):]
+    preview = " ".join(shown.split())[:140]
+
+    cmd = [CHAT, "--text", "--dir", o.get("dir", "~"), "--prompt-b64", o["prompt-b64"]]
+    # Claude Code and Codex read a stream of user messages; Cursor's agent does
+    # not (one prompt, one turn), so its runs keep the old one-shot stdin.
+    # A group's member run is one turn nobody feeds: it ends when it answers,
+    # so the round advances then (tick-run runs at exit), not a grace later.
+    living = o.get("backend", "") in ("", "claude", "codex") and not o.get("group")
+    if living:
+        # The engine's stdin is a PIPE from our keeper (`pervio-run keep`, which
+        # pervio-chat puts in front of the engine): the keeper relays what lands
+        # in the FIFO and closes the pipe when the run has gone idle — a real
+        # EOF, which Claude Code honours on a pipe but not on a FIFO (measured
+        # 2026-10-20: 30 s past EOF on a FIFO it was still waiting).
+        os.mkfifo(_fifo_path(rd), 0o600)
+        cmd += ["--input-fifo", _fifo_path(rd), "--input-keeper", os.path.abspath(__file__), "--run-id", run_id]
+    # "lang" (prompt language of the injected pointer prose) rides through to
+    # pervio-chat exactly like the context flag it accompanies.
+    for k in ("resume", "perm", "model", "effort", "backend", "sandbox", "reviewer", "lang", "provider",
+              "approve-sid", "device", "service-tier"):
+        if o.get(k):
+            cmd += ["--" + k, o[k]]
+    if pervio_ctx:
+        cmd += ["--pervio-context"]
+    for d in extra_dirs:
+        cmd += ["--extra-dir", d]
+
+    with open(os.path.join(rd, "meta.json"), "w") as f:
+        json.dump({
+            "runId": run_id, "dir": o.get("dir", "~"), "resume": o.get("resume", ""),
+            "perm": o.get("perm", ""), "model": o.get("model", ""),
+            "effort": o.get("effort", ""), "backend": o.get("backend", ""),
+            "provider": o.get("provider", ""), "extraDirs": extra_dirs,
+            "started": int(time.time()), "preview": preview,
+            "group": o.get("group", ""),     # set by pervio-group: one push per ROUND, not per run
+            "ctx": pervio_ctx,               # --pervio-context rode through to pervio-chat
+            "device": o.get("device", ""),   # the phone that started it (push recipient)
+            "origin": o.get("origin", ""),   # the server entry on that phone (tap landing)
+            # The approval channel (2026-10-19): with a sid the run can ASK — the
+            # request lands in out.jsonl, the phone is pinged and answers over
+            # ~/.pervio/chat/<sid>/control.fifo, even after reopening the run.
+            "approveSid": o.get("approve-sid", ""),
+            "living": living,                # takes further messages while alive (say)
+            "lang": o.get("lang", ""),       # the push copy's language (the keeper pushes per reply)
+            "waitedFor": waited,             # runs of ours on this conversation that were let go first
+        }, f)
+
+    status_path = os.path.join(rd, "status")
+    with open(status_path, "w") as f:
+        f.write("running")
+
+    out_f = open(os.path.join(rd, "out.jsonl"), "ab")     # append: say's turn_sent marker shares this file
+    err_f = open(os.path.join(rd, "err"), "wb")
+    # Wrapper records the real exit code into `status` when pervio-chat returns.
+    # start_new_session=True => the wrapper bash is its own session leader (no
+    # controlling tty) so it survives this process and the SSH channel closing.
+    # The wrapper records the exit code and hands the finish to `finish`, which
+    # fires the phone notifications a run still owes. This is the only place
+    # that survives the phone being asleep: a detached run outlives the SSH
+    # channel, so the app cannot observe this finish itself — iOS suspends it
+    # seconds after the screen locks.
+    #
+    #   1. `send`         — the lock-screen alert. Since the app stopped posting
+    #      its own banner for detached runs (CompletionNotifier.serverPushArmed),
+    #      THIS is the only completion notice the user gets — the two used to
+    #      arrive side by side saying the same thing. Its words come from
+    #      `_push_text`, and the thread is per-run so two runs finishing minutes
+    #      apart are two notifications, not one collapsed over the other. For a
+    #      LIVING run the keeper sends it at each reply (the process stays on
+    #      past the answer, 2026-10-21), so finish sends nothing then.
+    #   2. `liveactivity` — ENDS the Dynamic Island card for this run. Needed for
+    #      exactly the same reason: every ActivityKit end() call lives in the app
+    #      process, so a run that finishes while the app is suspended used to leave
+    #      the island counting forever. No-op when the phone never started an
+    #      activity (no token file for this runId).
+    #
+    # Both are fire-and-forget and can never affect the run's own exit code
+    # (|| true, output discarded); with no APNs key / no token pervio-push exits 0
+    # silently.
+    # A run that belongs to a group advances the group's round the moment it
+    # finishes (pervio-group tick-run) — the same survive-the-phone reason as
+    # the push: the synthesis must start even if nobody is watching.
+    grp = os.path.join(SELF_DIR, "pervio-group")
+    # The completion notice itself is `finish`'s (python, testable): the keeper
+    # has already pushed each answered reply of a living run, so finish only
+    # announces a run nobody announced — a one-shot run, or one that died
+    # mid-turn — and ends the island either way.
+    wrapper = (
+        'st="$1"; py="$2"; self="$3"; rid="$4"; grp="$5";'
+        ' shift 5; "$@"; rc=$?;'
+        ' printf "exited:%s" "$rc" > "$st";'
+        ' if [ -x "$grp" ]; then "$grp" tick-run --run "$rid" >/dev/null 2>&1 || true; fi;'
+        ' "$py" "$self" finish --run "$rid" --rc "$rc" >/dev/null 2>&1 || true'
+    )
+    # The run's identity for whoever asks the phone something mid-run
+    # (pervio-approve, pervio-codex-app): the ping goes to the starting phone and
+    # its tap reopens THIS run.
+    env = dict(os.environ, PERVIO_RUN_ID=run_id)
+    if o.get("device"):
+        env["PERVIO_PUSH_DEVICE"] = o["device"]
+    p = subprocess.Popen(
+        ["bash", "-c", wrapper, "pervio-run", status_path, sys.executable, os.path.abspath(__file__), run_id, grp]
+        + cmd,
+        stdin=subprocess.DEVNULL, stdout=out_f, stderr=err_f,
+        start_new_session=True, env=env,
+    )
+    out_f.close()
+    err_f.close()
+    with open(os.path.join(rd, "pgid"), "w") as f:
+        f.write(str(p.pid))            # session leader pid == process-group id
+
+    sys.stdout.write(json.dumps({"runId": run_id}) + "\n")
+
+def cmd_tail(argv):
+    o = _parse(argv, {"run", "from"})
+    if "run" not in o:
+        _die("tail needs --run")
+    rd = _run_path(o["run"])
+    out = os.path.join(rd, "out.jsonl")
+    # out.jsonl may not exist for a few ms right after start.
+    for _ in range(40):
+        if os.path.exists(out):
+            break
+        time.sleep(0.05)
+    if not os.path.exists(out):
+        _die("no such run: %s" % o["run"], 3)
+    try:
+        frm = int(o.get("from", "0"))
+    except ValueError:
+        frm = 0
+    pgid = _pgid_of(rd)
+    w = sys.stdout.buffer
+    # Keep the SSH tail channel alive during Codex's long silent "thinking" gaps:
+    # Codex doesn't stream, so a turn can emit nothing for 30-60s, and the phone
+    # would judge the connection dead and reconnect (a reconnect storm). We emit a
+    # heartbeat line the app ignores — but ONLY at a line boundary, so we never
+    # split a partial JSON line. Heartbeats are NOT written to out.jsonl.
+    HEARTBEAT = b'{"type":"heartbeat"}\n'
+    last_beat = time.time()
+    at_boundary = True             # start of stream is a safe boundary
+    with open(out, "rb") as f:
+        f.seek(max(0, frm))
+        while True:
+            chunk = f.read(65536)
+            if chunk:
+                w.write(chunk)
+                w.flush()
+                at_boundary = chunk.endswith(b"\n")
+                last_beat = time.time()
+                continue
+            if _finished(rd) or not _alive(pgid):
+                chunk = f.read(65536)        # final catch-up read
+                if chunk:
+                    w.write(chunk)
+                    w.flush()
+                    at_boundary = chunk.endswith(b"\n")
+                    continue
+                break
+            if at_boundary and time.time() - last_beat >= 10:
+                w.write(HEARTBEAT)
+                w.flush()
+                last_beat = time.time()
+            time.sleep(0.25)
+
+def _under(path, root):
+    """`path` is `root` or inside it — the phone's working directory is a
+    server's scope (see pervio-sessions.under); ~ spellings and /tmp vs
+    /private/tmp both handled."""
+    root = os.path.expanduser(root or "").rstrip("/")
+    if not root:
+        return True
+    path = (path or "").rstrip("/")
+    roots = {root, os.path.realpath(root)}
+    paths = {path, os.path.realpath(path)}
+    return any(p == r or p.startswith(r + "/") for r in roots for p in paths)
+
+
+def cmd_list(argv):
+    o = _parse(argv, {"dir", "under", "device"})
+    _runs_dir()
+    items = []
+    for rid in os.listdir(RUNS):
+        rd = os.path.join(RUNS, rid)
+        if not os.path.isdir(rd):
+            continue
+        meta = _read_json(os.path.join(rd, "meta.json"))
+        if o.get("dir") and meta.get("dir") != o["dir"]:
+            continue
+        if o.get("under") and not _under(meta.get("dir", ""), o["under"]):
+            continue
+        # --device: this phone's own runs (two people on one Mac account each
+        # see their own, 2026-10-19). A run that recorded no device — started
+        # from the shell, or by an older app — stays visible to everyone.
+        if o.get("device") and meta.get("device") and meta["device"] != o["device"]:
+            continue
+        items.append({
+            "runId": rid,
+            "sessionId": _session_id(rd) or meta.get("resume", ""),
+            "dir": meta.get("dir", ""),
+            "preview": meta.get("preview", ""),
+            "started": meta.get("started", 0),
+            "state": _state(rd),
+            "replied": _replied(rd),              # answered, process still alive → not "working"
+            "waiting": _waiting(rd),              # blocked on the phone's Allow/Deny
+            "approveSid": meta.get("approveSid", ""),   # the channel that answer goes down
+            "accepting": _accepting(rd),          # a further message can be fed into it (say)
+            "background": _background(rd),        # the engine's own background tasks still pending
+            "turnFrom": _turn_from(rd) if _alive(_pgid_of(rd)) else 0,   # where its current turn starts (reattach from here)
+            "lastTaken": _last_taken(rd) if _alive(_pgid_of(rd)) else "",  # the fed message the replay starts after
+            "group": meta.get("group", ""),
+            "bytes": _filesize(os.path.join(rd, "out.jsonl")),
+            "backend": meta.get("backend", ""),   # "" = claude; lets the phone reopen with the right agent
+            "device": meta.get("device", ""),     # the phone that started it
+            "origin": meta.get("origin", ""),     # the server entry on that phone
+        })
+    items.sort(key=lambda i: i.get("started", 0), reverse=True)
+    sys.stdout.write(json.dumps(items) + "\n")
+
+def _err_tail(rd):
+    """The last non-empty stderr line of a run, for a failed run's autopsy.
+    That single line is where the backend states its refusal in words
+    ("thread … already has an active writer", "cannot resume a … sub-agent"),
+    while out.jsonl just stops — without it the phone can only say "ended
+    without a result". Capped so a stack trace can't flood the status JSON."""
+    # Terminal colour codes stripped: Cursor's agent prints its advice in colour,
+    # and the escape bytes reached the phone as "[36m…[0m" (2026-10-16).
+    raw = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", _read(os.path.join(rd, "err")))
+    lines = [l.strip() for l in raw.splitlines() if l.strip()]
+    return lines[-1][:300] if lines else ""
+
+def cmd_status(argv):
+    o = _parse(argv, {"run"})
+    if "run" not in o:
+        _die("status needs --run")
+    rd = _run_path(o["run"])
+    if not os.path.isdir(rd):
+        _die("no such run: %s" % o["run"], 3)
+    state = _state(rd)
+    out = {
+        "runId": o["run"],
+        "state": state,
+        "replied": _replied(rd),
+        "waiting": _waiting(rd),
+        "approveSid": _read_json(os.path.join(rd, "meta.json")).get("approveSid", ""),
+        "accepting": _accepting(rd),
+        "background": _background(rd),
+        "turnFrom": _turn_from(rd) if state == "running" else 0,
+        "lastTaken": _last_taken(rd) if state == "running" else "",
+        "lastResultAt": int(_keeper_state(rd).get("lastResultAt") or 0),
+        "bytes": _filesize(os.path.join(rd, "out.jsonl")),
+        "exitCode": _exit_code(rd),
+        "sessionId": _session_id(rd),
+        "backend": _read_json(os.path.join(rd, "meta.json")).get("backend", ""),
+    }
+    if state == "failed":
+        err = _err_tail(rd)
+        if err:
+            out["error"] = err
+    sys.stdout.write(json.dumps(out) + "\n")
+
+def cmd_stop(argv):
+    o = _parse(argv, {"run"})
+    if "run" not in o:
+        _die("stop needs --run")
+    rd = _run_path(o["run"])
+    if not os.path.isdir(rd):
+        _die("no such run: %s" % o["run"], 3)
+    pgid = _pgid_of(rd)
+    if pgid and _alive(pgid):
+        # Snapshot the WHOLE subtree first (incl. Claude's new-session tool
+        # children), then signal by explicit pid so reparenting can't lose them.
+        targets = _tree(pgid)
+        # The leader's own group goes first and alone: claude lives there, and
+        # so does the codex translator, which answers a TERM with
+        # turn/interrupt — codex app-server (its own session) must still be
+        # alive to take it. Only once the leader is gone, or 1.5 s have passed,
+        # does the rest of the tree get the signal.
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except OSError:
+            pass
+        for _ in range(15):
+            if not _alive(pgid):
+                break
+            time.sleep(0.1)
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            for pid in targets:
+                try:
+                    os.kill(pid, sig)
+                except OSError:
+                    pass
+            try:
+                os.killpg(pgid, sig)        # belt-and-suspenders for the leader's own group
+            except OSError:
+                pass
+            if sig is signal.SIGTERM:
+                for _ in range(10):
+                    if not _alive(pgid):
+                        break
+                    time.sleep(0.1)
+                if not any(_alive(p) for p in targets):
+                    break
+    # The keeper is its own session (not in the tree): end it too, and the pipe.
+    try:
+        kp = int(_read(os.path.join(rd, "keeper.pid")).strip() or "0")
+        if kp > 0:
+            os.kill(kp, signal.SIGTERM)
+    except (ValueError, OSError):
+        pass
+    try:
+        os.remove(_fifo_path(rd))
+    except OSError:
+        pass
+    if not _finished(rd):
+        with open(os.path.join(rd, "status"), "w") as f:
+            f.write("exited:143")       # 128+SIGTERM
+    sys.stdout.write(json.dumps({"runId": o["run"], "stopped": True}) + "\n")
+
+CMDS = {"start": cmd_start, "tail": cmd_tail, "list": cmd_list,
+        "status": cmd_status, "stop": cmd_stop, "say": cmd_say, "stop-task": cmd_stop_task,
+        "keep": cmd_keep, "finish": cmd_finish}
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] not in CMDS:
+        _die("usage: pervio-run {start|tail|list|status|stop|say|stop-task} …", 2)
+    CMDS[sys.argv[1]](sys.argv[2:])
+
+if __name__ == "__main__":
+    main()

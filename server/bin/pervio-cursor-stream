@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""pervio-cursor-stream — Cursor's `agent -p --output-format stream-json` on
+stdin, Claude Code's stream-json shape on stdout, line by line, unbuffered.
+
+Why: everything downstream (the phone's event parser, pervio-run's progress
+trace, pervio-group reading a reply, the island) speaks ONE event vocabulary —
+Claude's. Codex got its own parser on the phone; Cursor's stream is already so
+close to Claude's that translating it here is cheaper and keeps every other
+layer ignorant of a third engine.
+
+Verified against agent 2026.10.14 (probes on 2026-10-14):
+    {"type":"system","subtype":"init","session_id":…,"model":…,"permissionMode":…}
+    {"type":"user", …}                              the prompt echoed — dropped
+    {"type":"thinking","subtype":"delta","text":…}  → stream_event thinking_delta
+    {"type":"assistant","message":{"content":[{"type":"text","text":…}]}}
+                                                    → stream_event text_delta
+                                                      (one per event; with
+                                                      --stream-partial-output they
+                                                      are deltas, otherwise blocks)
+    {"type":"tool_call","subtype":"started","call_id":…,"tool_call":{"<kind>ToolCall":{"args":{…}}}}
+                                                    → assistant message, tool_use block
+    {"type":"tool_call","subtype":"completed",…,"tool_call":{"<kind>ToolCall":{"args":…,"result":{…}}}}
+                                                    → user message, tool_result block
+    {"type":"result","subtype":"success","is_error":…,"result":…,"session_id":…,"usage":{…}}
+                                                    → passed through (Claude's shape already)
+Anything else passes through untouched, so a new Cursor event never silently
+vanishes — the phone ignores unknown types.
+"""
+import json
+import time
+import sys
+
+# Cursor tool kinds → the Claude tool names the phone already renders.
+TOOL_NAMES = {
+    "edit": "Edit", "write": "Write", "read": "Read", "shell": "Bash",
+    "delete": "Delete", "grep": "Grep", "glob": "Glob", "ls": "LS",
+    "createPlan": "Plan", "webSearch": "WebSearch", "webFetch": "WebFetch",
+    "semanticSearch": "Search", "todo": "Todo", "mcp": "MCP",
+}
+
+
+def _emit(o):
+    sys.stdout.write(json.dumps(o, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
+def _kind(tc):
+    """("edit", {...}) from {"editToolCall": {...}} — the one key Cursor sets."""
+    if not isinstance(tc, dict):
+        return "", {}
+    for k, v in tc.items():
+        if k.endswith("ToolCall") and isinstance(v, dict):
+            return k[:-len("ToolCall")], v
+    return "", {}
+
+
+def _tool_use(kind, body, call_id):
+    args = body.get("args") if isinstance(body.get("args"), dict) else {}
+    name = TOOL_NAMES.get(kind) or (kind[:1].upper() + kind[1:] if kind else "Tool")
+    inp = {}
+    if kind in ("edit", "write"):
+        if args.get("path"):
+            inp["file_path"] = args["path"]
+        content = args.get("streamContent") or args.get("contents") or args.get("content")
+        if isinstance(content, str):
+            inp["content"] = content
+        # A write of a NEW file renders as Write; an in-place change as Edit.
+        name = "Write" if kind == "write" or content is not None and not args.get("oldString") else "Edit"
+        if args.get("oldString") is not None:
+            inp["old_string"] = args.get("oldString")
+            inp["new_string"] = args.get("newString")
+            name = "Edit"
+    elif kind == "shell":
+        inp["command"] = args.get("command", "")
+        if args.get("workingDirectory"):
+            inp["cwd"] = args["workingDirectory"]
+    elif kind == "read":
+        if args.get("path"):
+            inp["file_path"] = args["path"]
+    elif kind in ("grep", "glob"):
+        inp["pattern"] = args.get("pattern") or args.get("query") or ""
+    elif kind in ("webSearch", "webFetch"):
+        inp["url"] = args.get("url") or ""
+        inp["query"] = args.get("query") or ""
+    elif kind == "createPlan":
+        inp["plan"] = args.get("plan") or ""
+        inp["name"] = args.get("name") or ""
+    else:
+        inp = args
+    return {"type": "tool_use", "id": call_id, "name": name, "input": inp}
+
+
+def _task_said(inner):
+    """What a sub-agent (the Task tool) came back with: its last words. The
+    result carries the sub-agent's steps — {"conversationSteps":
+    [{"assistantMessage": {"text": …}}, …], "durationMs": "4709", …}
+    (cursor-agent, a real turn, 2026-11-22)."""
+    steps = inner.get("conversationSteps") if isinstance(inner, dict) else None
+    if not isinstance(steps, list):
+        return None
+    for step in reversed(steps):
+        text = ((step or {}).get("assistantMessage") or {}).get("text") if isinstance(step, dict) else None
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+    return ""
+
+
+def _task_events(kind, body, call_id, subtype, sid, started):
+    """Cursor's sub-agents are calls of its Task tool, each waited for by the
+    turn. Said as well in the words Claude Code uses for a sub-agent its tool
+    call waits for (task_started with is_backgrounded false, task_notification),
+    so the phone's task line counts them and lists what each came back with.
+    Cursor reports no tokens or tool counts for a sub-agent, only how long it took."""
+    if kind != "task":
+        return
+    args = body.get("args") if isinstance(body.get("args"), dict) else {}
+    if subtype == "started":
+        started[call_id] = time.time()
+        row = {"type": "system", "subtype": "task_started", "task_id": call_id, "task_type": "local_agent",
+               "description": str(args.get("description") or "Task")[:300], "is_backgrounded": False, "session_id": sid}
+        # subagentType is {"<type>": {}}; "unspecified" is no type.
+        st = args.get("subagentType")
+        name = next(iter(st), "") if isinstance(st, dict) else (st if isinstance(st, str) else "")
+        if name and name != "unspecified":
+            row["subagent_type"] = str(name)[:80]
+        _emit(row)
+    elif subtype == "completed":
+        r = body.get("result") if isinstance(body.get("result"), dict) else {}
+        ok = "success" in r
+        inner = r.get("success") if ok else next((r[k] for k in ("rejected", "error", "failure") if k in r), None)
+        said = _task_said(inner) if ok else None
+        try:
+            took = int(float((inner or {}).get("durationMs"))) if isinstance(inner, dict) and inner.get("durationMs") is not None else None
+        except (TypeError, ValueError):
+            took = None
+        if took is None:
+            took = int(max(0.0, time.time() - started.get(call_id, time.time())) * 1000)
+        _emit({"type": "system", "subtype": "task_notification", "task_id": call_id,
+               "status": "completed" if ok else "failed",
+               "summary": (said if said is not None else _result_text(body))[:2000],
+               "usage": {"total_tokens": 0, "tool_uses": 0, "duration_ms": took}, "session_id": sid})
+
+
+def _result_text(body):
+    r = body.get("result")
+    if r is None:
+        return ""
+    if isinstance(r, dict):
+        for k in ("success", "rejected", "error", "failure"):
+            if k in r:
+                inner = r[k]
+                head = "" if k == "success" else "[%s] " % k
+                said = _task_said(inner)
+                if said is not None:            # a sub-agent's answer, not its whole record
+                    return head + said
+                if isinstance(inner, dict):
+                    text = inner.get("output") or inner.get("stdout") or inner.get("content") or inner.get("message")
+                    if isinstance(text, str):
+                        return head + text
+                    return head + json.dumps(inner, ensure_ascii=False)[:4000]
+                return head + str(inner)
+        return json.dumps(r, ensure_ascii=False)[:4000]
+    return str(r)
+
+
+def main():
+    # With --stream-partial-output Cursor sends the deltas of a text block AND
+    # then the whole block again; without the flag only the block. Either way
+    # a block that equals what its deltas already said is the recap — drop it.
+    buf = ""
+    task_started = {}       # Task call id -> when it started (see _task_events)
+    saw_result = False      # exit 3 when Cursor never answered: pervio-chat then
+                            # puts the agent's stderr reason on the channel
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            o = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(o, dict):
+            continue
+        t = o.get("type")
+        if t == "result":
+            saw_result = True
+        if t == "user":
+            continue                                  # the prompt echoed back
+        if t == "thinking":
+            if o.get("subtype") == "delta" and isinstance(o.get("text"), str):
+                _emit({"type": "stream_event", "event": {"type": "content_block_delta",
+                       "delta": {"type": "thinking_delta", "thinking": o["text"]}},
+                       "session_id": o.get("session_id")})
+            continue
+        if t == "assistant":
+            msg = o.get("message") or {}
+            for b in (msg.get("content") or []):
+                if isinstance(b, dict) and b.get("type") == "text" and b.get("text"):
+                    if buf and b["text"] == buf:
+                        buf = ""
+                        continue
+                    buf += b["text"]
+                    _emit({"type": "stream_event", "event": {"type": "content_block_delta",
+                           "delta": {"type": "text_delta", "text": b["text"]}},
+                           "session_id": o.get("session_id")})
+            continue
+        buf = ""
+        if t == "tool_call":
+            kind, body = _kind(o.get("tool_call"))
+            call_id = (o.get("call_id") or "").split("\n")[0] or "tc"
+            if o.get("subtype") == "started":
+                _emit({"type": "assistant", "message": {"role": "assistant",
+                       "content": [_tool_use(kind, body, call_id)]},
+                       "session_id": o.get("session_id")})
+            elif o.get("subtype") == "completed":
+                _emit({"type": "user", "message": {"role": "user", "content": [
+                       {"type": "tool_result", "tool_use_id": call_id,
+                        "content": _result_text(body)}]},
+                       "session_id": o.get("session_id")})
+            _task_events(kind, body, call_id, o.get("subtype"), o.get("session_id"), task_started)
+            continue
+        _emit(o)
+    sys.exit(0 if saw_result else 3)
+
+
+if __name__ == "__main__":
+    main()

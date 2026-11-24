@@ -1,0 +1,265 @@
+# XcodeGen spec. On your Mac:  brew install xcodegen && cd ios && xcodegen generate
+# then open Pervio.xcodeproj, pick your signing Team, and run on your iPhone.
+name: Pervio
+configFiles:
+  Debug: Signing.xcconfig
+  Release: Signing.xcconfig
+options:
+  bundleIdPrefix: app.pervio
+  deploymentTarget:
+    iOS: "17.0"   # Citadel 0.12.x requires iOS 17+
+  createIntermediateGroups: true
+
+packages:
+  Citadel:
+    url: https://github.com/orlandos-nl/Citadel.git
+    from: "0.7.0"
+  SwiftMath:
+    # LaTeX typesetting for chat math (GPT-family models emit \[…\]/\(…\);
+    # rendered faithfully instead of showing backslash source — 2026-09-13).
+    url: https://github.com/mgriebling/SwiftMath.git
+    from: "1.7.0"
+  SwiftTerm:
+    url: https://github.com/migueldeicaza/SwiftTerm.git
+    # Pinned to the last release BEFORE the Metal renderer (added in v1.12.0).
+    # This avoids requiring Xcode's separately-downloaded Metal Toolchain, whose
+    # cryptex mount often fails with "metal: Permission denied". v1.11.2 has every
+    # API we use (TerminalView(frame:font:), feed(byteArray:), getTerminal(), and
+    # the TerminalViewDelegate methods).
+    exactVersion: "1.11.2"
+
+targets:
+  Pervio:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+      # The server scripts, bundled WHOLE into the app (Resources/bin). This is
+      # what makes app↔server versions definitionally paired: build N carries
+      # scripts N, and ServerProvisioner repaves any Mac whose installed rev
+      # (content hash, stamped by install.sh) disagrees. Folder reference, so a
+      # new script lands in the bundle with zero project edits. iOS never
+      # executes these — they are cargo for the SSH pave.
+      - path: ../server/bin
+        type: folder
+        buildPhase: resources
+      # The seed templates (server/templates), bundled the same way. After a
+      # successful pave, ServerProvisioner copies any that are MISSING into
+      # ~/.pervio/templates — write-if-absent, the same discipline as
+      # install.sh's seeding, so a user's edited copy is never overwritten.
+      # This is what puts 晨报/GitHub 热点 in the market on a Mac the app
+      # paved itself (install.sh never ran there).
+      - path: ../server/templates
+        type: folder
+        buildPhase: resources
+    preBuildScripts:
+      # The server test suites import _pervio_lib with python, which drops a
+      # __pycache__ into server/bin — and a folder-reference resource copies
+      # WHATEVER is there at build time. Compiled .pyc embeds absolute source
+      # paths (a personal-path leak in a public IPA) and is dead weight the
+      # provisioner ignores anyway. Sweep it before every build.
+      - name: Prune server/bin pycache
+        script: rm -rf "${PROJECT_DIR}/../server/bin/__pycache__"
+        basedOnDependencyAnalysis: false
+    # APNs lock-screen push (Tier 2). This is the ONE build setting that enables
+    # remote notifications, and it can only live here — the .pbxproj is regenerated
+    # from this file by `xcodegen generate`, so hand-adding the capability in Xcode
+    # would be wiped on the next generate. XcodeGen writes Pervio.entitlements from
+    # these properties and points CODE_SIGN_ENTITLEMENTS at it.
+    #
+    # `development` is correct for both dev AND TestFlight/App Store: Apple's cloud
+    # signing rewrites aps-environment to `production` when it re-signs the upload,
+    # so a single value covers the debug build on a cable AND the TestFlight build.
+    # (Matches api.push.apple.com by default; --sandbox on the Mac targets a debug
+    # build. See docs/apns.md.)
+    entitlements:
+      path: Pervio.entitlements
+      properties:
+        aps-environment: development
+    dependencies:
+      - package: Citadel
+      - package: SwiftTerm
+      - package: SwiftMath
+      - target: PervioWidgets        # embed the Live Activity widget extension
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(PRODUCT_BUNDLE_ID_BASE)
+        # Signing lives in Signing.xcconfig (open-source friendly): fill your
+        # own DEVELOPMENT_TEAM / PRODUCT_BUNDLE_ID_BASE there (or in the
+        # git-ignored Signing.local.xcconfig) and a plain clone runs on device.
+        CODE_SIGN_STYLE: Automatic
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        SWIFT_VERSION: "5.9"
+        # iPhone only (the person's call, 2026-11-17), on every target. This has
+        # to be settled before the first App Store release: a device family that
+        # has shipped there can never be taken away again. An iPad still runs
+        # the app, in its iPhone-sized window.
+        TARGETED_DEVICE_FAMILY: "1"
+        GENERATE_INFOPLIST_FILE: YES
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_CFBundleDisplayName: Pervio
+        # The orientations stay explicit as they were for the universal build,
+        # and the crypto declaration skips the per-build export-compliance
+        # questionnaire (SSH is standard-protocol encryption → exempt).
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
+        INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: NO
+        # Enables ActivityKit Live Activities (Dynamic Island / Lock Screen) for the
+        # "Run" indicator. If this build setting is ignored by your Xcode, add
+        # NSSupportsLiveActivities=YES to an explicit Info.plist instead.
+        INFOPLIST_KEY_NSSupportsLiveActivities: YES
+        # App Transport Security is irrelevant here — SSH is a raw TCP socket,
+        # not URLSession — but allow arbitrary loads in case any HTTP is added.
+        INFOPLIST_KEY_NSLocalNetworkUsageDescription: "Connect to your dev server over SSH."
+
+  # Unit tests. Hosted BY the app (TEST_HOST) rather than a standalone logic
+  # bundle: the types under test live in the app target and are `internal`, so
+  # `@testable import Pervio` needs the app to link against. Sources are ONLY
+  # Tests/ — nothing here ships in the app, and the app target's `sources: Sources`
+  # never sees the test files.
+  PervioTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: Tests
+      # The island's drawable parts, so ViewSnapshotTests can rasterize the REAL
+      # Live Activity views. They live in the widget extension, which a unit test
+      # cannot import (an app-extension is not a linkable module), so the one
+      # dependency-free file is compiled in here too. It imports nothing but
+      # SwiftUI, which is what makes that safe — see LiveActivity/IslandViews.swift.
+      # The otter frames resolve from Bundle.main = the TEST HOST (the app ships
+      # the same eight frames in Sources/Assets.xcassets), so no catalog is copied.
+      - path: LiveActivity/IslandViews.swift
+    dependencies:
+      - target: Pervio
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(PRODUCT_BUNDLE_ID_BASE).tests
+        CODE_SIGN_STYLE: Automatic
+        SWIFT_VERSION: "5.9"
+        TARGETED_DEVICE_FAMILY: "1"
+        GENERATE_INFOPLIST_FILE: YES
+
+  # UI smoke tests (XCUITest). A SEPARATE target from PervioTests: XCUITests
+  # drive the app from OUTSIDE the process (no @testable import), so they need
+  # bundle.ui-testing, not bundle.unit-test. Sources are ONLY UITests/. The
+  # flows that need a live sandbox export PERVIO_E2E_CONFIG_B64 (see
+  # server/tests/e2e_ios/run_smoke.sh) and SKIP without it; the others (route
+  # editor, language switch on chrome) drive the app with the launch-argument
+  # seam alone and run against a bare simulator. Run this target on its own:
+  #   xcodebuild test -only-testing:PervioUITests …
+  PervioUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: UITests
+    dependencies:
+      - target: Pervio
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(PRODUCT_BUNDLE_ID_BASE).uitests
+        CODE_SIGN_STYLE: Automatic
+        SWIFT_VERSION: "5.9"
+        TARGETED_DEVICE_FAMILY: "1"
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_TARGET_NAME: Pervio
+
+  # Design render harness for the entry-page redesign. A host-less logic-test
+  # bundle scoped ONLY to design/render (self-contained SwiftUI mockups — it
+  # links nothing from the app, so it cannot affect the app build).
+  # `xcodebuild test -scheme PervioDesignRender` runs ImageRenderer inside it and
+  # writes the design PNGs to design/. NOT a product test: it is never in the
+  # Pervio scheme, so `-only-testing:PervioTests` and the app's build/archive
+  # never see it.
+  PervioDesignRender:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: ../design/render
+      # The Live Activity mascot frames, so the island mockups render the REAL
+      # hand-drawn otter (not a placeholder glyph). This is the SAME catalog the
+      # widget ships — referenced, not copied, so the two can never drift.
+      - path: LiveActivity/Assets.xcassets
+      # …and the island's real views, so design/island-production-combo-zh.png is
+      # a render of the SHIPPING card rather than a mockup of it. A design PNG that
+      # is a drawing of the code is a PNG that starts lying the first time the code
+      # changes.
+      - path: LiveActivity/IslandViews.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.pervio.designrender
+        CODE_SIGN_STYLE: Automatic
+        SWIFT_VERSION: "5.9"
+        GENERATE_INFOPLIST_FILE: YES
+        TARGETED_DEVICE_FAMILY: "1"
+
+  # Live Activity widget extension. Scoped to ONLY the widget code + the shared
+  # RunActivityAttributes (NOT all of Sources — that pulls in Citadel/SwiftTerm,
+  # which the extension neither needs nor can link). Local Live Activities need no
+  # special entitlement; they're started/updated from the app while it runs.
+  PervioWidgets:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: LiveActivity
+      - path: Sources/Shared        # RunActivityAttributes shared with the app
+    info:
+      path: LiveActivity/Info.plist
+      properties:
+        CFBundleDisplayName: Pervio Run
+        # Variable forms, NOT literals: App Store Connect requires the extension's
+        # versions to match the app's, and the deploy script stamps the build
+        # number via CURRENT_PROJECT_VERSION at archive time.
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(PRODUCT_BUNDLE_ID_BASE).widgets
+        CODE_SIGN_STYLE: Automatic
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        SWIFT_VERSION: "5.9"
+        TARGETED_DEVICE_FAMILY: "1"
+        SKIP_INSTALL: YES
+
+# One shared scheme that runs the APP (which embeds the widget). The widget
+# extension vends only a Live Activity — no home-screen widget — so its own
+# auto-created scheme can't be "Run" directly (SpringBoard: "Failed to get
+# descriptors"). Always run THIS "Pervio" scheme, not "PervioWidgets".
+schemes:
+  Pervio:
+    build:
+      targets:
+        Pervio: all
+        PervioTests: [test]
+        PervioUITests: [test]     # built so `-only-testing:PervioUITests` resolves
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        # Both suites are testables of the one shared scheme, so each is reachable
+        # by name with `-only-testing:`. The UITest sandbox flows XCTSkip without
+        # PERVIO_E2E_CONFIG_B64 (run_smoke.sh exports it); the bare-sim flows run
+        # on any simulator. Run the fast unit suite alone with
+        #   -only-testing:PervioTests
+        # and the slow UI suite alone with
+        #   -only-testing:PervioUITests
+        - PervioTests
+        - PervioUITests
+    archive:
+      config: Release
+  # Scheme for the design render harness. Kept SEPARATE from the app scheme so
+  # the app's build/run/archive — and both product test suites — stay exactly as
+  # they were; the harness only runs when this scheme is named explicitly.
+  PervioDesignRender:
+    build:
+      targets:
+        PervioDesignRender: [test]
+    test:
+      config: Debug
+      targets:
+        - PervioDesignRender

@@ -1,0 +1,51 @@
+{
+  "scenario": "claude-text",
+  "backend": "claude",
+  "model": "claude-haiku-4-5-20251001",
+  "capturedUTC": "2026-08-07T08:56:40Z",
+  "cliVersion": "2.1.181 (Claude Code)",
+  "command": "server/bin/pervio-chat --text --backend claude --dir /home/pervio/work --prompt-b64 <base64 of the prompt below> --perm default --model claude-haiku-4-5-20251001 --effort low",
+  "prompt": "Reply with exactly this sentence and nothing else: The corpus is alive.",
+  "exitCode": 0,
+  "events": 24,
+  "seconds": 3.8,
+  "usage": {
+    "inputTokens": 10,
+    "cachedInputTokens": 23037,
+    "outputTokens": 53,
+    "reasoningOutputTokens": null,
+    "costUSD": 0.046928
+  },
+  "sessionIdRedactedTo": "00000000-0000-4000-8000-000000000001",
+  "covers": [
+    "system/init",
+    "system/status",
+    "stream_event text_delta (partial-message shards)",
+    "assistant message + per-request usage",
+    "result + usage + total_cost_usd"
+  ],
+  "twin": "codex-text",
+  "noTwinBecause": null,
+  "free": false,
+  "redactions": [
+    "workdir (plain, realpath, and '-'-encoded) -> /home/pervio/work",
+    "$HOME -> /home/pervio, username -> pervio",
+    "hostname -> pervio-host",
+    "IANA timezone -> Etc/UTC",
+    "UUIDs -> 00000000-0000-4000-8000-0000000000NN (consistent within a file)",
+    "req_… -> req_000…NN",
+    "bulk vendor/environment values -> '<redacted: …>' markers (keys and types preserved; see 'scrubbedPaths')"
+  ],
+  "scrubbedPaths": [
+    "agents",
+    "attachment.addedLines",
+    "attachment.addedNames",
+    "attachment.addedTypes",
+    "attachment.content",
+    "attachment.names",
+    "skills",
+    "slash_commands"
+  ],
+  "regenerate": "python3 server/tests/capture_corpus.py --only claude-text",
+  "note": "REAL agent output. Everything except the values listed under 'redactions' is byte-for-byte what the CLI emitted."
+}
